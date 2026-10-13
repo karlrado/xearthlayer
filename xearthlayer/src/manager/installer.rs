@@ -12,7 +12,7 @@
 //! single package is a batch of one.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tracing::info;
@@ -287,6 +287,12 @@ impl PackageInstaller {
         // for itself rather than trusting its caller.
         xearthlayer_package::validate_region(region)
             .map_err(|e| ManagerError::InvalidPath(e.to_string()))?;
+        // The archive and part names are joined onto the temp directory, and
+        // arrive by the same route as the title.
+        validate_file_name(&metadata.filename)?;
+        for part in &metadata.parts {
+            validate_file_name(&part.filename)?;
+        }
         let package_type = metadata.package_type;
         let version = &metadata.package_version;
 
@@ -431,6 +437,19 @@ impl PackageInstaller {
             bytes_downloaded,
             files_extracted,
         })
+    }
+}
+
+/// Refuse a metadata-supplied file name unless it is a single plain path
+/// component. Anything else, joined onto a directory, can land outside it:
+/// `..` climbs out, and an absolute name replaces the directory outright.
+fn validate_file_name(name: &str) -> ManagerResult<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(ManagerError::InvalidPath(format!(
+            "unsafe file name in package metadata: {name:?}"
+        ))),
     }
 }
 
@@ -901,6 +920,73 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Part and archive file names come from metadata fetched over HTTP and
+    /// are joined onto the package's temp directory, so `../x` would write
+    /// outside it and an absolute name would replace the directory entirely.
+    /// The checksums come from the same file, so they cannot catch it.
+    #[test]
+    fn only_a_single_plain_path_component_is_a_valid_file_name() {
+        assert!(validate_file_name("zzXEL_af-north_ortho-1.0.0.tar.gz.aa").is_ok());
+        for hostile in [
+            "",
+            ".",
+            "..",
+            "../x.aa",
+            "a/../../x.aa",
+            "sub/x.aa",
+            "/etc/x.aa",
+        ] {
+            assert!(
+                matches!(
+                    validate_file_name(hostile),
+                    Err(ManagerError::InvalidPath(_))
+                ),
+                "{hostile:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_file_name_that_escapes_the_temp_directory_is_refused_before_downloading() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let mut hostile = package("AF-NORTH", &mut transfer);
+        hostile.parts[0].filename = "../../escaped.aa".to_string();
+        let downloaded = Arc::clone(&transfer.downloaded);
+
+        let results =
+            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+
+        assert!(
+            matches!(results[0], Err(ManagerError::InvalidPath(_))),
+            "{:?}",
+            results[0]
+        );
+        assert!(downloaded.lock().unwrap().is_empty());
+        assert!(!temp.path().join("escaped.aa").exists());
+    }
+
+    #[test]
+    fn an_archive_file_name_that_escapes_the_temp_directory_is_refused_before_downloading() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let mut hostile = package("AF-NORTH", &mut transfer);
+        let target = temp.path().join("escaped.tar.gz");
+        hostile.filename = target.to_string_lossy().into_owned();
+        let downloaded = Arc::clone(&transfer.downloaded);
+
+        let results =
+            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+
+        assert!(
+            matches!(results[0], Err(ManagerError::InvalidPath(_))),
+            "{:?}",
+            results[0]
+        );
+        assert!(downloaded.lock().unwrap().is_empty());
+        assert!(!target.exists());
     }
 
     #[test]

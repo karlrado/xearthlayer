@@ -51,6 +51,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Security
 
+- **Archive file names in package metadata are validated before they become paths**: a package's metadata names its archive and each archive part, and the installer joined those names onto its temp directory unchecked. A name such as `../../x` wrote a downloaded part outside that directory, and an absolute name replaced the directory altogether; the checksums come from the same metadata file, so they could not catch it. This is the same class of flaw #287 closed for region codes, reached through the same untrusted input. Every file name is now required to be a single plain path component, and a package that breaks the rule is refused before anything downloads.
+
 - **Region codes are validated before they become paths** ([#287](https://github.com/samsoir/xearthlayer/issues/287)): a package's region code is joined directly into a filesystem path, and `package_mountpoint` prefixes only the first path component it produces, so a `..` segment further along survived untouched. A code such as `x/../../../../tmp/evil` therefore resolved outside the directory it was joined to.
 
   On the runtime side that directory is the user's Custom Scenery folder, and the code arrives as the title of package metadata fetched over HTTP, so a hostile or compromised package library could direct an install to write outside the scenery folder. On the publisher side it is the package repository, where the same code reaches a recursive delete.
