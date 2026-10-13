@@ -105,6 +105,21 @@ enum Commands {
     Diagnostics,
 
     /// Package manager commands (install and manage scenery packages)
+    ///
+    /// Region codes are hierarchical, so install, update, remove and info
+    /// accept the start of a code and act on every package it selects,
+    /// ignoring case:
+    ///
+    ///   NA          every North America package
+    ///   NA-CANADA   NA-CANADA-WEST and NA-CANADA-EAST
+    ///   AS-RUSSIA   AS-RUSSIA-WEST and AS-RUSSIA-EAST
+    ///   AF-SOUTH    exactly AF-SOUTH
+    ///
+    /// A full code still selects every code that starts with it, so EU also
+    /// selects EU-WEST and EU-EAST. When a code selects more than one
+    /// package, the matches are listed before anything is installed or
+    /// removed.
+    #[command(verbatim_doc_comment)]
     Packages {
         #[command(subcommand)]
         command: commands::packages::PackagesCommands,
@@ -294,7 +309,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     use super::Cli;
 
@@ -311,5 +326,27 @@ mod tests {
             err.to_string().contains("publish"),
             "the error should name the removed subcommand: {err}"
         );
+    }
+
+    #[test]
+    fn packages_help_explains_partial_region_codes() {
+        // Prefix selection is invisible unless the help says so (#293).
+        let mut cli = Cli::command();
+        let packages = cli.find_subcommand_mut("packages").unwrap();
+
+        let help = packages.render_long_help().to_string();
+        assert!(help.contains("NA-CANADA"), "packages --help: {help}");
+
+        for name in ["install", "update", "remove", "info"] {
+            let help = packages
+                .find_subcommand_mut(name)
+                .unwrap()
+                .render_long_help()
+                .to_string();
+            assert!(
+                help.contains("or the start of one"),
+                "{name} --help: {help}"
+            );
+        }
     }
 }

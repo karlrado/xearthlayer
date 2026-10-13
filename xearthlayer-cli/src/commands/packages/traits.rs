@@ -125,14 +125,6 @@ pub trait PackageManagerService: Send + Sync {
         package_type: PackageType,
     ) -> ManagerResult<()>;
 
-    /// Get an installed package.
-    fn get_package(
-        &self,
-        store: &LocalPackageStore,
-        region: &str,
-        package_type: PackageType,
-    ) -> ManagerResult<InstalledPackage>;
-
     /// List all installed packages.
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>>;
 }

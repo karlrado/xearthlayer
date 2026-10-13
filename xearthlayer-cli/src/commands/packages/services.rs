@@ -316,15 +316,6 @@ impl PackageManagerService for DefaultPackageManagerService {
         store.remove(region, package_type)
     }
 
-    fn get_package(
-        &self,
-        store: &LocalPackageStore,
-        region: &str,
-        package_type: PackageType,
-    ) -> ManagerResult<InstalledPackage> {
-        store.get(region, package_type)
-    }
-
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {
         store.list()
     }

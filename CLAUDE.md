@@ -341,11 +341,12 @@ xearthlayer scenery-index status    # Show cache status and tile counts
 xearthlayer scenery-index update    # Rebuild index from installed packages
 xearthlayer scenery-index clear     # Delete the cache file
 
-# Package management
+# Package management (<reg> may be the start of a code: NA, NA-CANADA; #293)
 xearthlayer packages list           # List installed/available packages
-xearthlayer packages install <reg>  # Install a regional package
+xearthlayer packages install <reg>  # Install every package <reg> selects
 xearthlayer packages update [reg]   # Update packages
-xearthlayer packages remove <reg>   # Remove a package
+xearthlayer packages remove <reg>   # Remove packages (whole set validated, one prompt)
+xearthlayer packages info <reg>     # Show installed package details
 xearthlayer packages check          # Check for updates
 
 # Configuration management
