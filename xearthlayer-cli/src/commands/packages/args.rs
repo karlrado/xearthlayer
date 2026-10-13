@@ -9,6 +9,11 @@ use clap::Subcommand;
 
 use xearthlayer_package::PackageType;
 
+/// Help for every `region` argument. They all resolve through
+/// `selector::resolve`, so they share one description.
+const REGION_HELP: &str =
+    "Region code, or the start of one to select a group (e.g. \"NA\", \"NA-CANADA\")";
+
 /// Package type argument for CLI.
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub enum PackageTypeArg {
@@ -54,7 +59,7 @@ pub enum PackagesCommands {
 
     /// Install a package from a library
     Install {
-        /// Region code to install (e.g., "na", "eu")
+        #[arg(help = REGION_HELP)]
         region: String,
 
         /// Package type
@@ -74,9 +79,9 @@ pub enum PackagesCommands {
         temp_dir: Option<PathBuf>,
     },
 
-    /// Update installed packages
+    /// Update installed packages (all of them when no region is given)
     Update {
-        /// Region code to update (optional, updates all if not specified)
+        #[arg(help = REGION_HELP)]
         region: Option<String>,
 
         /// Package type (optional)
@@ -102,7 +107,7 @@ pub enum PackagesCommands {
 
     /// Remove an installed package
     Remove {
-        /// Region code to remove
+        #[arg(help = REGION_HELP)]
         region: String,
 
         /// Package type
@@ -120,7 +125,7 @@ pub enum PackagesCommands {
 
     /// Show detailed information about an installed package
     Info {
-        /// Region code
+        #[arg(help = REGION_HELP)]
         region: String,
 
         /// Package type

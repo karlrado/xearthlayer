@@ -3,13 +3,17 @@
 //! Each handler implements the `CommandHandler` trait and contains the
 //! business logic for its respective command.
 
+use std::path::Path;
+
 use xearthlayer::config::format_size;
 use xearthlayer::manager::{
-    create_consolidated_overlay, remove_overlay_symlink, MountStatus, PackageStatus,
+    create_consolidated_overlay, remove_overlay_symlink, InstallResult, InstalledPackage,
+    LocalPackageStore, MountStatus, PackageStatus,
 };
-use xearthlayer_package::PackageType;
+use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
 
 use super::args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
+use super::selector::resolve;
 use super::traits::{CommandContext, CommandHandler};
 use crate::error::CliError;
 
@@ -180,6 +184,64 @@ impl CommandHandler for CheckHandler {
 // Shared Helpers
 // ============================================================================
 
+/// Installed packages of `package_type` selected by a region `selector`.
+///
+/// Used by every command that acts on what is installed, so a selector that
+/// matches nothing lists the installed codes rather than the library's.
+fn select_installed(
+    ctx: &CommandContext<'_>,
+    store: &LocalPackageStore,
+    selector: &str,
+    package_type: PackageType,
+) -> Result<Vec<InstalledPackage>, CliError> {
+    let installed = ctx
+        .manager
+        .list_packages(store)
+        .map_err(|e| CliError::Packages(e.to_string()))?
+        .into_iter()
+        .filter(|p| p.package_type() == package_type)
+        .collect();
+    resolve(selector, installed, |p| p.region())
+}
+
+/// Fetch a library entry's metadata, then download and install the package
+/// with progress reporting. Shared by `install`, its overlay auto-install,
+/// and `update`.
+fn fetch_and_install(
+    entry: &LibraryEntry,
+    install_dir: &Path,
+    temp_dir: &Path,
+    concurrent_downloads: usize,
+    ctx: &CommandContext<'_>,
+) -> Result<InstallResult, CliError> {
+    ctx.output.println("Fetching package metadata...");
+    let metadata = ctx
+        .manager
+        .fetch_metadata(&entry.metadata_url)
+        .map_err(|e| CliError::Packages(e.to_string()))?;
+
+    ctx.output.println(&format!(
+        "Package: {} v{}",
+        metadata.title, metadata.package_version
+    ));
+    ctx.output.println(&format!(
+        "Parts: {} ({})",
+        metadata.parts.len(),
+        metadata.filename
+    ));
+    ctx.output.newline();
+
+    let result = ctx.manager.install_package(
+        &metadata,
+        install_dir,
+        temp_dir,
+        concurrent_downloads,
+        Some(ctx.output.create_progress_callback()),
+    );
+    ctx.output.progress_done();
+    result
+}
+
 /// Rebuild the consolidated overlay folder after an overlay install/remove/update.
 ///
 /// This creates a single `yzXEL_overlay/` folder in Custom Scenery containing
@@ -233,20 +295,63 @@ fn rebuild_consolidated_overlay(
 pub struct InstallHandler;
 
 impl InstallHandler {
-    /// Install an overlay package for auto_install_overlays feature.
+    /// Install one library entry, then do what its type needs afterwards:
+    /// rebuild the consolidated overlay, or auto-install the region's overlay.
+    fn install_entry(
+        entry: &LibraryEntry,
+        library: &PackageLibrary,
+        args: &InstallArgs,
+        ctx: &CommandContext<'_>,
+    ) -> Result<(), CliError> {
+        let result = fetch_and_install(
+            entry,
+            &args.install_dir,
+            &args.temp_dir,
+            args.concurrent_downloads,
+            ctx,
+        )?;
+        ctx.output.success(&format!(
+            "Installed {} ({}) v{} to {}",
+            result.region,
+            result.package_type,
+            result.version,
+            result.install_path.display()
+        ));
+        ctx.output.println(&format!(
+            "Downloaded {} bytes, extracted {} files",
+            format_size(result.bytes_downloaded as usize),
+            result.files_extracted
+        ));
+
+        match entry.package_type {
+            PackageType::Overlay => {
+                ctx.output.newline();
+                rebuild_consolidated_overlay(
+                    &args.install_dir,
+                    &args.custom_scenery_path,
+                    args.disable_overlays,
+                    ctx,
+                );
+            }
+            PackageType::Ortho if args.auto_install_overlays => {
+                Self::install_overlay_for_region(&entry.title, library, args, ctx);
+            }
+            PackageType::Ortho => {}
+        }
+        Ok(())
+    }
+
+    /// Install the overlay package for `region`, if the library has one.
+    ///
+    /// Best effort: the ortho package it accompanies is already installed, so
+    /// a failure here is reported rather than failing the command.
     fn install_overlay_for_region(
         region: &str,
-        library: &xearthlayer_package::PackageLibrary,
+        library: &PackageLibrary,
         args: &InstallArgs,
         ctx: &CommandContext<'_>,
     ) {
-        // Find overlay entry in library
-        let overlay_entry = library.entries.iter().find(|e| {
-            e.title.to_lowercase() == region.to_lowercase()
-                && e.package_type == PackageType::Overlay
-        });
-
-        let Some(overlay_entry) = overlay_entry else {
+        let Some(overlay_entry) = library.find(region, PackageType::Overlay) else {
             return; // No overlay available for this region
         };
 
@@ -255,60 +360,10 @@ impl InstallHandler {
             "Auto-installing overlay package for {}...",
             region
         ));
-
-        // Fetch and install overlay
-        let metadata = match ctx.manager.fetch_metadata(&overlay_entry.metadata_url) {
-            Ok(m) => m,
-            Err(e) => {
-                ctx.output
-                    .error(&format!("Failed to fetch overlay metadata: {}", e));
-                return;
-            }
-        };
-
-        ctx.output.println(&format!(
-            "Overlay package: {} v{}",
-            metadata.title, metadata.package_version
-        ));
-        ctx.output.println(&format!(
-            "Parts: {} ({})",
-            metadata.parts.len(),
-            metadata.filename
-        ));
-        ctx.output.newline();
-
-        // Install with progress callback
-        let progress_callback = ctx.output.create_progress_callback();
-        let result = match ctx.manager.install_package(
-            &metadata,
-            &args.install_dir,
-            &args.temp_dir,
-            args.concurrent_downloads,
-            Some(progress_callback),
-        ) {
-            Ok(r) => r,
-            Err(e) => {
-                ctx.output
-                    .error(&format!("Failed to install overlay package: {}", e));
-                return;
-            }
-        };
-
-        ctx.output.progress_done();
-        ctx.output.success(&format!(
-            "Installed overlay {} v{} to {}",
-            result.region,
-            result.version,
-            result.install_path.display()
-        ));
-
-        // Rebuild consolidated overlay to include the newly installed overlay
-        rebuild_consolidated_overlay(
-            &args.install_dir,
-            &args.custom_scenery_path,
-            args.disable_overlays,
-            ctx,
-        );
+        if let Err(e) = Self::install_entry(overlay_entry, library, args, ctx) {
+            ctx.output
+                .error(&format!("Failed to install overlay package: {}", e));
+        }
     }
 }
 
@@ -329,79 +384,55 @@ impl CommandHandler for InstallHandler {
             .fetch_library(&args.library_url)
             .map_err(|e| CliError::Packages(e.to_string()))?;
 
-        // Find the package in the library
-        let entry = library
+        let offered: Vec<&LibraryEntry> = library
             .entries
             .iter()
-            .find(|e| {
-                e.title.to_lowercase() == args.region.to_lowercase()
-                    && e.package_type == args.package_type
-            })
-            .ok_or_else(|| {
-                CliError::Packages(format!(
-                    "Package {} ({}) not found in library",
-                    args.region, args.package_type
-                ))
-            })?;
+            .filter(|e| e.package_type == args.package_type)
+            .collect();
+        let entries = resolve(&args.region, offered, |e| e.title.as_str())?;
 
-        // Fetch package metadata
-        ctx.output.println("Fetching package metadata...");
-        let metadata = ctx
-            .manager
-            .fetch_metadata(&entry.metadata_url)
-            .map_err(|e| CliError::Packages(e.to_string()))?;
+        if let [entry] = entries.as_slice() {
+            return Self::install_entry(entry, &library, &args, ctx);
+        }
 
         ctx.output.println(&format!(
-            "Package: {} v{}",
-            metadata.title, metadata.package_version
+            "{} matches {} packages ({}):",
+            args.region,
+            entries.len(),
+            args.package_type
         ));
-        ctx.output.println(&format!(
-            "Parts: {} ({})",
-            metadata.parts.len(),
-            metadata.filename
-        ));
+        for entry in &entries {
+            ctx.output
+                .indented(&format!("{} v{}", entry.title, entry.version));
+        }
         ctx.output.newline();
+        if !ctx.interaction.confirm("Proceed with install?") {
+            ctx.output.println("Install cancelled.");
+            return Ok(());
+        }
 
-        // Install the package with progress reporting
-        let progress_callback = ctx.output.create_progress_callback();
-        let result = ctx.manager.install_package(
-            &metadata,
-            &args.install_dir,
-            &args.temp_dir,
-            args.concurrent_downloads,
-            Some(progress_callback),
-        )?;
-
-        ctx.output.progress_done();
-        ctx.output.success(&format!(
-            "Installed {} ({}) v{} to {}",
-            result.region,
-            result.package_type,
-            result.version,
-            result.install_path.display()
-        ));
-        ctx.output.println(&format!(
-            "Downloaded {} bytes, extracted {} files",
-            format_size(result.bytes_downloaded as usize),
-            result.files_extracted
-        ));
-
-        // Rebuild consolidated overlay for overlay packages
-        if args.package_type == PackageType::Overlay {
+        // A failure is reported and the batch continues: a partial continent
+        // is still useful.
+        let mut failed = 0;
+        for entry in &entries {
             ctx.output.newline();
-            rebuild_consolidated_overlay(
-                &args.install_dir,
-                &args.custom_scenery_path,
-                args.disable_overlays,
-                ctx,
-            );
+            ctx.output.println(&format!(
+                "Installing {} ({})...",
+                entry.title, entry.package_type
+            ));
+            if let Err(e) = Self::install_entry(entry, &library, &args, ctx) {
+                ctx.output.error(&e.to_string());
+                failed += 1;
+            }
         }
 
-        // Auto-install overlay when installing ortho (if enabled)
-        if args.package_type == PackageType::Ortho && args.auto_install_overlays {
-            Self::install_overlay_for_region(&args.region, &library, &args, ctx);
+        if failed > 0 {
+            return Err(CliError::Packages(format!(
+                "{} of {} packages failed to install",
+                failed,
+                entries.len()
+            )));
         }
-
         Ok(())
     }
 }
@@ -430,31 +461,21 @@ impl CommandHandler for UpdateHandler {
         let store = ctx.manager.create_store(&args.install_dir);
         let statuses = ctx.manager.check_updates(&store, &library);
 
-        // Filter to updates only, and optionally by region/type
-        let updates: Vec<_> = statuses
+        // Installed packages of the requested type, narrowed by the region
+        // selector when one is given, then only those with an update.
+        let installed: Vec<_> = statuses
             .into_iter()
             .filter(|(info, status)| {
-                // Only updates
-                if !matches!(status, PackageStatus::UpdateAvailable { .. }) {
-                    return false;
-                }
-
-                // Filter by region if specified
-                if let Some(ref region) = args.region {
-                    if info.region.to_lowercase() != region.to_lowercase() {
-                        return false;
-                    }
-                }
-
-                // Filter by type if specified
-                if let Some(pkg_type) = args.package_type {
-                    if info.package_type != pkg_type {
-                        return false;
-                    }
-                }
-
-                true
+                status.is_installed() && args.package_type.is_none_or(|t| t == info.package_type)
             })
+            .collect();
+        let selected = match args.region {
+            Some(ref selector) => resolve(selector, installed, |(info, _)| info.region.as_str())?,
+            None => installed,
+        };
+        let updates: Vec<_> = selected
+            .into_iter()
+            .filter(|(_, status)| status.has_update())
             .collect();
 
         if updates.is_empty() {
@@ -499,45 +520,23 @@ impl CommandHandler for UpdateHandler {
                 info.region, info.package_type
             ));
 
-            // Find the entry in the library
-            let entry = library.entries.iter().find(|e| {
-                e.title.to_lowercase() == info.region.to_lowercase()
-                    && e.package_type == info.package_type
-            });
-
-            let entry = match entry {
-                Some(e) => e,
-                None => {
-                    ctx.output.error(&format!(
-                        "Package {} ({}) not found in library",
-                        info.region, info.package_type
-                    ));
-                    error_count += 1;
-                    continue;
-                }
+            let Some(entry) = library.find(&info.region, info.package_type) else {
+                ctx.output.error(&format!(
+                    "Package {} ({}) not found in library",
+                    info.region, info.package_type
+                ));
+                error_count += 1;
+                continue;
             };
 
-            // Fetch metadata and install
-            let metadata = match ctx.manager.fetch_metadata(&entry.metadata_url) {
-                Ok(m) => m,
-                Err(e) => {
-                    ctx.output
-                        .error(&format!("Failed to fetch metadata: {}", e));
-                    error_count += 1;
-                    continue;
-                }
-            };
-
-            let progress_callback = ctx.output.create_progress_callback();
-            match ctx.manager.install_package(
-                &metadata,
+            match fetch_and_install(
+                entry,
                 &args.install_dir,
                 &args.temp_dir,
                 args.concurrent_downloads,
-                Some(progress_callback),
+                ctx,
             ) {
                 Ok(result) => {
-                    ctx.output.progress_done();
                     ctx.output.success(&format!(
                         "Updated {} ({}) to v{}",
                         result.region, result.package_type, result.version
@@ -548,7 +547,6 @@ impl CommandHandler for UpdateHandler {
                     success_count += 1;
                 }
                 Err(e) => {
-                    ctx.output.progress_done();
                     ctx.output.error(&format!("Failed to update: {}", e));
                     error_count += 1;
                 }
@@ -588,71 +586,73 @@ impl CommandHandler for RemoveHandler {
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         let store = ctx.manager.create_store(&args.install_dir);
+        let packages = select_installed(ctx, &store, &args.region, args.package_type)?;
 
-        // Check if package exists
-        let package = ctx
-            .manager
-            .get_package(&store, &args.region, args.package_type)
-            .map_err(|e| CliError::Packages(e.to_string()))?;
-
-        ctx.output.println(&format!(
-            "Package: {} ({}) v{}",
-            package.region(),
-            package.package_type(),
-            package.version()
-        ));
-        ctx.output
-            .println(&format!("Path: {}", package.path.display()));
-        ctx.output.println(&format!(
-            "Size: {}",
-            format_size(package.size_bytes as usize)
-        ));
-        ctx.output.newline();
-
-        // Check mount status for ortho packages
-        if package.package_type() == PackageType::Ortho
-            && package.mount_status == MountStatus::Mounted
-        {
-            return Err(CliError::Packages(
-                "Cannot remove a mounted package. Unmount it first.".to_string(),
+        // Phase one: show the whole plan and validate all of it, so a batch
+        // never deletes some packages and then fails on a later one.
+        for package in &packages {
+            ctx.output.println(&format!(
+                "Package: {} ({}) v{}",
+                package.region(),
+                package.package_type(),
+                package.version()
             ));
+            ctx.output
+                .println(&format!("Path: {}", package.path.display()));
+            ctx.output.println(&format!(
+                "Size: {}",
+                format_size(package.size_bytes as usize)
+            ));
+            ctx.output.newline();
         }
 
-        // Confirm unless --force
-        if !args.force
-            && !ctx
-                .interaction
-                .confirm("Are you sure you want to remove this package?")
-        {
+        if let Some(mounted) = packages.iter().find(|p| {
+            p.package_type() == PackageType::Ortho && p.mount_status == MountStatus::Mounted
+        }) {
+            return Err(CliError::Packages(format!(
+                "Cannot remove a mounted package ({}). Unmount it first.",
+                mounted.region()
+            )));
+        }
+
+        // Phase two: one confirmation for the whole set, unless --force.
+        let prompt = match packages.len() {
+            1 => "Are you sure you want to remove this package?".to_string(),
+            n => format!("Are you sure you want to remove these {n} packages?"),
+        };
+        if !args.force && !ctx.interaction.confirm(&prompt) {
             ctx.output.println("Removal cancelled.");
             return Ok(());
         }
 
-        // Clean up stale per-region overlay symlink if one exists
-        if args.package_type == PackageType::Overlay {
-            if let Some(ref custom_scenery_path) = args.custom_scenery_path {
-                match remove_overlay_symlink(&args.region, custom_scenery_path) {
-                    Ok(true) => {
-                        tracing::info!(region = %args.region, "Removed stale per-region overlay symlink");
-                    }
-                    Ok(false) => {}
-                    Err(e) => {
-                        tracing::warn!(region = %args.region, error = %e, "Failed to remove per-region overlay symlink");
+        for package in &packages {
+            let region = package.region();
+
+            // Clean up stale per-region overlay symlink if one exists
+            if args.package_type == PackageType::Overlay {
+                if let Some(ref custom_scenery_path) = args.custom_scenery_path {
+                    match remove_overlay_symlink(region, custom_scenery_path) {
+                        Ok(true) => {
+                            tracing::info!(region = %region, "Removed stale per-region overlay symlink");
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(region = %region, error = %e, "Failed to remove per-region overlay symlink");
+                        }
                     }
                 }
             }
+
+            ctx.output.println("Removing package...");
+            ctx.manager
+                .remove_package(&store, region, args.package_type)
+                .map_err(|e| CliError::Packages(e.to_string()))?;
+
+            ctx.output
+                .success(&format!("Removed {} ({})", region, args.package_type));
         }
 
-        // Remove the package
-        ctx.output.println("Removing package...");
-        ctx.manager
-            .remove_package(&store, &args.region, args.package_type)
-            .map_err(|e| CliError::Packages(e.to_string()))?;
-
-        ctx.output
-            .success(&format!("Removed {} ({})", args.region, args.package_type));
-
-        // Rebuild consolidated overlay after removing an overlay package
+        // Rebuild consolidated overlay after removing overlay packages
         if args.package_type == PackageType::Overlay {
             rebuild_consolidated_overlay(
                 &args.install_dir,
@@ -678,62 +678,410 @@ impl CommandHandler for InfoHandler {
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
         let store = ctx.manager.create_store(&args.install_dir);
+        let packages = select_installed(ctx, &store, &args.region, args.package_type)?;
 
-        let package = ctx
-            .manager
-            .get_package(&store, &args.region, args.package_type)
-            .map_err(|e| CliError::Packages(e.to_string()))?;
-
-        ctx.output.header(&format!(
-            "{} ({}) v{}",
-            package.region(),
-            package.package_type(),
-            package.version()
-        ));
-        ctx.output.newline();
-
-        ctx.output.println("Package Details:");
-        ctx.output
-            .indented(&format!("Title: {}", package.metadata.title));
-        ctx.output.indented(&format!(
-            "Type: {}",
-            match package.package_type() {
-                PackageType::Ortho => "Orthophoto (satellite imagery)",
-                PackageType::Overlay => "Overlay (roads, buildings)",
+        for (i, package) in packages.iter().enumerate() {
+            if i > 0 {
+                ctx.output.newline();
             }
-        ));
-        ctx.output
-            .indented(&format!("Version: {}", package.version()));
-        ctx.output
-            .indented(&format!("Mountpoint: {}", package.metadata.mountpoint));
-        ctx.output.newline();
-
-        ctx.output.println("Installation:");
-        ctx.output
-            .indented(&format!("Path: {}", package.path.display()));
-        ctx.output.indented(&format!(
-            "Size: {}",
-            format_size(package.size_bytes as usize)
-        ));
-        ctx.output.newline();
-
-        if package.package_type() == PackageType::Ortho {
-            ctx.output.println("Mount Status:");
-            let mount_status = match package.mount_status {
-                MountStatus::Mounted => "Mounted (FUSE filesystem active)",
-                MountStatus::NotMounted => "Not mounted",
-                MountStatus::Unknown => "Unknown",
-            };
-            ctx.output.indented(mount_status);
+            ctx.output.header(&format!(
+                "{} ({}) v{}",
+                package.region(),
+                package.package_type(),
+                package.version()
+            ));
             ctx.output.newline();
-        }
 
-        ctx.output.println("Archive Parts:");
-        for part in &package.metadata.parts {
+            ctx.output.println("Package Details:");
             ctx.output
-                .indented(&format!("{} ({})", part.filename, part.checksum));
+                .indented(&format!("Title: {}", package.metadata.title));
+            ctx.output.indented(&format!(
+                "Type: {}",
+                match package.package_type() {
+                    PackageType::Ortho => "Orthophoto (satellite imagery)",
+                    PackageType::Overlay => "Overlay (roads, buildings)",
+                }
+            ));
+            ctx.output
+                .indented(&format!("Version: {}", package.version()));
+            ctx.output
+                .indented(&format!("Mountpoint: {}", package.metadata.mountpoint));
+            ctx.output.newline();
+
+            ctx.output.println("Installation:");
+            ctx.output
+                .indented(&format!("Path: {}", package.path.display()));
+            ctx.output.indented(&format!(
+                "Size: {}",
+                format_size(package.size_bytes as usize)
+            ));
+            ctx.output.newline();
+
+            if package.package_type() == PackageType::Ortho {
+                ctx.output.println("Mount Status:");
+                let mount_status = match package.mount_status {
+                    MountStatus::Mounted => "Mounted (FUSE filesystem active)",
+                    MountStatus::NotMounted => "Not mounted",
+                    MountStatus::Unknown => "Unknown",
+                };
+                ctx.output.indented(mount_status);
+                ctx.output.newline();
+            }
+
+            ctx.output.println("Archive Parts:");
+            for part in &package.metadata.parts {
+                ctx.output
+                    .indented(&format!("{} ({})", part.filename, part.checksum));
+            }
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::test_support::{
+        install_dir, FakeManager, RecordingOutput, ScriptedInteraction,
+    };
+    use super::*;
+
+    fn packages_error(result: Result<(), CliError>) -> String {
+        match result {
+            Err(CliError::Packages(message)) => message,
+            other => panic!("expected a packages error, got {other:?}"),
+        }
+    }
+
+    /// What a handler returned, and what the user was asked and shown.
+    struct Run {
+        result: Result<(), CliError>,
+        interaction: ScriptedInteraction,
+        output: RecordingOutput,
+    }
+
+    /// Execute a handler against `manager`, answering every prompt with `answer`.
+    fn run(
+        manager: &FakeManager,
+        answer: bool,
+        execute: impl FnOnce(&CommandContext<'_>) -> Result<(), CliError>,
+    ) -> Run {
+        let interaction = ScriptedInteraction::answering(answer);
+        let output = RecordingOutput::default();
+        let result = execute(&CommandContext::new(&output, manager, &interaction));
+        Run {
+            result,
+            interaction,
+            output,
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // remove
+    // ------------------------------------------------------------------------
+
+    fn remove(manager: &FakeManager, answer: bool, region: &str, force: bool) -> Run {
+        run(manager, answer, |ctx| {
+            RemoveHandler::execute(
+                RemoveArgs {
+                    region: region.to_string(),
+                    package_type: PackageType::Ortho,
+                    install_dir: install_dir(),
+                    force,
+                    custom_scenery_path: None,
+                    disable_overlays: false,
+                },
+                ctx,
+            )
+        })
+    }
+
+    #[test]
+    fn remove_resolves_a_prefix_against_installed_packages() {
+        let manager = FakeManager::default().with_installed(
+            PackageType::Ortho,
+            &["NA-CANADA-WEST", "NA-CANADA-EAST", "EU-WEST"],
+        );
+
+        let run = remove(&manager, true, "NA-CANADA", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.removals(), ["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+    }
+
+    #[test]
+    fn remove_considers_only_the_requested_package_type() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Ortho, &["EU-WEST"])
+            .with_installed(PackageType::Overlay, &["EU-WEST", "EU-EAST"]);
+
+        let run = remove(&manager, true, "EU", true);
+
+        run.result.unwrap();
+        assert_eq!(manager.removals(), ["EU-WEST"]);
+    }
+
+    #[test]
+    fn remove_asks_once_for_the_whole_set_and_a_no_removes_nothing() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+
+        let run = remove(&manager, false, "NA-CANADA", false);
+
+        run.result.unwrap();
+        assert!(manager.removals().is_empty());
+        assert_eq!(
+            run.interaction.prompts(),
+            ["Are you sure you want to remove these 2 packages?"]
+        );
+    }
+
+    #[test]
+    fn remove_of_a_single_match_keeps_the_original_prompt() {
+        let manager = FakeManager::default().with_installed(PackageType::Ortho, &["NA-GREENLAND"]);
+
+        let run = remove(&manager, false, "NA-GREENLAND", false);
+
+        assert_eq!(
+            run.interaction.prompts(),
+            ["Are you sure you want to remove this package?"]
+        );
+    }
+
+    #[test]
+    fn one_mounted_package_aborts_the_batch_before_anything_is_removed() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST"])
+            .with_mounted("NA-CANADA-EAST");
+
+        let run = remove(&manager, true, "NA-CANADA", true);
+
+        let message = packages_error(run.result);
+        assert!(message.contains("NA-CANADA-EAST"), "{message}");
+        assert!(manager.removals().is_empty());
+        assert!(run.interaction.prompts().is_empty());
+    }
+
+    #[test]
+    fn remove_with_no_match_lists_installed_codes_not_library_codes() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["AF-NORTH"])
+            .with_installed(PackageType::Ortho, &["EU-WEST"]);
+
+        let run = remove(&manager, true, "NA", true);
+
+        let message = packages_error(run.result);
+        assert!(message.contains("Available: EU-WEST"), "{message}");
+        assert!(!message.contains("AF-NORTH"), "{message}");
+    }
+
+    // ------------------------------------------------------------------------
+    // info
+    // ------------------------------------------------------------------------
+
+    fn info(manager: &FakeManager, region: &str) -> Run {
+        run(manager, true, |ctx| {
+            InfoHandler::execute(
+                InfoArgs {
+                    region: region.to_string(),
+                    package_type: PackageType::Ortho,
+                    install_dir: install_dir(),
+                },
+                ctx,
+            )
+        })
+    }
+
+    #[test]
+    fn info_shows_every_matching_package() {
+        let manager = FakeManager::default()
+            .with_installed(PackageType::Ortho, &["AS-RUSSIA-WEST", "AS-RUSSIA-EAST"]);
+
+        let run = info(&manager, "as-russia");
+
+        run.result.unwrap();
+        let text = run.output.text();
+        assert!(text.contains("AS-RUSSIA-WEST (ortho) v1.0.0"), "{text}");
+        assert!(text.contains("AS-RUSSIA-EAST (ortho) v1.0.0"), "{text}");
+    }
+
+    #[test]
+    fn info_with_no_match_lists_installed_codes() {
+        let manager = FakeManager::default().with_installed(PackageType::Ortho, &["EU-WEST"]);
+
+        let run = info(&manager, "NA");
+
+        assert!(packages_error(run.result).contains("Available: EU-WEST"));
+    }
+
+    // ------------------------------------------------------------------------
+    // install
+    // ------------------------------------------------------------------------
+
+    fn install(manager: &FakeManager, answer: bool, region: &str, auto_overlays: bool) -> Run {
+        run(manager, answer, |ctx| {
+            InstallHandler::execute(
+                InstallArgs {
+                    region: region.to_string(),
+                    package_type: PackageType::Ortho,
+                    library_url: String::new(),
+                    install_dir: install_dir(),
+                    temp_dir: install_dir(),
+                    custom_scenery_path: None,
+                    auto_install_overlays: auto_overlays,
+                    disable_overlays: false,
+                    concurrent_downloads: 1,
+                },
+                ctx,
+            )
+        })
+    }
+
+    #[test]
+    fn install_of_a_single_match_does_not_prompt() {
+        let manager = FakeManager::default().with_library(PackageType::Ortho, &["NA-GREENLAND"]);
+
+        let run = install(&manager, false, "NA-G", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-GREENLAND"]);
+        assert!(run.interaction.prompts().is_empty());
+    }
+
+    #[test]
+    fn install_of_many_matches_lists_them_and_installs_each_after_confirmation() {
+        let manager = FakeManager::default().with_library(
+            PackageType::Ortho,
+            &["NA-CANADA-WEST", "NA-CANADA-EAST", "EU-WEST"],
+        );
+
+        let run = install(&manager, true, "NA-CANADA", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+        assert_eq!(run.interaction.prompts(), ["Proceed with install?"]);
+        let text = run.output.text();
+        assert!(
+            text.contains("NA-CANADA matches 2 packages (ortho):"),
+            "{text}"
+        );
+        assert!(text.contains("NA-CANADA-EAST v1.0.0"), "{text}");
+    }
+
+    #[test]
+    fn declining_a_multi_install_installs_nothing() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+
+        let run = install(&manager, false, "NA-CANADA", false);
+
+        run.result.unwrap();
+        assert!(manager.installs().is_empty());
+    }
+
+    #[test]
+    fn install_considers_only_the_requested_package_type() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Overlay, &["EU-WEST"])
+            .with_library(PackageType::Ortho, &["EU-EAST"]);
+
+        let run = install(&manager, false, "EU", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["EU-EAST"]);
+        assert!(run.interaction.prompts().is_empty());
+    }
+
+    #[test]
+    fn install_with_no_match_lists_library_codes_not_installed_codes() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["AF-NORTH"])
+            .with_installed(PackageType::Ortho, &["EU-WEST"]);
+
+        let message = packages_error(install(&manager, true, "NA", false).result);
+
+        assert!(message.contains("Available: AF-NORTH"), "{message}");
+        assert!(!message.contains("EU-WEST"), "{message}");
+    }
+
+    #[test]
+    fn a_failed_install_does_not_stop_the_rest_of_the_batch() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"])
+            .failing_on("NA-CANADA-WEST");
+
+        let run = install(&manager, true, "NA-CANADA", false);
+
+        assert_eq!(manager.installs(), ["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+        let message = packages_error(run.result);
+        assert!(message.contains("1 of 2"), "{message}");
+    }
+
+    #[test]
+    fn auto_installed_overlays_follow_each_resolved_package() {
+        let canada = ["NA-CANADA-WEST", "NA-CANADA-EAST"];
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &canada)
+            .with_library(PackageType::Overlay, &canada);
+
+        let run = install(&manager, true, "NA-CANADA", true);
+
+        run.result.unwrap();
+        assert_eq!(
+            manager.installs(),
+            [
+                "NA-CANADA-WEST",
+                "NA-CANADA-WEST",
+                "NA-CANADA-EAST",
+                "NA-CANADA-EAST"
+            ]
+        );
+    }
+
+    // ------------------------------------------------------------------------
+    // update
+    // ------------------------------------------------------------------------
+
+    fn update(manager: &FakeManager, region: &str) -> Run {
+        run(manager, true, |ctx| {
+            UpdateHandler::execute(
+                UpdateArgs {
+                    region: Some(region.to_string()),
+                    package_type: None,
+                    library_url: String::new(),
+                    install_dir: install_dir(),
+                    temp_dir: install_dir(),
+                    all: true,
+                    custom_scenery_path: None,
+                    disable_overlays: false,
+                    concurrent_downloads: 1,
+                },
+                ctx,
+            )
+        })
+    }
+
+    #[test]
+    fn update_with_a_prefix_updates_every_matching_package() {
+        let manager = FakeManager::default()
+            .with_update(PackageType::Ortho, "NA-CANADA-WEST")
+            .with_update(PackageType::Ortho, "NA-CANADA-EAST")
+            .with_update(PackageType::Ortho, "EU-WEST");
+
+        update(&manager, "NA-CANADA").result.unwrap();
+
+        assert_eq!(manager.installs(), ["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+    }
+
+    #[test]
+    fn update_with_no_installed_match_lists_installed_codes() {
+        let manager = FakeManager::default()
+            .with_update(PackageType::Ortho, "EU-WEST")
+            .with_library(PackageType::Ortho, &["AF-NORTH"]);
+
+        let message = packages_error(update(&manager, "AF").result);
+
+        assert!(message.contains("Available: EU-WEST"), "{message}");
+        assert!(!message.contains("AF-NORTH"), "{message}");
     }
 }

@@ -31,6 +31,46 @@ When `auto_install_overlays = true`, installing an ortho package will automatica
 
 ## Commands
 
+### Selecting Packages by Region Code
+
+Region codes are hierarchical, from continent to country to part of a
+country, so `install`, `update`, `remove` and `info` all accept the start of a
+code and act on every package it selects. Matching ignores case.
+
+| You type | Selects |
+|----------|---------|
+| `NA` | every North America package |
+| `NA-CANADA` | `NA-CANADA-WEST` and `NA-CANADA-EAST` |
+| `AS-RUSSIA` | `AS-RUSSIA-WEST` and `AS-RUSSIA-EAST` |
+| `AF-SOUTH` | exactly `AF-SOUTH` |
+
+A code that selects one package behaves exactly as a full code always has.
+When it selects several, the matches are listed first and you are asked to
+confirm before anything is downloaded:
+
+```
+$ xearthlayer packages install NA
+Installing NA (ortho)...
+
+Fetching library index...
+NA matches 4 packages (ortho):
+  NA-CANADA-EAST v0.1.0
+  NA-CANADA-WEST v0.1.0
+  NA-GREENLAND v0.1.0
+  NA-USA-MX-CENTRAL v0.1.1
+
+Proceed with install? [y/N]:
+```
+
+If one package in the batch fails to install, the rest still install and the
+command reports how many failed. A code that selects nothing lists the codes
+you could have used: the library's for `install`, and your installed packages
+for `update`, `remove` and `info`.
+
+A full code is still the start of every longer code, so `EU` selects `EU`,
+`EU-WEST` and `EU-EAST` together. There is no way to name only the shorter
+one while the longer ones are installed.
+
 ### Check Available Packages
 
 See what packages are available and their update status:
@@ -196,11 +236,21 @@ Removing package...
 Success: Removed eu-paris (ortho)
 ```
 
+When a code selects several packages, every one of them is listed, and the
+removal is checked as a whole before anything is deleted: if any selected
+package is mounted, nothing is removed. Then a single prompt covers the set:
+
+```
+Are you sure you want to remove these 2 packages? [y/N]:
+```
+
 To skip the confirmation prompt:
 
 ```bash
 xearthlayer packages remove eu-paris --force
 ```
+
+`--force` skips only the prompt. A mounted package still stops the removal.
 
 ## Package Types
 
@@ -220,6 +270,9 @@ xearthlayer packages install eu-paris --type overlay
 ## CLI Reference
 
 All package commands support these common options:
+
+`<REGION>` is a region code or the start of one; see
+[Selecting Packages by Region Code](#selecting-packages-by-region-code).
 
 | Option | Description |
 |--------|-------------|

@@ -17,7 +17,10 @@
 
 mod args;
 mod handlers;
+mod selector;
 mod services;
+#[cfg(test)]
+mod test_support;
 mod traits;
 
 // Re-export public types
