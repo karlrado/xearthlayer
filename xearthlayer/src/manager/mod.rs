@@ -63,7 +63,7 @@ pub use download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
 pub use error::{ManagerError, ManagerResult};
-pub use extractor::{check_required_tools, ShellExtractor};
+pub use extractor::TarGzExtractor;
 pub use installer::{InstallProgressCallback, InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};

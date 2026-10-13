@@ -503,6 +503,7 @@ matrix jobs are renamed.
 - `block_compression` - BCn GPU compression via WGSL
 - `indicatif` - Progress bar rendering for package downloads
 - `sevenz-rust2` - Pure-Rust 7z writer for DSF compression (`compress` feature only)
+- `tar` + `flate2` - In-process `tar.gz` extraction for package installs (#274, client side; the publisher still shells out). flate2 runs on the `zlib-rs` backend, which picks AVX2/SSE/NEON at run time: never use `target-cpu` flags, the packaged binary must run on every CPU
 
 ## Performance Notes
 

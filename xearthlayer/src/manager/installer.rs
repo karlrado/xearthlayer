@@ -24,7 +24,7 @@ use super::download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
 use super::error::{ManagerError, ManagerResult};
-use super::extractor::ShellExtractor;
+use super::extractor::TarGzExtractor;
 use super::install_guard::InstallTempGuard;
 use super::local::LocalPackageStore;
 use super::traits::{ArchiveExtractor, LibraryClient};
@@ -411,7 +411,7 @@ impl<C: LibraryClient> PackageInstaller<C> {
         );
         report(InstallStage::Reassembling, 0.0, "Reassembling archive...");
         let archive_path = install_temp.join(&metadata.filename);
-        let extractor = ShellExtractor::new();
+        let extractor = TarGzExtractor::new();
         extractor.reassemble(&destinations, &archive_path)?;
 
         // Free the parts before extracting rather than at cleanup. They are
