@@ -117,7 +117,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 10. **Package Publisher** (`xearthlayer-publisher/`, its own crate behind the `xearthlayer-publish` binary since #284; the runtime does not link it, and the shared format lives in `xearthlayer-package/`)
    - Creates distributable scenery packages from Ortho4XP output (ortho tiles and overlays)
    - Repository management with package versioning
-   - Archive building with configurable part sizes
+   - Archive building with configurable part sizes, in process: the `tar.gz` streams straight into `split`-named parts, each hashed as written (#274)
    - Library index management for package discovery
    - `delete` retires a package: library index entry, working directory and built archives. Assets already uploaded to a hosting provider are deliberately never touched, because they must outlive the index entry while users are still installing from them
    - `release` also records `size.<type>.download_bytes` and `size.<type>.installed_bytes` into `region_metadata.json`; a missing file or missing region entry is a warning, not a failed release, because updating the library index is the release
@@ -503,6 +503,7 @@ matrix jobs are renamed.
 - `block_compression` - BCn GPU compression via WGSL
 - `indicatif` - Progress bar rendering for package downloads
 - `sevenz-rust2` - Pure-Rust 7z writer for DSF compression (`compress` feature only)
+- `tar` + `flate2` - In-process `tar.gz` handling (#274): the client extracts packages and the publisher builds them, no `tar` or `split` binary on either side. Declared once in `[workspace.dependencies]`. flate2 runs on the `zlib-rs` backend, which picks AVX2/SSE/NEON at run time: never use `target-cpu` flags, the packaged binary must run on every CPU
 
 ## Performance Notes
 

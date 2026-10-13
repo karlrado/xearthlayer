@@ -156,12 +156,18 @@ Create distributable archives:
 xearthlayer-publish build --region na --type ortho
 ```
 
-Steps:
+Steps, in one pass and in process (no `tar` or `split` binary, #274):
 
-1. Create tar.gz archive of package directory
-2. Split into parts (configurable size, default 1GB)
-3. Generate SHA-256 checksum for each part
-4. Store in `dist/` directory
+1. Archive the package directory as `tar.gz`, entries in sorted order
+2. Stream the archive straight into parts of `part_size` bytes, named
+   `.aa`, `.ab`, ... exactly as `split -b` would cut them
+3. Hash each part with SHA-256 as it is written, so no part is read back
+4. Store the parts in `dist/`
+
+The same tree always produces the same parts and checksums: entries are
+sorted and the gzip header carries no timestamp. File modification times
+are kept as `tar` keeps them, because the runtime's ortho union index
+invalidates its cache by mtime.
 
 ### 4. Configure URLs
 

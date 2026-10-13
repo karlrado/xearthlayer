@@ -1,60 +1,48 @@
 //! Package installer for downloading and installing packages.
 //!
-//! This module orchestrates the full installation workflow:
-//! 1. Fetch package metadata from library
-//! 2. Download all archive parts
-//! 3. Verify checksums
-//! 4. Reassemble and extract archive
-//! 5. Install to package directory
-//! 6. Clean up temporary files
+//! Installing a package has two halves with different bottlenecks:
+//!
+//! 1. **Download** (network bound): fetch every archive part into the
+//!    package's own temp directory, verifying checksums as parts arrive.
+//! 2. **Install** (disk bound): reassemble the parts, extract the archive and
+//!    move the extracted tree into the package store.
+//!
+//! [`PackageInstaller::install_all`] runs a batch through the [`pipeline`], so
+//! one package installs while the next one downloads (#292). Installing a
+//! single package is a batch of one.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::time::Instant;
+use std::path::{Component, Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use tracing::info;
 
 use xearthlayer_package::{PackageMetadata, PackageType};
 
-use super::disk_check::{
-    check_disk_space, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
-};
-use super::download::{
-    DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
-};
+use super::disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider};
+use super::download::{DownloadProgressCallback, DownloadState, MultiPartDownloader};
 use super::error::{ManagerError, ManagerResult};
-use super::extractor::ShellExtractor;
+use super::extractor::TarGzExtractor;
 use super::install_guard::InstallTempGuard;
 use super::local::LocalPackageStore;
-use super::traits::{ArchiveExtractor, LibraryClient};
+use super::pipeline;
+use super::traits::ArchiveExtractor;
 
-/// Progress callback for installation operations.
-///
-/// # Arguments
-///
-/// * `stage` - Current installation stage
-/// * `progress` - Progress within the stage (0.0 - 1.0)
-/// * `message` - Human-readable message
-pub type InstallProgressCallback = Box<dyn Fn(InstallStage, f64, &str) + Send + Sync>;
+/// Timeout for downloading a single archive part.
+const PART_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Installation stages for progress reporting.
+/// Parts downloaded in parallel unless `with_parallel_downloads` says otherwise.
+const DEFAULT_PARALLEL_DOWNLOADS: usize = 4;
+
+/// Stages of installing a package whose parts have downloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallStage {
-    /// Fetching package metadata.
-    FetchingMetadata,
-    /// Downloading archive parts.
-    Downloading,
-    /// Verifying checksums.
-    Verifying,
-    /// Reassembling split archive.
+    /// Joining the downloaded parts into one archive.
     Reassembling,
     /// Extracting archive contents.
     Extracting,
-    /// Installing to final location.
+    /// Moving the extracted tree into the package store.
     Installing,
-    /// Cleaning up temporary files.
-    Cleanup,
     /// Installation complete.
     Complete,
 }
@@ -63,31 +51,55 @@ impl InstallStage {
     /// Get a human-readable name for the stage.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::FetchingMetadata => "Fetching metadata",
-            Self::Downloading => "Downloading",
-            Self::Verifying => "Verifying",
             Self::Reassembling => "Reassembling",
             Self::Extracting => "Extracting",
             Self::Installing => "Installing",
-            Self::Cleanup => "Cleaning up",
             Self::Complete => "Complete",
         }
     }
+}
 
-    /// Whether this stage has indeterminate progress (no meaningful percentage).
-    ///
-    /// Indeterminate stages should show a spinner or similar indicator
-    /// rather than a percentage progress bar.
-    pub fn is_indeterminate(&self) -> bool {
-        matches!(
-            self,
-            Self::FetchingMetadata
-                | Self::Verifying
-                | Self::Reassembling
-                | Self::Extracting
-                | Self::Installing
-                | Self::Cleanup
-        )
+/// Receives progress from [`PackageInstaller::install_all`].
+///
+/// A package's download reports from the calling thread while an earlier
+/// package installs on a worker thread, so both methods can be called at the
+/// same time.
+pub trait InstallObserver: Send + Sync {
+    /// `package` is about to download. The returned callback, if any,
+    /// receives its per-part progress.
+    fn download_started(&self, package: &PackageMetadata) -> Option<DownloadProgressCallback>;
+
+    /// `package`'s install has reached `stage`.
+    fn install_stage(&self, package: &PackageMetadata, stage: InstallStage);
+}
+
+/// The network half of a download: sizing and fetching archive parts.
+///
+/// A seam rather than a plugin point: production always uses
+/// [`MultiPartDownloader`], and tests substitute local files.
+pub(crate) trait PartTransfer: Send + Sync {
+    /// Record each part's size, and their total, before anything downloads.
+    fn query_sizes(&self, state: &mut DownloadState);
+
+    /// Download every part to its destination, verifying checksums.
+    fn download_all(
+        &self,
+        state: &mut DownloadState,
+        on_progress: Option<DownloadProgressCallback>,
+    ) -> ManagerResult<()>;
+}
+
+impl PartTransfer for MultiPartDownloader {
+    fn query_sizes(&self, state: &mut DownloadState) {
+        MultiPartDownloader::query_sizes(self, state);
+    }
+
+    fn download_all(
+        &self,
+        state: &mut DownloadState,
+        on_progress: Option<DownloadProgressCallback>,
+    ) -> ManagerResult<()> {
+        MultiPartDownloader::download_all(self, state, on_progress)
     }
 }
 
@@ -108,43 +120,54 @@ pub struct InstallResult {
     pub files_extracted: usize,
 }
 
+/// A package ready to download: validated, its temp directory created and
+/// its parts sized.
+struct Prepared<'a> {
+    metadata: &'a PackageMetadata,
+    temp: InstallTempGuard,
+    state: DownloadState,
+}
+
+/// A package whose parts are all on disk with verified checksums.
+struct Downloaded<'a> {
+    metadata: &'a PackageMetadata,
+    temp: InstallTempGuard,
+    parts: Vec<PathBuf>,
+    bytes_downloaded: u64,
+}
+
 /// Package installer.
 ///
 /// Handles the complete installation workflow including downloading,
 /// verification, extraction, and installation.
-pub struct PackageInstaller<C: LibraryClient> {
-    /// Library client for fetching metadata.
-    client: C,
+pub struct PackageInstaller {
     /// Local package store.
     store: LocalPackageStore,
     /// Directory for temporary download files.
     temp_dir: PathBuf,
-    /// Number of parallel downloads.
-    parallel_downloads: usize,
-    /// Optional per-part download progress callback.
-    /// When set, bypasses the aggregate InstallProgressCallback bridge.
-    on_download_progress: Option<Arc<DownloadProgressCallback>>,
+    /// Fetches archive parts.
+    transfer: Box<dyn PartTransfer>,
     /// Filesystem info provider for the pre-flight disk-space check.
     /// Defaults to `RealFsInfoProvider`; tests can substitute a stub
     /// via `with_fs_info_provider`.
     fs_info_provider: Box<dyn FsInfoProvider>,
 }
 
-impl<C: LibraryClient> PackageInstaller<C> {
+impl PackageInstaller {
     /// Create a new package installer.
     ///
     /// # Arguments
     ///
-    /// * `client` - Library client for fetching metadata
     /// * `store` - Local package store for installation
     /// * `temp_dir` - Directory for temporary files during installation
-    pub fn new(client: C, store: LocalPackageStore, temp_dir: impl Into<PathBuf>) -> Self {
+    pub fn new(store: LocalPackageStore, temp_dir: impl Into<PathBuf>) -> Self {
         Self {
-            client,
             store,
             temp_dir: temp_dir.into(),
-            parallel_downloads: 4,
-            on_download_progress: None,
+            transfer: Box::new(MultiPartDownloader::with_settings(
+                PART_TIMEOUT,
+                DEFAULT_PARALLEL_DOWNLOADS,
+            )),
             fs_info_provider: Box::new(RealFsInfoProvider),
         }
     }
@@ -158,84 +181,105 @@ impl<C: LibraryClient> PackageInstaller<C> {
         self
     }
 
-    /// Set the number of parallel downloads.
+    /// Serve archive parts from somewhere other than the network.
+    #[cfg(test)]
+    fn with_transfer(mut self, transfer: Box<dyn PartTransfer>) -> Self {
+        self.transfer = transfer;
+        self
+    }
+
+    /// Set the number of parts downloaded in parallel.
     pub fn with_parallel_downloads(mut self, count: usize) -> Self {
-        self.parallel_downloads = count.max(1);
+        self.transfer = Box::new(MultiPartDownloader::with_settings(
+            PART_TIMEOUT,
+            count.max(1),
+        ));
         self
     }
 
-    /// Set a per-part download progress callback.
+    /// Install every package in `packages`, returning one result per package
+    /// in the same order.
     ///
-    /// When set, this callback receives `DownloadProgress` snapshots with
-    /// per-part state, bypassing the aggregate `InstallProgressCallback`
-    /// bridge for the download stage. Use this for multi-bar UIs.
-    pub fn with_download_progress(mut self, cb: DownloadProgressCallback) -> Self {
-        self.on_download_progress = Some(Arc::new(cb));
-        self
-    }
-
-    /// Get the local package store.
-    pub fn store(&self) -> &LocalPackageStore {
-        &self.store
-    }
-
-    /// Install a package from a metadata URL.
-    ///
-    /// # Arguments
-    ///
-    /// * `metadata_url` - URL to the package metadata file
-    /// * `on_progress` - Optional progress callback
-    ///
-    /// # Returns
-    ///
-    /// Information about the installed package.
-    pub fn install_from_url(
+    /// Each package is validated and sized first, then the peak disk usage of
+    /// the whole batch is checked once, before anything downloads. Packages
+    /// then install while the next one downloads, or one at a time when only
+    /// that fits (see [`pipeline::schedule_for`]). A package that fails at any
+    /// point fails alone.
+    pub fn install_all(
         &self,
-        metadata_url: &str,
-        on_progress: Option<InstallProgressCallback>,
-    ) -> ManagerResult<InstallResult> {
-        // Report progress helper
-        let report = |stage: InstallStage, progress: f64, message: &str| {
-            if let Some(ref cb) = on_progress {
-                cb(stage, progress, message);
+        packages: &[PackageMetadata],
+        observer: &dyn InstallObserver,
+    ) -> Vec<ManagerResult<InstallResult>> {
+        let mut ready = Vec::new();
+        let refusals: Vec<Option<ManagerError>> = packages
+            .iter()
+            .map(|metadata| match self.prepare(metadata) {
+                Ok(prepared) => {
+                    ready.push(prepared);
+                    None
+                }
+                Err(e) => Some(e),
+            })
+            .collect();
+
+        let mut installed = self.run_ready(ready, observer).into_iter();
+        refusals
+            .into_iter()
+            .map(|refusal| match refusal {
+                None => installed.next().expect("one result per prepared package"),
+                Some(e) => Err(e),
+            })
+            .collect()
+    }
+
+    /// Check the batch's disk peak, then download and install every prepared
+    /// package. Results are in `ready` order.
+    fn run_ready(
+        &self,
+        ready: Vec<Prepared<'_>>,
+        observer: &dyn InstallObserver,
+    ) -> Vec<ManagerResult<InstallResult>> {
+        if ready.is_empty() {
+            return Vec::new();
+        }
+
+        let refuse_all =
+            |reason: &dyn Fn() -> ManagerError| ready.iter().map(|_| Err(reason())).collect();
+        let available = match available_bytes(self.fs_info_provider.as_ref(), &self.temp_dir) {
+            Ok(available) => available,
+            Err(e) => {
+                let reason = e.to_string();
+                return refuse_all(&|| ManagerError::InvalidPath(reason.clone()));
+            }
+        };
+        let sizes: Vec<u64> = ready.iter().map(|p| p.state.total_size).collect();
+        let schedule = match pipeline::schedule_for(&sizes, available) {
+            Ok(schedule) => schedule,
+            Err(required_bytes) => {
+                return refuse_all(&|| ManagerError::InsufficientDiskSpace {
+                    path: self.temp_dir.clone(),
+                    required_bytes,
+                    available_bytes: available,
+                });
             }
         };
 
-        // Stage 1: Fetch metadata
-        report(
-            InstallStage::FetchingMetadata,
-            0.0,
-            "Fetching package metadata...",
-        );
-        let metadata = self.client.fetch_metadata(metadata_url)?;
         info!(
-            region = %metadata.title,
-            package_type = %metadata.package_type,
-            version = %metadata.package_version,
-            parts = metadata.parts.len(),
-            "package metadata fetched"
+            packages = ready.len(),
+            ?schedule,
+            available_bytes = available,
+            "batch install started"
         );
-        report(InstallStage::FetchingMetadata, 1.0, "Metadata fetched");
-
-        // Install using the fetched metadata
-        self.install_from_metadata(&metadata, on_progress)
+        pipeline::run(
+            ready,
+            schedule,
+            |prepared| self.download(prepared, observer),
+            |downloaded| self.install(downloaded, observer),
+        )
     }
 
-    /// Install a package from already-fetched metadata.
-    ///
-    /// # Arguments
-    ///
-    /// * `metadata` - The package metadata
-    /// * `on_progress` - Optional progress callback
-    ///
-    /// # Returns
-    ///
-    /// Information about the installed package.
-    pub fn install_from_metadata(
-        &self,
-        metadata: &PackageMetadata,
-        on_progress: Option<InstallProgressCallback>,
-    ) -> ManagerResult<InstallResult> {
+    /// Validate `metadata`, create its temp directory and size its parts.
+    fn prepare<'a>(&self, metadata: &'a PackageMetadata) -> ManagerResult<Prepared<'a>> {
         let region = &metadata.title;
         // The title becomes the install directory name, and metadata reaches
         // us over HTTP. The parser refuses an unusable title, but
@@ -243,31 +287,18 @@ impl<C: LibraryClient> PackageInstaller<C> {
         // for itself rather than trusting its caller.
         xearthlayer_package::validate_region(region)
             .map_err(|e| ManagerError::InvalidPath(e.to_string()))?;
+        // The archive and part names are joined onto the temp directory, and
+        // arrive by the same route as the title.
+        validate_file_name(&metadata.filename)?;
+        for part in &metadata.parts {
+            validate_file_name(&part.filename)?;
+        }
         let package_type = metadata.package_type;
-        let version = metadata.package_version.clone();
+        let version = &metadata.package_version;
 
-        info!(
-            region = %region,
-            package_type = %package_type,
-            version = %version,
-            parts = metadata.parts.len(),
-            "package install started"
-        );
-
-        // Wrap callback in Arc for sharing with download progress
-        let on_progress = on_progress.map(Arc::new);
-
-        // Report progress helper
-        let report = |stage: InstallStage, progress: f64, message: &str| {
-            if let Some(ref cb) = on_progress {
-                cb(stage, progress, message);
-            }
-        };
-
-        // Check if already installed
         if self.store.is_installed(region, package_type) {
             let existing = self.store.get(region, package_type)?;
-            if existing.version() == &version {
+            if existing.version() == version {
                 return Err(ManagerError::AlreadyInstalled {
                     region: region.to_string(),
                     package_type: package_type.to_string(),
@@ -276,7 +307,6 @@ impl<C: LibraryClient> PackageInstaller<C> {
             }
         }
 
-        // Create temp directory for this installation
         let install_temp = self.temp_dir.join(format!(
             "install_{}_{}_{}",
             region.to_lowercase(),
@@ -287,267 +317,204 @@ impl<C: LibraryClient> PackageInstaller<C> {
             path: install_temp.clone(),
             source: e,
         })?;
+        // From here every exit, including a panic, removes the temp
+        // directory: the guard travels with the package until it is
+        // installed or dropped. See issue #187.
+        let temp = InstallTempGuard::new(install_temp.clone());
 
-        // Wrap the temp directory in a RAII guard so any subsequent
-        // error path (download failure, extraction failure, mid-install
-        // panic) cleans the partial work. The success path also drops
-        // the guard, replacing the explicit Stage 7 cleanup that used
-        // to live below. See issue #187.
-        let _temp_guard = InstallTempGuard::new(install_temp.clone());
-
-        // Prepare download state
-        let urls: Vec<String> = metadata.parts.iter().map(|p| p.url.clone()).collect();
-        let checksums: Vec<String> = metadata.parts.iter().map(|p| p.checksum.clone()).collect();
-        let destinations: Vec<PathBuf> = metadata
-            .parts
-            .iter()
-            .map(|p| install_temp.join(&p.filename))
-            .collect();
-
-        // Stage 2: Download all parts
-        let mut download_state = DownloadState::new(urls, checksums, destinations.clone());
-        let downloader = MultiPartDownloader::with_settings(
-            std::time::Duration::from_secs(300),
-            self.parallel_downloads,
+        let mut state = DownloadState::new(
+            metadata.parts.iter().map(|p| p.url.clone()).collect(),
+            metadata.parts.iter().map(|p| p.checksum.clone()).collect(),
+            metadata
+                .parts
+                .iter()
+                .map(|p| install_temp.join(&p.filename))
+                .collect(),
         );
+        self.transfer.query_sizes(&mut state);
 
-        // Query sizes via HEAD requests for accurate progress
-        report(
-            InstallStage::Downloading,
-            0.0,
-            &format!("Preparing {} parts...", metadata.parts.len()),
-        );
-        downloader.query_sizes(&mut download_state);
+        Ok(Prepared {
+            metadata,
+            temp,
+            state,
+        })
+    }
+
+    /// Download every part of a prepared package.
+    fn download<'a>(
+        &self,
+        prepared: Prepared<'a>,
+        observer: &dyn InstallObserver,
+    ) -> ManagerResult<Downloaded<'a>> {
+        let Prepared {
+            metadata,
+            temp,
+            mut state,
+        } = prepared;
 
         info!(
-            region = %region,
+            region = %metadata.title,
             parts = metadata.parts.len(),
-            parallel_downloads = self.parallel_downloads,
-            total_bytes = download_state.total_size,
+            total_bytes = state.total_size,
             "download phase started"
         );
-        let download_started = Instant::now();
-
-        // Pre-flight disk-space check (issue #188): fail fast with a
-        // clear message if the temp directory's filesystem can't hold
-        // the download plus the extracted contents. We check the temp
-        // dir because that's where peak usage lives during install
-        // (downloaded archive parts + reassembled archive + extracted
-        // tree, all coexisting briefly before cleanup).
-        if download_state.total_size > 0 {
-            let required = download_state
-                .total_size
-                .saturating_mul(SPACE_BUFFER_MULTIPLIER);
-            check_disk_space(self.fs_info_provider.as_ref(), &install_temp, required)?;
-        }
-
-        // Use per-part callback if set, otherwise bridge to aggregate InstallProgressCallback
-        let download_progress: Option<DownloadProgressCallback> =
-            if let Some(ref dp) = self.on_download_progress {
-                Some(Box::new({
-                    let dp = Arc::clone(dp);
-                    move |progress: &DownloadProgress| dp(progress)
-                }))
-            } else {
-                on_progress.as_ref().map(|cb| {
-                    let cb = Arc::clone(cb);
-                    let boxed: DownloadProgressCallback =
-                        Box::new(move |progress: &DownloadProgress| {
-                            let ratio = match progress.total_bytes {
-                                Some(total) if total > 0 => {
-                                    (progress.total_bytes_downloaded as f64 / total as f64).min(1.0)
-                                }
-                                _ => {
-                                    let done = progress
-                                        .parts
-                                        .iter()
-                                        .filter(|p| matches!(p.state, PartState::Done))
-                                        .count();
-                                    if progress.parts.is_empty() {
-                                        0.0
-                                    } else {
-                                        done as f64 / progress.parts.len() as f64
-                                    }
-                                }
-                            };
-                            let message = format!(
-                                "{:.1} / {:.1} MB",
-                                progress.total_bytes_downloaded as f64 / 1_048_576.0,
-                                progress.total_bytes.unwrap_or(0) as f64 / 1_048_576.0,
-                            );
-                            cb(InstallStage::Downloading, ratio, &message);
-                        });
-                    boxed
-                })
-            };
-
-        downloader.download_all(&mut download_state, download_progress)?;
-
-        let bytes_downloaded = download_state.bytes_downloaded;
+        let started = Instant::now();
+        self.transfer
+            .download_all(&mut state, observer.download_started(metadata))?;
         info!(
-            region = %region,
-            bytes_downloaded,
-            elapsed_secs = download_started.elapsed().as_secs_f64(),
+            region = %metadata.title,
+            bytes_downloaded = state.bytes_downloaded,
+            elapsed_secs = started.elapsed().as_secs_f64(),
             "download phase completed"
         );
-        report(
-            InstallStage::Downloading,
-            1.0,
-            &format!("Downloaded {} bytes", bytes_downloaded),
-        );
 
-        // Stage 3: Verify (checksums already verified during download)
-        report(
-            InstallStage::Verifying,
-            1.0,
-            "Checksums verified during download",
-        );
+        Ok(Downloaded {
+            metadata,
+            temp,
+            parts: state.destinations,
+            bytes_downloaded: state.bytes_downloaded,
+        })
+    }
 
-        // Stage 4: Reassemble archive
-        info!(
-            parts = destinations.len(),
-            archive = %metadata.filename,
-            "reassembly started"
-        );
-        report(InstallStage::Reassembling, 0.0, "Reassembling archive...");
-        let archive_path = install_temp.join(&metadata.filename);
-        let extractor = ShellExtractor::new();
-        extractor.reassemble(&destinations, &archive_path)?;
+    /// Reassemble, extract and install a downloaded package. Its temp
+    /// directory is removed when this returns, whatever the outcome.
+    fn install(
+        &self,
+        downloaded: Downloaded<'_>,
+        observer: &dyn InstallObserver,
+    ) -> ManagerResult<InstallResult> {
+        let Downloaded {
+            metadata,
+            temp,
+            parts,
+            bytes_downloaded,
+        } = downloaded;
+        let report = |stage| observer.install_stage(metadata, stage);
+        let region = &metadata.title;
+        let package_type = metadata.package_type;
 
+        report(InstallStage::Reassembling);
+        let extractor = TarGzExtractor::new();
+        let archive = temp.path().join(&metadata.filename);
+        extractor.reassemble(&parts, &archive)?;
         // Free the parts before extracting rather than at cleanup. They are
         // redundant now and extraction is where peak disk usage lives, so
         // holding them through it costs a full extra copy of the download
         // (#260).
-        let freed_bytes = free_downloaded_parts(&destinations);
-        info!(
-            archive = %metadata.filename,
-            freed_bytes,
-            "reassembly completed, archive parts freed"
-        );
-        report(InstallStage::Reassembling, 1.0, "Archive reassembled");
+        let freed_bytes = free_downloaded_parts(&parts);
+        info!(region = %region, freed_bytes, "reassembly completed, archive parts freed");
 
-        // Stage 5: Extract archive
-        info!(archive = %metadata.filename, "extraction started");
-        report(InstallStage::Extracting, 0.0, "Extracting archive...");
-        let extract_dir = install_temp.join("extracted");
-        let files_extracted = extractor.extract(&archive_path, &extract_dir)?;
-        info!(files_extracted, "extraction completed");
-        report(
-            InstallStage::Extracting,
-            1.0,
-            &format!("Extracted {} files", files_extracted),
-        );
+        report(InstallStage::Extracting);
+        let extract_dir = temp.path().join("extracted");
+        let files_extracted = extractor.extract(&archive, &extract_dir)?;
+        info!(region = %region, files_extracted, "extraction completed");
 
-        // Stage 6: Install to final location
-        report(InstallStage::Installing, 0.0, "Installing package...");
+        report(InstallStage::Installing);
         let install_path = self.store.install_path(region, package_type);
-
-        // Remove existing package if present
         if install_path.exists() {
             fs::remove_dir_all(&install_path).map_err(|e| ManagerError::WriteFailed {
                 path: install_path.clone(),
                 source: e,
             })?;
         }
-
-        // Move extracted contents to install path
-        // The extracted directory should contain the package folder
-        self.move_extracted_contents(&extract_dir, &install_path)?;
-        report(InstallStage::Installing, 1.0, "Package installed");
-
-        // Stage 7: Cleanup is handled by `_temp_guard` dropping when this
-        // scope exits (whether via Ok return, ? on Err, or panic).
-        report(InstallStage::Cleanup, 1.0, "Cleanup complete");
-
-        report(InstallStage::Complete, 1.0, "Installation complete");
+        move_extracted_contents(&extract_dir, &install_path)?;
+        report(InstallStage::Complete);
 
         info!(
             region = %region,
             package_type = %package_type,
-            version = %version,
+            version = %metadata.package_version,
             install_path = %install_path.display(),
             bytes_downloaded,
             files_extracted,
             "package install completed"
         );
-
         Ok(InstallResult {
             region: region.to_string(),
             package_type,
-            version,
+            version: metadata.package_version.clone(),
             install_path,
             bytes_downloaded,
             files_extracted,
         })
     }
+}
 
-    /// Move extracted contents to the install path.
-    fn move_extracted_contents(
-        &self,
-        extract_dir: &Path,
-        install_path: &Path,
-    ) -> ManagerResult<()> {
-        // The archive should contain a single top-level directory (the package folder)
-        // We need to move its contents to the install path
+/// Refuse a metadata-supplied file name unless it is a single plain path
+/// component. Anything else, joined onto a directory, can land outside it:
+/// `..` climbs out, and an absolute name replaces the directory outright.
+fn validate_file_name(name: &str) -> ManagerResult<()> {
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(_)), None) => Ok(()),
+        _ => Err(ManagerError::InvalidPath(format!(
+            "unsafe file name in package metadata: {name:?}"
+        ))),
+    }
+}
 
-        let entries: Vec<_> = fs::read_dir(extract_dir)
-            .map_err(|e| ManagerError::ReadFailed {
-                path: extract_dir.to_path_buf(),
-                source: e,
-            })?
-            .filter_map(|e| e.ok())
-            .collect();
+/// Move extracted contents to the install path.
+fn move_extracted_contents(extract_dir: &Path, install_path: &Path) -> ManagerResult<()> {
+    // The archive should contain a single top-level directory (the package folder)
+    // We need to move its contents to the install path
 
-        if entries.len() == 1 && entries[0].path().is_dir() {
-            // Single directory - this is the package folder, rename it
-            let source = entries[0].path();
+    let entries: Vec<_> = fs::read_dir(extract_dir)
+        .map_err(|e| ManagerError::ReadFailed {
+            path: extract_dir.to_path_buf(),
+            source: e,
+        })?
+        .filter_map(|e| e.ok())
+        .collect();
 
-            // Create parent directory
-            if let Some(parent) = install_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-            }
+    if entries.len() == 1 && entries[0].path().is_dir() {
+        // Single directory - this is the package folder, rename it
+        let source = entries[0].path();
 
-            // Try rename first (fast path if same filesystem)
-            if fs::rename(&source, install_path).is_err() {
-                // Fall back to recursive copy
-                copy_dir_recursive(&source, install_path)?;
-            }
-        } else {
-            // Multiple entries or files at root - move them all
-            if let Some(parent) = install_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
-                    path: parent.to_path_buf(),
-                    source: e,
-                })?;
-            }
-
-            fs::create_dir_all(install_path).map_err(|e| ManagerError::CreateDirFailed {
-                path: install_path.to_path_buf(),
+        // Create parent directory
+        if let Some(parent) = install_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
+                path: parent.to_path_buf(),
                 source: e,
             })?;
+        }
 
-            for entry in entries {
-                let source = entry.path();
-                let dest = install_path.join(entry.file_name());
+        // Try rename first (fast path if same filesystem)
+        if fs::rename(&source, install_path).is_err() {
+            // Fall back to recursive copy
+            copy_dir_recursive(&source, install_path)?;
+        }
+    } else {
+        // Multiple entries or files at root - move them all
+        if let Some(parent) = install_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
+                path: parent.to_path_buf(),
+                source: e,
+            })?;
+        }
 
-                if fs::rename(&source, &dest).is_err() {
-                    if source.is_dir() {
-                        copy_dir_recursive(&source, &dest)?;
-                    } else {
-                        fs::copy(&source, &dest).map_err(|e| ManagerError::WriteFailed {
-                            path: dest,
-                            source: e,
-                        })?;
-                    }
+        fs::create_dir_all(install_path).map_err(|e| ManagerError::CreateDirFailed {
+            path: install_path.to_path_buf(),
+            source: e,
+        })?;
+
+        for entry in entries {
+            let source = entry.path();
+            let dest = install_path.join(entry.file_name());
+
+            if fs::rename(&source, &dest).is_err() {
+                if source.is_dir() {
+                    copy_dir_recursive(&source, &dest)?;
+                } else {
+                    fs::copy(&source, &dest).map_err(|e| ManagerError::WriteFailed {
+                        path: dest,
+                        source: e,
+                    })?;
                 }
             }
         }
-
-        Ok(())
     }
+
+    Ok(())
 }
 
 /// Recursively copy a directory.
@@ -612,6 +579,423 @@ fn free_downloaded_parts(parts: &[PathBuf]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use std::io;
+    use std::sync::{Arc, Mutex};
+
+    use tempfile::TempDir;
+    use xearthlayer_package::ArchivePart;
+
+    use crate::system::FilesystemInfo;
+
+    /// Serves archive parts from memory instead of the network.
+    #[derive(Clone, Default)]
+    struct LocalTransfer {
+        /// Bytes served for each part URL.
+        parts: HashMap<String, Vec<u8>>,
+        /// Size reported for every part when set, otherwise its real size.
+        declared_size: Option<u64>,
+        /// URLs whose download fails.
+        failing: Vec<String>,
+        /// URLs downloaded, in order, shared with the test.
+        downloaded: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl PartTransfer for LocalTransfer {
+        fn query_sizes(&self, state: &mut DownloadState) {
+            state.total_size = state
+                .urls
+                .iter()
+                .map(|url| {
+                    let real = self.parts.get(url).map_or(0, |p| p.len() as u64);
+                    self.declared_size.unwrap_or(real)
+                })
+                .sum();
+        }
+
+        fn download_all(
+            &self,
+            state: &mut DownloadState,
+            _on_progress: Option<DownloadProgressCallback>,
+        ) -> ManagerResult<()> {
+            for (url, dest) in state.urls.iter().zip(&state.destinations) {
+                if self.failing.contains(url) {
+                    return Err(ManagerError::DownloadFailed {
+                        url: url.clone(),
+                        reason: "connection reset".to_string(),
+                    });
+                }
+                let bytes = &self.parts[url];
+                fs::write(dest, bytes).unwrap();
+                state.bytes_downloaded += bytes.len() as u64;
+                self.downloaded.lock().unwrap().push(url.clone());
+            }
+            Ok(())
+        }
+    }
+
+    /// Records every observer event as "<event> <title>".
+    #[derive(Default)]
+    struct Recorder(Mutex<Vec<String>>);
+
+    impl Recorder {
+        fn events(&self) -> Vec<String> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl InstallObserver for Recorder {
+        fn download_started(&self, package: &PackageMetadata) -> Option<DownloadProgressCallback> {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("download {}", package.title));
+            None
+        }
+
+        fn install_stage(&self, package: &PackageMetadata, stage: InstallStage) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("{} {}", stage.name(), package.title));
+        }
+    }
+
+    /// Reports a fixed amount of free space.
+    struct FreeSpace(u64);
+
+    impl FsInfoProvider for FreeSpace {
+        fn fs_info(&self, _path: &Path) -> io::Result<FilesystemInfo> {
+            Ok(FilesystemInfo {
+                total_bytes: u64::MAX,
+                available_bytes: self.0,
+            })
+        }
+    }
+
+    /// Add a one-part ortho package for `title` to `transfer`. Like a
+    /// published package, its archive holds the package's metadata file
+    /// alongside its content, `<mountpoint>/terrain/tile.ter`.
+    fn package(title: &str, transfer: &mut LocalTransfer) -> PackageMetadata {
+        let mountpoint = xearthlayer_package::package_mountpoint(title, PackageType::Ortho);
+        let url = format!("test://{title}");
+        let filename = format!("{mountpoint}-1.0.0.tar.gz");
+        let metadata = PackageMetadata {
+            spec_version: semver::Version::new(1, 0, 0),
+            title: title.to_string(),
+            package_version: semver::Version::new(1, 0, 0),
+            published_at: chrono::Utc::now(),
+            package_type: PackageType::Ortho,
+            mountpoint: mountpoint.clone(),
+            parts: vec![ArchivePart::new(
+                "unused",
+                format!("{filename}.aa"),
+                url.clone(),
+            )],
+            filename,
+        };
+
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        let files = [
+            (
+                "xearthlayer_scenery_package.txt",
+                xearthlayer_package::serialize_package_metadata(&metadata),
+            ),
+            ("terrain/tile.ter", format!("terrain for {title}")),
+        ];
+        for (name, body) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(body.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("{mountpoint}/{name}"), body.as_bytes())
+                .unwrap();
+        }
+        transfer
+            .parts
+            .insert(url, builder.into_inner().unwrap().finish().unwrap());
+        metadata
+    }
+
+    fn installer(temp: &TempDir, transfer: LocalTransfer, free: u64) -> PackageInstaller {
+        PackageInstaller::new(
+            LocalPackageStore::new(temp.path().join("Custom Scenery")),
+            temp.path().join("tmp"),
+        )
+        .with_transfer(Box::new(transfer))
+        .with_fs_info_provider(Box::new(FreeSpace(free)))
+    }
+
+    #[test]
+    fn a_batch_installs_every_package() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let batch = [
+            package("AF-NORTH", &mut transfer),
+            package("AF-SOUTH", &mut transfer),
+        ];
+
+        let results =
+            installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+
+        assert_eq!(results.len(), 2);
+        for (result, title) in results.iter().zip(["AF-NORTH", "AF-SOUTH"]) {
+            let result = result.as_ref().unwrap();
+            assert_eq!(result.region, title);
+            assert_eq!(result.files_extracted, 2);
+            assert_eq!(
+                fs::read_to_string(result.install_path.join("terrain/tile.ter")).unwrap(),
+                format!("terrain for {title}")
+            );
+        }
+    }
+
+    #[test]
+    fn the_observer_hears_each_download_and_every_install_stage() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let batch = [
+            package("AF-NORTH", &mut transfer),
+            package("AF-SOUTH", &mut transfer),
+        ];
+        let recorder = Recorder::default();
+
+        installer(&temp, transfer, u64::MAX).install_all(&batch, &recorder);
+
+        let events = recorder.events();
+        for title in ["AF-NORTH", "AF-SOUTH"] {
+            let at = |event: &str| {
+                let event = format!("{event} {title}");
+                events
+                    .iter()
+                    .position(|e| *e == event)
+                    .unwrap_or_else(|| panic!("no '{event}' in {events:?}"))
+            };
+            assert!(at("download") < at("Reassembling"));
+            assert!(at("Reassembling") < at("Extracting"));
+            assert!(at("Extracting") < at("Installing"));
+            assert!(at("Installing") < at("Complete"));
+        }
+    }
+
+    #[test]
+    fn a_failed_download_does_not_stop_the_batch() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let batch = [
+            package("AF-NORTH", &mut transfer),
+            package("AF-SOUTH", &mut transfer),
+        ];
+        transfer.failing.push("test://AF-NORTH".to_string());
+
+        let results =
+            installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+
+        assert!(
+            matches!(results[0], Err(ManagerError::DownloadFailed { .. })),
+            "{:?}",
+            results[0]
+        );
+        assert!(results[1].is_ok(), "{:?}", results[1]);
+    }
+
+    /// A hostile package metadata file could name a title that escapes the
+    /// Custom Scenery directory once `package_mountpoint` joins it into a
+    /// path, because that function prefixes only the first path component.
+    /// The metadata parser now refuses such a title, but `PackageMetadata` is
+    /// publicly constructible, so the install path itself is checked too.
+    #[test]
+    fn a_title_that_escapes_the_scenery_directory_is_refused_and_the_batch_continues() {
+        let temp = TempDir::new().unwrap();
+        let victim = temp.path().join("victim");
+        fs::create_dir_all(&victim).unwrap();
+        fs::write(victim.join("keep.txt"), b"keep").unwrap();
+        let mut transfer = LocalTransfer::default();
+        let mut hostile = package("AF-NORTH", &mut transfer);
+        hostile.title = "../victim".to_string();
+        let south = package("AF-SOUTH", &mut transfer);
+        let downloaded = Arc::clone(&transfer.downloaded);
+
+        let results = installer(&temp, transfer, u64::MAX)
+            .install_all(&[hostile, south], &Recorder::default());
+
+        assert!(
+            matches!(results[0], Err(ManagerError::InvalidPath(_))),
+            "{:?}",
+            results[0]
+        );
+        assert!(results[1].is_ok(), "{:?}", results[1]);
+        assert!(victim.join("keep.txt").exists());
+        assert_eq!(*downloaded.lock().unwrap(), ["test://AF-SOUTH"]);
+    }
+
+    #[test]
+    fn an_installed_version_is_refused_without_downloading_it_again() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let north = package("AF-NORTH", &mut transfer);
+        let downloaded = Arc::clone(&transfer.downloaded);
+        let first = installer(&temp, transfer.clone(), u64::MAX)
+            .install_all(std::slice::from_ref(&north), &Recorder::default());
+        assert!(first[0].is_ok(), "{:?}", first[0]);
+
+        let again =
+            installer(&temp, transfer, u64::MAX).install_all(&[north], &Recorder::default());
+
+        assert!(
+            matches!(again[0], Err(ManagerError::AlreadyInstalled { .. })),
+            "{:?}",
+            again[0]
+        );
+        assert_eq!(downloaded.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_batch_that_cannot_install_even_one_package_at_a_time_downloads_nothing() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer {
+            declared_size: Some(50),
+            ..LocalTransfer::default()
+        };
+        let batch = [
+            package("AF-NORTH", &mut transfer),
+            package("AF-SOUTH", &mut transfer),
+        ];
+        let downloaded = Arc::clone(&transfer.downloaded);
+
+        // One at a time needs 4 * 50 = 200.
+        let results = installer(&temp, transfer, 199).install_all(&batch, &Recorder::default());
+
+        for result in &results {
+            match result {
+                Err(ManagerError::InsufficientDiskSpace {
+                    required_bytes,
+                    available_bytes,
+                    ..
+                }) => {
+                    assert_eq!((*required_bytes, *available_bytes), (200, 199));
+                }
+                other => panic!("expected InsufficientDiskSpace, got {other:?}"),
+            }
+        }
+        assert!(downloaded.lock().unwrap().is_empty());
+        assert_eq!(fs::read_dir(temp.path().join("tmp")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_batch_that_only_fits_one_package_at_a_time_still_installs() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer {
+            declared_size: Some(50),
+            ..LocalTransfer::default()
+        };
+        let batch = [
+            package("AF-NORTH", &mut transfer),
+            package("AF-SOUTH", &mut transfer),
+        ];
+
+        // Overlapped needs 4 * 50 + 50 = 250; one at a time needs 200.
+        let results = installer(&temp, transfer, 200).install_all(&batch, &Recorder::default());
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(Result::is_ok), "{results:?}");
+    }
+
+    #[test]
+    fn nothing_is_left_in_the_temp_directory() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let batch = [
+            package("AF-NORTH", &mut transfer),
+            package("AF-SOUTH", &mut transfer),
+        ];
+        transfer.failing.push("test://AF-SOUTH".to_string());
+
+        installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// Part and archive file names come from metadata fetched over HTTP and
+    /// are joined onto the package's temp directory, so `../x` would write
+    /// outside it and an absolute name would replace the directory entirely.
+    /// The checksums come from the same file, so they cannot catch it.
+    #[test]
+    fn only_a_single_plain_path_component_is_a_valid_file_name() {
+        assert!(validate_file_name("zzXEL_af-north_ortho-1.0.0.tar.gz.aa").is_ok());
+        for hostile in [
+            "",
+            ".",
+            "..",
+            "../x.aa",
+            "a/../../x.aa",
+            "sub/x.aa",
+            "/etc/x.aa",
+        ] {
+            assert!(
+                matches!(
+                    validate_file_name(hostile),
+                    Err(ManagerError::InvalidPath(_))
+                ),
+                "{hostile:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_part_file_name_that_escapes_the_temp_directory_is_refused_before_downloading() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let mut hostile = package("AF-NORTH", &mut transfer);
+        hostile.parts[0].filename = "../../escaped.aa".to_string();
+        let downloaded = Arc::clone(&transfer.downloaded);
+
+        let results =
+            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+
+        assert!(
+            matches!(results[0], Err(ManagerError::InvalidPath(_))),
+            "{:?}",
+            results[0]
+        );
+        assert!(downloaded.lock().unwrap().is_empty());
+        assert!(!temp.path().join("escaped.aa").exists());
+    }
+
+    #[test]
+    fn an_archive_file_name_that_escapes_the_temp_directory_is_refused_before_downloading() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let mut hostile = package("AF-NORTH", &mut transfer);
+        let target = temp.path().join("escaped.tar.gz");
+        hostile.filename = target.to_string_lossy().into_owned();
+        let downloaded = Arc::clone(&transfer.downloaded);
+
+        let results =
+            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+
+        assert!(
+            matches!(results[0], Err(ManagerError::InvalidPath(_))),
+            "{:?}",
+            results[0]
+        );
+        assert!(downloaded.lock().unwrap().is_empty());
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn test_install_stage_name() {
+        assert_eq!(InstallStage::Reassembling.name(), "Reassembling");
+        assert_eq!(InstallStage::Extracting.name(), "Extracting");
+        assert_eq!(InstallStage::Installing.name(), "Installing");
+        assert_eq!(InstallStage::Complete.name(), "Complete");
+    }
 
     /// #260: the parts stay on disk through reassembly and extraction, so the
     /// temp filesystem briefly holds the parts, the reassembled archive AND the
@@ -656,39 +1040,6 @@ mod tests {
     }
 
     #[test]
-    fn test_install_stage_name() {
-        assert_eq!(InstallStage::FetchingMetadata.name(), "Fetching metadata");
-        assert_eq!(InstallStage::Downloading.name(), "Downloading");
-        assert_eq!(InstallStage::Verifying.name(), "Verifying");
-        assert_eq!(InstallStage::Reassembling.name(), "Reassembling");
-        assert_eq!(InstallStage::Extracting.name(), "Extracting");
-        assert_eq!(InstallStage::Installing.name(), "Installing");
-        assert_eq!(InstallStage::Cleanup.name(), "Cleaning up");
-        assert_eq!(InstallStage::Complete.name(), "Complete");
-    }
-
-    #[test]
-    fn test_install_stage_equality() {
-        assert_eq!(InstallStage::Downloading, InstallStage::Downloading);
-        assert_ne!(InstallStage::Downloading, InstallStage::Extracting);
-    }
-
-    #[test]
-    fn test_install_stage_is_indeterminate() {
-        // Indeterminate stages - no meaningful percentage
-        assert!(InstallStage::FetchingMetadata.is_indeterminate());
-        assert!(InstallStage::Verifying.is_indeterminate());
-        assert!(InstallStage::Reassembling.is_indeterminate());
-        assert!(InstallStage::Extracting.is_indeterminate());
-        assert!(InstallStage::Installing.is_indeterminate());
-        assert!(InstallStage::Cleanup.is_indeterminate());
-
-        // Determinate stages - show percentage progress
-        assert!(!InstallStage::Downloading.is_indeterminate());
-        assert!(!InstallStage::Complete.is_indeterminate());
-    }
-
-    #[test]
     fn test_copy_dir_recursive() {
         use tempfile::TempDir;
 
@@ -711,66 +1062,5 @@ mod tests {
 
         let content = fs::read_to_string(dest.join("file1.txt")).unwrap();
         assert_eq!(content, "hello");
-    }
-
-    /// A hostile package metadata file could name a title that escapes the
-    /// Custom Scenery directory once `package_mountpoint` joins it into a
-    /// path, because that function prefixes only the first path component.
-    /// The metadata parser now refuses such a title, but `PackageMetadata` is
-    /// publicly constructible, so the install path itself is checked too.
-    #[test]
-    fn installing_refuses_a_title_that_escapes_the_scenery_directory() {
-        use crate::manager::LocalPackageStore;
-        use xearthlayer_package::PackageType;
-
-        struct UnusedClient;
-        impl LibraryClient for UnusedClient {
-            fn fetch_library(
-                &self,
-                _url: &str,
-            ) -> ManagerResult<xearthlayer_package::PackageLibrary> {
-                panic!("the install must be refused before any network access");
-            }
-            fn fetch_metadata(&self, _url: &str) -> ManagerResult<PackageMetadata> {
-                panic!("the install must be refused before any network access");
-            }
-        }
-
-        let temp = tempfile::tempdir().expect("tempdir");
-        let scenery = temp.path().join("Custom Scenery");
-        std::fs::create_dir_all(&scenery).expect("scenery dir");
-        let victim = temp.path().join("victim");
-        std::fs::create_dir_all(&victim).expect("victim dir");
-        std::fs::write(victim.join("keep.txt"), b"keep").expect("victim file");
-
-        let installer = PackageInstaller::new(
-            UnusedClient,
-            LocalPackageStore::new(&scenery),
-            temp.path().join("tmp"),
-        );
-
-        let metadata = PackageMetadata {
-            spec_version: semver::Version::new(1, 0, 0),
-            title: "../victim".to_string(),
-            package_version: semver::Version::new(1, 0, 0),
-            published_at: chrono::Utc::now(),
-            package_type: PackageType::Ortho,
-            mountpoint: "zzXEL_x_ortho".to_string(),
-            filename: "zzXEL_x_ortho-1.0.0.tar.gz".to_string(),
-            parts: Vec::new(),
-        };
-
-        let err = installer
-            .install_from_metadata(&metadata, None)
-            .expect_err("a title that escapes Custom Scenery must be refused");
-
-        assert!(
-            matches!(err, ManagerError::InvalidPath(_)),
-            "expected the title to be refused as an invalid path, got {err:?}"
-        );
-        assert!(
-            victim.join("keep.txt").exists(),
-            "nothing outside the scenery directory may be touched"
-        );
     }
 }

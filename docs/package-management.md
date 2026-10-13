@@ -315,12 +315,15 @@ xearthlayer packages remove <REGION> [OPTIONS]
 
 ## Disk Space
 
-Large packages are split into multiple parts (typically 500 MB each) for easier downloading. During installation, you'll need:
+Large packages are split into multiple parts for easier downloading. While a package installs, its temp directory holds the reassembled archive and the extracted tree together, which can take up to four times the size of the download. Temporary files are removed as soon as each package finishes, whether it succeeds or fails.
 
-- Enough space for the download (in temp directory)
-- Enough space for the extracted package (in scenery directory)
+When a command installs or updates several packages, each package installs while the next one downloads, so a batch takes about as long as its downloads rather than its downloads plus its installs. That overlap needs room for one package's install and the next package's download at the same time. XEarthLayer checks the whole batch once, before downloading anything:
 
-After extraction, temporary files are automatically cleaned up.
+- If the overlap fits, packages download and install side by side.
+- If only one package at a time fits, the batch runs one package at a time instead, exactly as earlier versions did.
+- If not even that fits, nothing is downloaded and the command reports how much space it needs.
+
+No external tools are needed to unpack a package: archives are extracted inside XEarthLayer itself.
 
 ## Network Issues
 

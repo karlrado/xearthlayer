@@ -58,8 +58,7 @@ mod size;
 mod urls;
 
 pub use archive::{
-    archive_filename, build_archive, check_required_tools, format_archive_size, ArchiveBuildResult,
-    ArchivePart,
+    archive_filename, build_archive, format_archive_size, ArchiveBuildResult, ArchivePart,
 };
 pub use config::{
     parse_size, read_config, write_config, RepoConfig, DEFAULT_PART_SIZE, MAX_PART_SIZE,

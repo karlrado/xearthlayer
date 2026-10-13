@@ -37,4 +37,9 @@ rayon = "1.10"
 tracing = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 tempfile = "3.8"
+# zlib-rs: pure-Rust deflate/inflate that picks SIMD (AVX2, SSE, NEON) at run
+# time, so one binary is fast on every CPU. Package archives are built and
+# extracted on it (#274).
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
+tar = "0.4"
 clap = { version = "4.5", features = ["derive"] }
