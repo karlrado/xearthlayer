@@ -204,42 +204,52 @@ fn select_installed(
     resolve(selector, installed, |p| p.region())
 }
 
-/// Fetch a library entry's metadata, then download and install the package
-/// with progress reporting. Shared by `install`, its overlay auto-install,
-/// and `update`.
-fn fetch_and_install(
-    entry: &LibraryEntry,
+/// Fetch each entry's metadata, then install every package whose metadata
+/// arrived as one batch, so each installs while the next downloads (#292).
+/// Shared by `install` and `update`. Returns one result per entry, in order.
+fn install_entries(
+    entries: &[&LibraryEntry],
     install_dir: &Path,
     temp_dir: &Path,
     concurrent_downloads: usize,
     ctx: &CommandContext<'_>,
-) -> Result<InstallResult, CliError> {
+) -> Vec<Result<InstallResult, CliError>> {
     ctx.output.println("Fetching package metadata...");
-    let metadata = ctx
-        .manager
-        .fetch_metadata(&entry.metadata_url)
-        .map_err(|e| CliError::Packages(e.to_string()))?;
-
-    ctx.output.println(&format!(
-        "Package: {} v{}",
-        metadata.title, metadata.package_version
-    ));
-    ctx.output.println(&format!(
-        "Parts: {} ({})",
-        metadata.parts.len(),
-        metadata.filename
-    ));
+    let mut batch = Vec::new();
+    let fetch_failures: Vec<Option<CliError>> = entries
+        .iter()
+        .map(
+            |entry| match ctx.manager.fetch_metadata(&entry.metadata_url) {
+                Ok(metadata) => {
+                    ctx.output.println(&format!(
+                        "Package: {} v{}",
+                        metadata.title, metadata.package_version
+                    ));
+                    ctx.output.println(&format!(
+                        "Parts: {} ({})",
+                        metadata.parts.len(),
+                        metadata.filename
+                    ));
+                    batch.push(metadata);
+                    None
+                }
+                Err(e) => Some(CliError::Packages(e.to_string())),
+            },
+        )
+        .collect();
     ctx.output.newline();
 
-    let result = ctx.manager.install_package(
-        &metadata,
-        install_dir,
-        temp_dir,
-        concurrent_downloads,
-        Some(ctx.output.create_progress_callback()),
-    );
-    ctx.output.progress_done();
-    result
+    let mut installed = ctx
+        .manager
+        .install_packages(&batch, install_dir, temp_dir, concurrent_downloads)
+        .into_iter();
+    fetch_failures
+        .into_iter()
+        .map(|failure| match failure {
+            None => installed.next().expect("one result per package"),
+            Some(e) => Err(e),
+        })
+        .collect()
 }
 
 /// Rebuild the consolidated overlay folder after an overlay install/remove/update.
@@ -295,74 +305,82 @@ fn rebuild_consolidated_overlay(
 pub struct InstallHandler;
 
 impl InstallHandler {
-    /// Install one library entry, then do what its type needs afterwards:
-    /// rebuild the consolidated overlay, or auto-install the region's overlay.
-    fn install_entry(
-        entry: &LibraryEntry,
-        library: &PackageLibrary,
+    /// The packages to install: each selected entry, followed by its
+    /// region's overlay when auto-install is on and the library has one.
+    fn plan<'a>(
+        entries: &[&'a LibraryEntry],
+        library: &'a PackageLibrary,
+        auto_install_overlays: bool,
+    ) -> Vec<&'a LibraryEntry> {
+        entries
+            .iter()
+            .flat_map(|&entry| {
+                let overlay = (auto_install_overlays && entry.package_type == PackageType::Ortho)
+                    .then(|| library.find(&entry.title, PackageType::Overlay))
+                    .flatten();
+                std::iter::once(entry).chain(overlay)
+            })
+            .collect()
+    }
+
+    /// Report each package's outcome, rebuild the consolidated overlay once
+    /// if any overlay installed, and fail the command if any package failed.
+    ///
+    /// Packages succeed or fail independently: an overlay still installs
+    /// when its ortho package fails.
+    fn report(
+        plan: &[&LibraryEntry],
+        results: Vec<Result<InstallResult, CliError>>,
         args: &InstallArgs,
         ctx: &CommandContext<'_>,
     ) -> Result<(), CliError> {
-        let result = fetch_and_install(
-            entry,
-            &args.install_dir,
-            &args.temp_dir,
-            args.concurrent_downloads,
-            ctx,
-        )?;
-        ctx.output.success(&format!(
-            "Installed {} ({}) v{} to {}",
-            result.region,
-            result.package_type,
-            result.version,
-            result.install_path.display()
-        ));
-        ctx.output.println(&format!(
-            "Downloaded {} bytes, extracted {} files",
-            format_size(result.bytes_downloaded as usize),
-            result.files_extracted
-        ));
-
-        match entry.package_type {
-            PackageType::Overlay => {
-                ctx.output.newline();
-                rebuild_consolidated_overlay(
-                    &args.install_dir,
-                    &args.custom_scenery_path,
-                    args.disable_overlays,
-                    ctx,
-                );
+        let mut failures = Vec::new();
+        let mut overlay_installed = false;
+        for (entry, result) in plan.iter().zip(results) {
+            match result {
+                Ok(result) => {
+                    ctx.output.success(&format!(
+                        "Installed {} ({}) v{} to {}",
+                        result.region,
+                        result.package_type,
+                        result.version,
+                        result.install_path.display()
+                    ));
+                    ctx.output.println(&format!(
+                        "Downloaded {}, extracted {} files",
+                        format_size(result.bytes_downloaded as usize),
+                        result.files_extracted
+                    ));
+                    overlay_installed |= result.package_type == PackageType::Overlay;
+                }
+                Err(e) => failures.push((entry, e)),
             }
-            PackageType::Ortho if args.auto_install_overlays => {
-                Self::install_overlay_for_region(&entry.title, library, args, ctx);
-            }
-            PackageType::Ortho => {}
         }
-        Ok(())
-    }
 
-    /// Install the overlay package for `region`, if the library has one.
-    ///
-    /// Best effort: the ortho package it accompanies is already installed, so
-    /// a failure here is reported rather than failing the command.
-    fn install_overlay_for_region(
-        region: &str,
-        library: &PackageLibrary,
-        args: &InstallArgs,
-        ctx: &CommandContext<'_>,
-    ) {
-        let Some(overlay_entry) = library.find(region, PackageType::Overlay) else {
-            return; // No overlay available for this region
-        };
+        if overlay_installed {
+            ctx.output.newline();
+            rebuild_consolidated_overlay(
+                &args.install_dir,
+                &args.custom_scenery_path,
+                args.disable_overlays,
+                ctx,
+            );
+        }
 
-        ctx.output.newline();
-        ctx.output.println(&format!(
-            "Auto-installing overlay package for {}...",
-            region
-        ));
-        if let Err(e) = Self::install_entry(overlay_entry, library, args, ctx) {
-            ctx.output
-                .error(&format!("Failed to install overlay package: {}", e));
+        match failures.len() {
+            0 => Ok(()),
+            _ if plan.len() == 1 => Err(failures.remove(0).1),
+            failed => {
+                for (entry, e) in &failures {
+                    ctx.output
+                        .error(&format!("{} ({}): {}", entry.title, entry.package_type, e));
+                }
+                Err(CliError::Packages(format!(
+                    "{} of {} packages failed to install",
+                    failed,
+                    plan.len()
+                )))
+            }
         }
     }
 }
@@ -391,49 +409,33 @@ impl CommandHandler for InstallHandler {
             .collect();
         let entries = resolve(&args.region, offered, |e| e.title.as_str())?;
 
-        if let [entry] = entries.as_slice() {
-            return Self::install_entry(entry, &library, &args, ctx);
-        }
-
-        ctx.output.println(&format!(
-            "{} matches {} packages ({}):",
-            args.region,
-            entries.len(),
-            args.package_type
-        ));
-        for entry in &entries {
-            ctx.output
-                .indented(&format!("{} v{}", entry.title, entry.version));
-        }
-        ctx.output.newline();
-        if !ctx.interaction.confirm("Proceed with install?") {
-            ctx.output.println("Install cancelled.");
-            return Ok(());
-        }
-
-        // A failure is reported and the batch continues: a partial continent
-        // is still useful.
-        let mut failed = 0;
-        for entry in &entries {
-            ctx.output.newline();
+        if entries.len() > 1 {
             ctx.output.println(&format!(
-                "Installing {} ({})...",
-                entry.title, entry.package_type
+                "{} matches {} packages ({}):",
+                args.region,
+                entries.len(),
+                args.package_type
             ));
-            if let Err(e) = Self::install_entry(entry, &library, &args, ctx) {
-                ctx.output.error(&e.to_string());
-                failed += 1;
+            for entry in &entries {
+                ctx.output
+                    .indented(&format!("{} v{}", entry.title, entry.version));
+            }
+            ctx.output.newline();
+            if !ctx.interaction.confirm("Proceed with install?") {
+                ctx.output.println("Install cancelled.");
+                return Ok(());
             }
         }
 
-        if failed > 0 {
-            return Err(CliError::Packages(format!(
-                "{} of {} packages failed to install",
-                failed,
-                entries.len()
-            )));
-        }
-        Ok(())
+        let plan = Self::plan(&entries, &library, args.auto_install_overlays);
+        let results = install_entries(
+            &plan,
+            &args.install_dir,
+            &args.temp_dir,
+            args.concurrent_downloads,
+            ctx,
+        );
+        Self::report(&plan, results, &args, ctx)
     }
 }
 
@@ -509,45 +511,46 @@ impl CommandHandler for UpdateHandler {
             ctx.output.newline();
         }
 
-        // Perform updates
         let mut success_count = 0;
         let mut error_count = 0;
         let mut overlay_updated = false;
 
-        for (info, _) in updates {
-            ctx.output.println(&format!(
-                "Updating {} ({})...",
-                info.region, info.package_type
-            ));
+        let mut entries = Vec::new();
+        for (info, _) in &updates {
+            match library.find(&info.region, info.package_type) {
+                Some(entry) => entries.push(entry),
+                None => {
+                    ctx.output.error(&format!(
+                        "Package {} ({}) not found in library",
+                        info.region, info.package_type
+                    ));
+                    error_count += 1;
+                }
+            }
+        }
 
-            let Some(entry) = library.find(&info.region, info.package_type) else {
-                ctx.output.error(&format!(
-                    "Package {} ({}) not found in library",
-                    info.region, info.package_type
-                ));
-                error_count += 1;
-                continue;
-            };
-
-            match fetch_and_install(
-                entry,
-                &args.install_dir,
-                &args.temp_dir,
-                args.concurrent_downloads,
-                ctx,
-            ) {
+        let results = install_entries(
+            &entries,
+            &args.install_dir,
+            &args.temp_dir,
+            args.concurrent_downloads,
+            ctx,
+        );
+        for (entry, result) in entries.iter().zip(results) {
+            match result {
                 Ok(result) => {
                     ctx.output.success(&format!(
                         "Updated {} ({}) to v{}",
                         result.region, result.package_type, result.version
                     ));
-                    if result.package_type == PackageType::Overlay {
-                        overlay_updated = true;
-                    }
+                    overlay_updated |= result.package_type == PackageType::Overlay;
                     success_count += 1;
                 }
                 Err(e) => {
-                    ctx.output.error(&format!("Failed to update: {}", e));
+                    ctx.output.error(&format!(
+                        "Failed to update {} ({}): {}",
+                        entry.title, entry.package_type, e
+                    ));
                     error_count += 1;
                 }
             }
@@ -1008,7 +1011,7 @@ mod tests {
     fn a_failed_install_does_not_stop_the_rest_of_the_batch() {
         let manager = FakeManager::default()
             .with_library(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"])
-            .failing_on("NA-CANADA-WEST");
+            .failing_on("NA-CANADA-WEST", PackageType::Ortho);
 
         let run = install(&manager, true, "NA-CANADA", false);
 
@@ -1036,6 +1039,52 @@ mod tests {
                 "NA-CANADA-EAST"
             ]
         );
+    }
+
+    #[test]
+    fn install_with_auto_overlays_installs_every_package_in_one_batch() {
+        // One batch, so each package installs while the next downloads (#292).
+        let canada = ["NA-CANADA-WEST", "NA-CANADA-EAST"];
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &canada)
+            .with_library(PackageType::Overlay, &canada);
+
+        install(&manager, true, "NA-CANADA", true).result.unwrap();
+
+        assert_eq!(
+            manager.batches(),
+            [[
+                "NA-CANADA-WEST (ortho)",
+                "NA-CANADA-WEST (overlay)",
+                "NA-CANADA-EAST (ortho)",
+                "NA-CANADA-EAST (overlay)",
+            ]]
+        );
+    }
+
+    #[test]
+    fn an_overlay_still_installs_when_its_ortho_fails() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_library(PackageType::Overlay, &["NA-GREENLAND"])
+            .failing_on("NA-GREENLAND", PackageType::Ortho);
+
+        let run = install(&manager, true, "NA-GREENLAND", true);
+
+        let text = run.output.text();
+        assert!(text.contains("Installed NA-GREENLAND (overlay)"), "{text}");
+        assert!(packages_error(run.result).contains("1 of 2"));
+    }
+
+    #[test]
+    fn a_single_failed_install_reports_its_own_error() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .failing_on("NA-GREENLAND", PackageType::Ortho);
+
+        let message = packages_error(install(&manager, true, "NA-GREENLAND", false).result);
+
+        assert!(message.contains("NA-GREENLAND (ortho) failed"), "{message}");
     }
 
     // ------------------------------------------------------------------------
@@ -1083,5 +1132,35 @@ mod tests {
 
         assert!(message.contains("Available: EU-WEST"), "{message}");
         assert!(!message.contains("AF-NORTH"), "{message}");
+    }
+
+    #[test]
+    fn update_installs_every_update_in_one_batch() {
+        let manager = FakeManager::default()
+            .with_update(PackageType::Ortho, "NA-CANADA-WEST")
+            .with_update(PackageType::Ortho, "NA-CANADA-EAST");
+
+        update(&manager, "NA-CANADA").result.unwrap();
+
+        assert_eq!(
+            manager.batches(),
+            [["NA-CANADA-WEST (ortho)", "NA-CANADA-EAST (ortho)"]]
+        );
+    }
+
+    #[test]
+    fn a_failed_update_does_not_stop_the_others() {
+        let manager = FakeManager::default()
+            .with_update(PackageType::Ortho, "NA-CANADA-WEST")
+            .with_update(PackageType::Ortho, "NA-CANADA-EAST")
+            .failing_on("NA-CANADA-WEST", PackageType::Ortho);
+
+        let run = update(&manager, "NA-CANADA");
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-CANADA-WEST", "NA-CANADA-EAST"]);
+        let text = run.output.text();
+        assert!(text.contains("Failed to update NA-CANADA-WEST"), "{text}");
+        assert!(text.contains("1 succeeded, 1 failed"), "{text}");
     }
 }

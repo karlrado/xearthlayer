@@ -49,6 +49,7 @@ mod install_guard;
 mod installer;
 mod local;
 mod mounts;
+mod pipeline;
 mod symlinks;
 mod traits;
 mod updates;
@@ -57,14 +58,14 @@ pub use cache::{CacheStats, CachedLibraryClient};
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
 pub use disk_check::{
-    check_disk_space, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
+    available_bytes, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
 };
 pub use download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
 pub use error::{ManagerError, ManagerResult};
 pub use extractor::TarGzExtractor;
-pub use installer::{InstallProgressCallback, InstallResult, InstallStage, PackageInstaller};
+pub use installer::{InstallObserver, InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use symlinks::{

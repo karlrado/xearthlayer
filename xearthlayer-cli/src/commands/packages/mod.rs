@@ -17,6 +17,7 @@
 
 mod args;
 mod handlers;
+mod progress;
 mod selector;
 mod services;
 #[cfg(test)]

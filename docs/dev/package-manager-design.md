@@ -200,22 +200,68 @@ Per-part retry via `RetryDownloader` decorator wrapping `HttpDownloader`:
 
 ## Installation Process
 
-### Ortho Packages
+`PackageInstaller::install_all` installs a batch of packages; a single install
+is a batch of one. Installing has two halves with different bottlenecks, and
+the batch overlaps them (#292).
 
-1. Download all parts
-2. Verify checksums
-3. Reassemble: `cat parts > archive.tar.gz`
-4. Extract to `install_location/<package_name>/`
-5. Verify `xearthlayer_scenery_package.txt` exists
-6. Register package for mounting
+### Per package
 
-### Overlay Packages
+1. **Prepare.** Validate the title and every archive and part file name (each
+   must be a single plain path component, since all of them come from metadata
+   fetched over HTTP and are joined onto paths). Refuse a version that is
+   already installed. Create the package's temp directory under an
+   `InstallTempGuard`, then size its parts with HEAD requests.
+2. **Download** (network bound). Fetch every part into the temp directory,
+   verifying checksums as parts arrive.
+3. **Install** (disk bound). Reassemble the parts into one archive and free the
+   parts (#260), extract the `tar.gz` in process with the `tar` crate over
+   flate2's `zlib-rs` backend (#274), then move the extracted tree into the
+   package store. Dropping the guard removes the temp directory on every exit
+   path.
 
-1. Download all parts
-2. Verify checksums
-3. Reassemble and extract to `install_location/<package_name>/`
-4. Create symlink: `Custom Scenery/<package_name>` → `install_location/<package_name>`
-5. Verify symlink resolves correctly
+### Batch schedule
+
+`manager/pipeline.rs` runs downloads on the calling thread and installs on a
+single worker thread, joined by a rendezvous channel (`sync_channel(0)`). A
+downloaded package is handed over only once the previous install has finished,
+so at most one package installs while one downloads, and package `k` cannot
+start downloading before package `k - 2` has left the disk. Packages never
+install in parallel: they would only compete for the same disk.
+
+The free space is read once, after every package is sized and before anything
+downloads. Installing a package peaks at `SPACE_BUFFER_MULTIPLIER` (4) times
+its download, so with download sizes `s`:
+
+| Schedule | Peak |
+|---|---|
+| Overlapped | `max(4 * s[i] + s[i+1], 4 * s[last])` |
+| Sequential | `max(4 * s[i])` |
+
+`pipeline::schedule_for` overlaps when that peak fits, falls back to sequential
+when only that fits, and otherwise refuses the batch before downloading. A
+batch is therefore never refused where installing its packages one at a time
+would have succeeded. A per-package check made when each download starts would
+not work: during the overlap it would see the previous package's half-written
+tree as used space.
+
+A failure at any stage is that package's result alone; every other package in
+the batch still downloads and installs.
+
+### Progress
+
+Progress is reported through `InstallObserver`: `download_started` returns the
+per-part callback for the package downloading, and `install_stage` reports the
+typed stage of the package installing. The two can arrive concurrently. The
+CLI's `ConsoleInstallObserver` shows a spinner line for the install above the
+part bars of the download.
+
+### Overlays
+
+The CLI plans the whole batch before it starts: each selected package, followed
+by its region's overlay when `packages.auto_install_overlays` is on. Packages
+succeed or fail independently, so an overlay installs even if its ortho package
+fails. After a batch that installed any overlay, the CLI rebuilds the
+consolidated `yzXEL_overlay/` folder once.
 
 ### Symlink Considerations
 

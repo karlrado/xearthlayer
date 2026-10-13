@@ -16,7 +16,7 @@ use xearthlayer::manager::{
 };
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageMetadata, PackageType};
 
-use super::traits::{Output, PackageManagerService, ProgressCallback, UserInteraction};
+use super::traits::{Output, PackageManagerService, UserInteraction};
 use crate::error::CliError;
 
 /// Output that keeps every line, for asserting on what the user saw.
@@ -38,12 +38,6 @@ impl Output for RecordingOutput {
 
     fn print(&self, message: &str) {
         self.println(message);
-    }
-
-    fn progress_done(&self) {}
-
-    fn create_progress_callback(&self) -> ProgressCallback {
-        Box::new(|_, _, _| {})
     }
 }
 
@@ -83,8 +77,10 @@ pub struct FakeManager {
     library: PackageLibrary,
     installed: Vec<InstalledPackage>,
     statuses: Vec<(PackageInfo, PackageStatus)>,
+    /// "TITLE (type)" of packages whose install fails.
     failing: Vec<String>,
-    installs: Mutex<Vec<String>>,
+    /// Each `install_packages` call, as "TITLE (type)" per package.
+    batches: Mutex<Vec<Vec<String>>>,
     removals: Mutex<Vec<String>>,
 }
 
@@ -138,15 +134,24 @@ impl FakeManager {
         self
     }
 
-    /// Make installing `title` fail.
-    pub fn failing_on(mut self, title: &str) -> Self {
-        self.failing.push(title.to_string());
+    /// Make installing `title` as `package_type` fail.
+    pub fn failing_on(mut self, title: &str, package_type: PackageType) -> Self {
+        self.failing.push(format!("{title} ({package_type})"));
         self
     }
 
     /// Titles installed, in order, including failed attempts.
     pub fn installs(&self) -> Vec<String> {
-        self.installs.lock().unwrap().clone()
+        self.batches()
+            .into_iter()
+            .flatten()
+            .map(|p| p.split(" (").next().unwrap().to_string())
+            .collect()
+    }
+
+    /// Each batch installed, as "TITLE (type)" per package.
+    pub fn batches(&self) -> Vec<Vec<String>> {
+        self.batches.lock().unwrap().clone()
     }
 
     /// Titles removed, in order.
@@ -182,26 +187,36 @@ impl PackageManagerService for FakeManager {
         self.statuses.clone()
     }
 
-    fn install_package(
+    fn install_packages(
         &self,
-        metadata: &PackageMetadata,
+        packages: &[PackageMetadata],
         install_dir: &Path,
         _temp_dir: &Path,
         _concurrent_downloads: usize,
-        _on_progress: Option<ProgressCallback>,
-    ) -> Result<InstallResult, CliError> {
-        self.installs.lock().unwrap().push(metadata.title.clone());
-        if self.failing.contains(&metadata.title) {
-            return Err(CliError::Packages(format!("{} failed", metadata.title)));
-        }
-        Ok(InstallResult {
-            region: metadata.title.clone(),
-            package_type: metadata.package_type,
-            version: metadata.package_version.clone(),
-            install_path: install_dir.join(&metadata.title),
-            bytes_downloaded: 0,
-            files_extracted: 0,
-        })
+    ) -> Vec<Result<InstallResult, CliError>> {
+        self.batches.lock().unwrap().push(
+            packages
+                .iter()
+                .map(|m| format!("{} ({})", m.title, m.package_type))
+                .collect(),
+        );
+        packages
+            .iter()
+            .map(|metadata| {
+                let key = format!("{} ({})", metadata.title, metadata.package_type);
+                if self.failing.contains(&key) {
+                    return Err(CliError::Packages(format!("{key} failed")));
+                }
+                Ok(InstallResult {
+                    region: metadata.title.clone(),
+                    package_type: metadata.package_type,
+                    version: metadata.package_version.clone(),
+                    install_path: install_dir.join(&metadata.title),
+                    bytes_downloaded: 0,
+                    files_extracted: 0,
+                })
+            })
+            .collect()
     }
 
     fn remove_package(

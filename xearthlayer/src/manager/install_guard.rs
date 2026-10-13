@@ -14,7 +14,7 @@
 //! Cleanup is unconditional and idempotent: removing an already-deleted
 //! directory is silently ignored.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// RAII guard that wipes a directory tree when dropped.
 ///
@@ -29,6 +29,11 @@ impl InstallTempGuard {
     /// when the guard is dropped.
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// The directory this guard removes.
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }
 

@@ -6,15 +6,11 @@
 use std::path::Path;
 
 use xearthlayer::manager::{
-    InstallResult, InstallStage, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo,
-    PackageStatus,
+    InstallResult, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo, PackageStatus,
 };
 use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
 use crate::error::CliError;
-
-/// Type alias for progress callback to reduce complexity.
-pub type ProgressCallback = Box<dyn Fn(InstallStage, f64, &str) + Send + Sync>;
 
 // ============================================================================
 // Output Trait - Abstracts console/UI output
@@ -31,17 +27,6 @@ pub trait Output: Send + Sync {
     /// Print text without a newline.
     #[allow(dead_code)]
     fn print(&self, message: &str);
-
-    /// Signal that progress display is complete.
-    ///
-    /// Call this after progress operations are done to ensure proper output formatting.
-    fn progress_done(&self);
-
-    /// Create a progress callback for package installation.
-    ///
-    /// Returns a boxed callback compatible with the manager's install function.
-    /// The callback is responsible for displaying progress information.
-    fn create_progress_callback(&self) -> ProgressCallback;
 
     /// Print an empty line.
     fn newline(&self) {
@@ -107,15 +92,15 @@ pub trait PackageManagerService: Send + Sync {
         library: &PackageLibrary,
     ) -> Vec<(PackageInfo, PackageStatus)>;
 
-    /// Install a package.
-    fn install_package(
+    /// Install a batch of packages, each installing while the next one
+    /// downloads. Returns one result per package, in order.
+    fn install_packages(
         &self,
-        metadata: &PackageMetadata,
+        packages: &[PackageMetadata],
         install_dir: &Path,
         temp_dir: &Path,
         concurrent_downloads: usize,
-        on_progress: Option<ProgressCallback>,
-    ) -> Result<InstallResult, CliError>;
+    ) -> Vec<Result<InstallResult, CliError>>;
 
     /// Remove a package.
     fn remove_package(

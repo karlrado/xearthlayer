@@ -5,16 +5,13 @@
 
 use std::io::{self, BufRead, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-
-use super::traits::{Output, PackageManagerService, ProgressCallback, UserInteraction};
+use super::progress::ConsoleInstallObserver;
+use super::traits::{Output, PackageManagerService, UserInteraction};
 use crate::error::CliError;
 use xearthlayer::manager::{
-    DownloadProgress, DownloadProgressCallback, HttpLibraryClient, InstallResult, InstalledPackage,
-    LibraryClient, LocalPackageStore, ManagerResult, PackageInfo, PackageInstaller, PackageStatus,
-    PartState, UpdateChecker,
+    HttpLibraryClient, InstallResult, InstalledPackage, LibraryClient, LocalPackageStore,
+    ManagerResult, PackageInfo, PackageInstaller, PackageStatus, UpdateChecker,
 };
 use xearthlayer_package::{PackageLibrary, PackageMetadata, PackageType};
 
@@ -41,58 +38,6 @@ impl Output for ConsoleOutput {
     fn print(&self, message: &str) {
         print!("{}", message);
         io::stdout().flush().ok();
-    }
-
-    fn progress_done(&self) {
-        // Print newline to preserve the final progress state
-        println!();
-    }
-
-    fn create_progress_callback(&self) -> ProgressCallback {
-        let bar = Arc::new(Mutex::new(ProgressBar::new(100)));
-
-        // Configure the initial bar style (progress bar for determinate stages)
-        {
-            let b = bar.lock().unwrap();
-            b.set_style(
-                ProgressStyle::with_template(
-                    "{spinner:.cyan} {prefix:.bold} [{bar:30.cyan/dim}] {percent:>3}% {msg}",
-                )
-                .unwrap()
-                .progress_chars("##-"),
-            );
-        }
-
-        Box::new(move |stage, progress, message| {
-            let b = bar.lock().unwrap();
-
-            if stage == xearthlayer::manager::InstallStage::Complete {
-                b.finish_and_clear();
-                return;
-            }
-
-            if stage.is_indeterminate() {
-                b.set_style(
-                    ProgressStyle::with_template("{spinner:.cyan} {prefix:.bold} {msg}").unwrap(),
-                );
-                b.set_prefix(stage.name().to_string());
-                b.set_message(message.to_string());
-                b.enable_steady_tick(std::time::Duration::from_millis(100));
-            } else {
-                b.disable_steady_tick();
-                b.set_style(
-                    ProgressStyle::with_template(
-                        "{spinner:.cyan} {prefix:.bold} [{bar:30.cyan/dim}] {percent:>3}% {msg}",
-                    )
-                    .unwrap()
-                    .progress_chars("##-"),
-                );
-                b.set_length(100);
-                b.set_position((progress * 100.0).min(100.0) as u64);
-                b.set_prefix(stage.name().to_string());
-                b.set_message(message.to_string());
-            }
-        })
     }
 }
 
@@ -184,127 +129,23 @@ impl PackageManagerService for DefaultPackageManagerService {
         }
     }
 
-    fn install_package(
+    fn install_packages(
         &self,
-        metadata: &PackageMetadata,
+        packages: &[PackageMetadata],
         install_dir: &Path,
         temp_dir: &Path,
         concurrent_downloads: usize,
-        on_progress: Option<ProgressCallback>,
-    ) -> Result<InstallResult, CliError> {
-        let store = LocalPackageStore::new(install_dir);
-
-        // Wrap the aggregate callback to skip Downloading stage — per-part bars handle it
-        let on_progress: Option<ProgressCallback> = on_progress.map(|cb| {
-            let wrapped: ProgressCallback = Box::new(move |stage, progress, message| {
-                if stage == xearthlayer::manager::InstallStage::Downloading {
-                    return; // Per-part bars handle this
-                }
-                cb(stage, progress, message);
-            });
-            wrapped
-        });
-
-        // Create per-part progress bars
-        let mp = MultiProgress::new();
-        let part_style = ProgressStyle::with_template(
-            "  {prefix:.dim} [{bar:25.cyan/dim}] {percent:>3}% {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>12}",
-        )
-        .unwrap()
-        .progress_chars("##-");
-        let fail_style = ProgressStyle::with_template("  {prefix:.red} {msg:.red}").unwrap();
-        let retry_style = ProgressStyle::with_template("  {prefix:.yellow} {msg:.yellow}").unwrap();
-
-        let queued_style = ProgressStyle::with_template("  {prefix:.dim} {msg:.dim}").unwrap();
-        let bars: Vec<ProgressBar> = metadata
-            .parts
-            .iter()
-            .map(|part| {
-                let bar = mp.add(ProgressBar::new(0));
-                bar.set_style(queued_style.clone());
-                bar.set_prefix(part.filename.clone());
-                bar.set_message("(queued)");
-                bar
-            })
-            .collect();
-
-        // Footer bar for aggregate progress
-        let footer = mp.add(ProgressBar::new(0));
-        footer.set_style(
-            ProgressStyle::with_template(
-                "\n  Total [{bar:25.green/dim}] {percent:>3}% {bytes:>10}/{total_bytes:<10} {binary_bytes_per_sec:>12}",
-            )
-            .unwrap()
-            .progress_chars("##-"),
-        );
-
-        let bars = Arc::new(bars);
-        let footer = Arc::new(footer);
-        let part_style = Arc::new(part_style);
-        let fail_style_arc = Arc::new(fail_style);
-        let retry_style_arc = Arc::new(retry_style);
-
-        let download_cb: DownloadProgressCallback = Box::new({
-            let bars = Arc::clone(&bars);
-            let footer = Arc::clone(&footer);
-            let part_style = Arc::clone(&part_style);
-            let fail_style = Arc::clone(&fail_style_arc);
-            let retry_style = Arc::clone(&retry_style_arc);
-            move |progress: &DownloadProgress| {
-                for part in &progress.parts {
-                    if part.index >= bars.len() {
-                        continue;
-                    }
-                    let bar = &bars[part.index];
-                    // Skip already-finished bars to avoid duplicate rendering
-                    if bar.is_finished() {
-                        continue;
-                    }
-                    match &part.state {
-                        PartState::Queued => {}
-                        PartState::Downloading => {
-                            if let Some(total) = part.total_bytes {
-                                bar.set_length(total);
-                            }
-                            bar.set_style((*part_style).clone());
-                            bar.set_position(part.bytes_downloaded);
-                        }
-                        PartState::Done => {
-                            // Clear completed bars so the list scrolls naturally
-                            bar.finish_and_clear();
-                        }
-                        PartState::Failed { reason, .. } => {
-                            bar.set_style((*fail_style).clone());
-                            bar.abandon_with_message(format!("(failed: {})", reason));
-                        }
-                        PartState::Retrying { attempt } => {
-                            bar.set_style((*retry_style).clone());
-                            bar.set_message(format!("(retry {}/3)", attempt));
-                        }
-                    }
-                }
-                if let Some(total) = progress.total_bytes {
-                    footer.set_length(total);
-                }
-                footer.set_position(progress.total_bytes_downloaded);
-            }
-        });
-
-        let installer = PackageInstaller::new(self.client.clone(), store, temp_dir)
+    ) -> Vec<Result<InstallResult, CliError>> {
+        let observer = ConsoleInstallObserver::default();
+        let results = PackageInstaller::new(LocalPackageStore::new(install_dir), temp_dir)
             .with_parallel_downloads(concurrent_downloads)
-            .with_download_progress(download_cb);
+            .install_all(packages, &observer);
+        observer.finish();
 
-        let result = installer
-            .install_from_metadata(metadata, on_progress)
-            .map_err(|e| CliError::Packages(e.to_string()));
-
-        // Clean up progress bars
-        footer.finish_and_clear();
-        for bar in bars.iter() {
-            bar.finish_and_clear();
-        }
-
-        result
+        results
+            .into_iter()
+            .map(|r| r.map_err(|e| CliError::Packages(e.to_string())))
+            .collect()
     }
 
     fn remove_package(
