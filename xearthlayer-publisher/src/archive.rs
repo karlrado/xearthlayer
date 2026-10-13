@@ -1,18 +1,26 @@
 //! Archive building for package distribution.
 //!
-//! Creates tar.gz archives from package directories and splits them
-//! into manageable parts for distribution.
+//! Archives a package directory as `tar.gz` and cuts it into parts for
+//! distribution, entirely in process: no `tar` or `split` binary is needed
+//! (#274). The archive streams straight into its parts, each hashed as it is
+//! written, so the package is read once and nothing is written twice.
 //!
-//! Uses external tools (`tar`, `split`) which are standard on Linux and
-//! macOS. Only flags shared by the GNU and BSD variants are used.
+//! The output stays what system `tar -czf` piped through `split -b` would
+//! produce in form: one gzip stream holding the package directory, cut into
+//! parts named `.aa`, `.ab` and so on at exactly `part_size` bytes. Entries
+//! are written in sorted order and the gzip header carries no timestamp, so
+//! the same tree always yields the same parts and checksums.
 
-use std::fs;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use sha2::{Digest, Sha256};
 
 use semver::Version;
 
-use super::metadata::calculate_sha256;
 use super::{PublishError, PublishResult, RepoConfig};
 use xearthlayer_package::{self as package, PackageType};
 
@@ -48,33 +56,6 @@ pub struct ArchivePart {
     pub size: u64,
 }
 
-/// Check if required external tools are available.
-pub fn check_required_tools() -> PublishResult<()> {
-    check_tool_available("tar", &["--version"])?;
-    // BSD split (macOS) has no --version flag; splitting /dev/null is a
-    // portable no-op probe (empty input produces no output files).
-    check_tool_available("split", &["-b", "1", "/dev/null"])?;
-    Ok(())
-}
-
-/// Check if a specific tool is available.
-fn check_tool_available(tool: &str, args: &[&str]) -> PublishResult<()> {
-    let result = Command::new(tool).args(args).output();
-
-    match result {
-        Ok(output) if output.status.success() => Ok(()),
-        Ok(_) => Err(PublishError::ArchiveFailed(format!(
-            "'{}' command failed. Please ensure it is properly installed.",
-            tool
-        ))),
-        Err(e) => Err(PublishError::ArchiveFailed(format!(
-            "'{}' command not found: {}. \
-             Please install it using your package manager (e.g., 'apt install {}' or 'dnf install {}').",
-            tool, e, tool, tool
-        ))),
-    }
-}
-
 /// Generate the archive filename for a package.
 ///
 /// This is a re-export of [`xearthlayer_package::archive_filename`] for convenience.
@@ -105,9 +86,6 @@ pub fn build_archive(
     version: &Version,
     config: &RepoConfig,
 ) -> PublishResult<ArchiveBuildResult> {
-    // Check tools are available
-    check_required_tools()?;
-
     // Validate package directory exists
     if !package_dir.exists() || !package_dir.is_dir() {
         return Err(PublishError::InvalidPath(format!(
@@ -130,42 +108,7 @@ pub fn build_archive(
     })?;
 
     let archive_name = archive_filename(region, package_type, version);
-    let archive_path = type_dist_dir.join(&archive_name);
-
-    // Create tar.gz archive
-    create_tar_gz(package_dir, &archive_path)?;
-
-    // Get archive size to determine if splitting is needed
-    let archive_size = fs::metadata(&archive_path)
-        .map_err(|e| PublishError::ReadFailed {
-            path: archive_path.clone(),
-            source: e,
-        })?
-        .len();
-
-    // Split if larger than part size
-    let parts = if archive_size > config.part_size {
-        split_archive(&archive_path, config.part_size)?
-    } else {
-        // Single part - rename to add .aa suffix for consistency
-        // Note: We can't use with_extension here because the archive name already
-        // has .tar.gz extension, and with_extension would only replace .gz
-        let mut part_filename = archive_path.as_os_str().to_os_string();
-        part_filename.push(".aa");
-        let part_path = PathBuf::from(part_filename);
-        fs::rename(&archive_path, &part_path).map_err(|e| PublishError::WriteFailed {
-            path: part_path.clone(),
-            source: e,
-        })?;
-
-        let checksum = calculate_sha256(&part_path)?;
-        vec![ArchivePart {
-            filename: format!("{}.aa", archive_name),
-            path: part_path,
-            checksum,
-            size: archive_size,
-        }]
-    };
+    let parts = write_split_archive(package_dir, &type_dist_dir, &archive_name, config.part_size)?;
 
     let total_size = parts.iter().map(|p| p.size).sum();
 
@@ -176,140 +119,197 @@ pub fn build_archive(
     })
 }
 
-/// Create a tar.gz archive of a directory.
-fn create_tar_gz(source_dir: &Path, archive_path: &Path) -> PublishResult<()> {
-    // Get the directory name for the archive root
+/// Archive `source_dir` as `tar.gz`, streamed straight into parts of
+/// `part_size` bytes in `out_dir`. The archive's single top-level entry is
+/// the directory itself, as `tar -czf <archive> <dir>` run from its parent.
+fn write_split_archive(
+    source_dir: &Path,
+    out_dir: &Path,
+    archive_name: &str,
+    part_size: u64,
+) -> PublishResult<Vec<ArchivePart>> {
     let dir_name = source_dir
         .file_name()
-        .and_then(|n| n.to_str())
         .ok_or_else(|| PublishError::InvalidPath("invalid source directory name".to_string()))?;
 
-    // Get the parent directory to run tar from
-    let parent_dir = source_dir
-        .parent()
-        .ok_or_else(|| PublishError::InvalidPath("source directory has no parent".to_string()))?;
+    let parts = PartWriter::new(out_dir, archive_name, part_size);
+    let mut tar = tar::Builder::new(GzEncoder::new(parts, Compression::default()));
+    // Store links as links, as `tar` does, rather than archiving their targets.
+    tar.follow_symlinks(false);
+    append_tree(&mut tar, source_dir, Path::new(dir_name))?;
 
-    // Convert archive path to absolute since we're running tar from a different directory
-    let abs_archive_path = if archive_path.is_absolute() {
-        archive_path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|e| PublishError::ArchiveFailed(format!("failed to get cwd: {}", e)))?
-            .join(archive_path)
+    let failed = |e: io::Error| PublishError::ArchiveFailed(format!("{}: {}", archive_name, e));
+    let gz = tar.into_inner().map_err(failed)?;
+    let parts = gz.finish().map_err(failed)?;
+    parts.finish()
+}
+
+/// Append `dir` and everything beneath it to `tar` as `name`, in sorted
+/// order so the same tree always produces the same archive.
+fn append_tree<W: Write>(tar: &mut tar::Builder<W>, dir: &Path, name: &Path) -> PublishResult<()> {
+    let failed = |path: &Path, e: io::Error| {
+        PublishError::ArchiveFailed(format!("{}: {}", path.display(), e))
     };
 
-    let output = Command::new("tar")
-        .current_dir(parent_dir)
-        .args(["-czf", abs_archive_path.to_str().unwrap(), dir_name])
-        .output()
-        .map_err(|e| PublishError::ArchiveFailed(format!("failed to run tar: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PublishError::ArchiveFailed(format!(
-            "tar failed: {}",
-            stderr
-        )));
-    }
-
-    Ok(())
-}
-
-/// Split an archive into parts.
-fn split_archive(archive_path: &Path, part_size: u64) -> PublishResult<Vec<ArchivePart>> {
-    // Generate split prefix (archive path without extension, then re-add it)
-    let archive_name = archive_path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| PublishError::InvalidPath("invalid archive path".to_string()))?;
-
-    let archive_dir = archive_path
-        .parent()
-        .ok_or_else(|| PublishError::InvalidPath("archive path has no parent".to_string()))?;
-
-    // Split prefix is the full archive name with a dot appended
-    let split_prefix = format!("{}.", archive_name);
-
-    let output = Command::new("split")
-        .current_dir(archive_dir)
-        .args(["-b", &part_size.to_string(), archive_name, &split_prefix])
-        .output()
-        .map_err(|e| PublishError::ArchiveFailed(format!("failed to run split: {}", e)))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(PublishError::ArchiveFailed(format!(
-            "split failed: {}",
-            stderr
-        )));
-    }
-
-    // Remove the original archive (we have the split parts now)
-    fs::remove_file(archive_path).map_err(|e| PublishError::WriteFailed {
-        path: archive_path.to_path_buf(),
-        source: e,
-    })?;
-
-    // Find all the parts and calculate checksums
-    collect_archive_parts(archive_dir, archive_name)
-}
-
-/// Collect all archive parts and calculate their checksums.
-fn collect_archive_parts(dir: &Path, archive_name: &str) -> PublishResult<Vec<ArchivePart>> {
-    let prefix = format!("{}.", archive_name);
-    let mut parts = Vec::new();
-
-    let entries = fs::read_dir(dir).map_err(|e| PublishError::ReadFailed {
-        path: dir.to_path_buf(),
-        source: e,
-    })?;
-
-    for entry in entries {
-        let entry = entry.map_err(|e| PublishError::ReadFailed {
+    tar.append_dir(name, dir).map_err(|e| failed(dir, e))?;
+    let mut entries = fs::read_dir(dir)
+        .and_then(|entries| entries.collect::<io::Result<Vec<_>>>())
+        .map_err(|e| PublishError::ReadFailed {
             path: dir.to_path_buf(),
             source: e,
         })?;
+    entries.sort_by_key(|entry| entry.file_name());
 
-        let filename = entry.file_name();
-        let filename_str = filename.to_string_lossy();
+    for entry in entries {
+        let path = entry.path();
+        let entry_name = name.join(entry.file_name());
+        // `file_type` does not follow symlinks, so a link to a directory is
+        // archived as a link, not descended into.
+        let is_dir = entry.file_type().map_err(|e| failed(&path, e))?.is_dir();
+        if is_dir {
+            append_tree(tar, &path, &entry_name)?;
+        } else {
+            tar.append_path_with_name(&path, &entry_name)
+                .map_err(|e| failed(&path, e))?;
+        }
+    }
+    Ok(())
+}
 
-        if filename_str.starts_with(&prefix) {
-            let path = entry.path();
-            let size = fs::metadata(&path)
-                .map_err(|e| PublishError::ReadFailed {
-                    path: path.clone(),
-                    source: e,
-                })?
-                .len();
+/// Letters in a part suffix, as `split`'s default `-a 2`.
+const SUFFIX_LETTERS: u32 = 2;
 
-            let checksum = calculate_sha256(&path)?;
+/// The suffix `split -b` gives part `index`: `aa`, `ab`, ... `zz`.
+fn part_suffix(index: usize) -> Option<String> {
+    if index >= 26usize.pow(SUFFIX_LETTERS) {
+        return None;
+    }
+    let letter = |n: usize| char::from(b'a' + n as u8);
+    Some([letter(index / 26), letter(index % 26)].iter().collect())
+}
 
-            parts.push(ArchivePart {
-                filename: filename_str.to_string(),
-                path,
-                checksum,
-                size,
-            });
+/// A part file being written, with the running hash of its contents.
+struct OpenPart {
+    file: BufWriter<File>,
+    hasher: Sha256,
+    written: u64,
+    filename: String,
+    path: PathBuf,
+}
+
+/// Cuts a byte stream into part files of exactly `part_size` bytes, named
+/// and sized as `split -b` would, hashing each part as it is written so no
+/// part has to be read back.
+struct PartWriter {
+    dir: PathBuf,
+    archive_name: String,
+    part_size: u64,
+    current: Option<OpenPart>,
+    parts: Vec<ArchivePart>,
+}
+
+impl PartWriter {
+    fn new(dir: &Path, archive_name: &str, part_size: u64) -> Self {
+        Self {
+            dir: dir.to_path_buf(),
+            archive_name: archive_name.to_string(),
+            part_size,
+            current: None,
+            parts: Vec::new(),
         }
     }
 
-    // Sort by suffix (aa, ab, ac, etc.)
-    parts.sort_by(|a, b| a.filename.cmp(&b.filename));
-
-    if parts.is_empty() {
-        return Err(PublishError::ArchiveFailed(
-            "no archive parts found after splitting".to_string(),
-        ));
+    /// Flush and record the part being written, if any.
+    fn close_current(&mut self) -> io::Result<()> {
+        if let Some(mut part) = self.current.take() {
+            part.file.flush().map_err(|e| with_path(&part.path, e))?;
+            self.parts.push(ArchivePart {
+                filename: part.filename,
+                path: part.path,
+                checksum: format!("{:x}", part.hasher.finalize()),
+                size: part.written,
+            });
+        }
+        Ok(())
     }
 
-    Ok(parts)
+    fn open_next(&mut self) -> io::Result<&mut OpenPart> {
+        let suffix = part_suffix(self.parts.len()).ok_or_else(|| {
+            io::Error::other(format!(
+                "{} needs more than {} parts; raise part_size",
+                self.archive_name,
+                26usize.pow(SUFFIX_LETTERS)
+            ))
+        })?;
+        let filename = format!("{}.{}", self.archive_name, suffix);
+        let path = self.dir.join(&filename);
+        let file = File::create(&path).map_err(|e| with_path(&path, e))?;
+        Ok(self.current.insert(OpenPart {
+            file: BufWriter::new(file),
+            hasher: Sha256::new(),
+            written: 0,
+            filename,
+            path,
+        }))
+    }
+
+    fn finish(mut self) -> PublishResult<Vec<ArchivePart>> {
+        self.close_current()
+            .map_err(|e| PublishError::ArchiveFailed(e.to_string()))?;
+        if self.parts.is_empty() {
+            return Err(PublishError::ArchiveFailed(format!(
+                "{} produced no data",
+                self.archive_name
+            )));
+        }
+        Ok(self.parts)
+    }
+}
+
+impl Write for PartWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // Parts open on demand, so a stream that ends exactly on a boundary
+        // leaves no empty trailing part, as with `split`.
+        if self
+            .current
+            .as_ref()
+            .is_some_and(|part| part.written == self.part_size)
+        {
+            self.close_current()?;
+        }
+        let part_size = self.part_size;
+        let part = match self.current {
+            Some(ref mut part) => part,
+            None => self.open_next()?,
+        };
+        let room = (part_size - part.written).min(buf.len() as u64) as usize;
+        part.file
+            .write_all(&buf[..room])
+            .map_err(|e| with_path(&part.path, e))?;
+        part.hasher.update(&buf[..room]);
+        part.written += room as u64;
+        Ok(room)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self.current {
+            Some(ref mut part) => part.file.flush().map_err(|e| with_path(&part.path, e)),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Prefix an I/O error with the file it concerns.
+fn with_path(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {}", path.display(), e))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs::File;
-    use std::io::Write;
     use tempfile::TempDir;
 
     #[test]
@@ -326,19 +326,142 @@ mod tests {
         assert_eq!(filename, "yzXEL_eur_overlay-2.0.0.tar.gz");
     }
 
-    #[test]
-    fn test_check_required_tools() {
-        // This should pass on Linux with coreutils installed
-        let result = check_required_tools();
-        assert!(result.is_ok(), "tar and split should be available");
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
     }
 
     #[test]
-    fn test_check_tool_not_available() {
-        let result = check_tool_available("nonexistent_tool_xyz", &["--version"]);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("not found"));
+    fn part_suffixes_follow_split_naming() {
+        assert_eq!(part_suffix(0).as_deref(), Some("aa"));
+        assert_eq!(part_suffix(1).as_deref(), Some("ab"));
+        assert_eq!(part_suffix(25).as_deref(), Some("az"));
+        assert_eq!(part_suffix(26).as_deref(), Some("ba"));
+        assert_eq!(part_suffix(675).as_deref(), Some("zz"));
+        // split -a 2 runs out here too.
+        assert_eq!(part_suffix(676), None);
+    }
+
+    #[test]
+    fn a_stream_is_cut_into_parts_of_exactly_the_part_size() {
+        let temp = TempDir::new().unwrap();
+        let mut writer = PartWriter::new(temp.path(), "pkg.tar.gz", 4);
+        // Writes that straddle part boundaries.
+        for chunk in [&b"abc"[..], b"defgh", b"ij"] {
+            writer.write_all(chunk).unwrap();
+        }
+        let parts = writer.finish().unwrap();
+
+        let expected: [(&str, &[u8]); 3] = [
+            ("pkg.tar.gz.aa", b"abcd"),
+            ("pkg.tar.gz.ab", b"efgh"),
+            ("pkg.tar.gz.ac", b"ij"),
+        ];
+        assert_eq!(parts.len(), expected.len());
+        for (part, (name, bytes)) in parts.iter().zip(expected) {
+            assert_eq!(part.filename, name);
+            assert_eq!(part.path, temp.path().join(name));
+            assert_eq!(fs::read(&part.path).unwrap(), bytes);
+            assert_eq!(part.size, bytes.len() as u64);
+            assert_eq!(part.checksum, sha256_hex(bytes));
+        }
+    }
+
+    #[test]
+    fn a_stream_that_fills_its_last_part_exactly_leaves_no_empty_part() {
+        let temp = TempDir::new().unwrap();
+        let mut writer = PartWriter::new(temp.path(), "pkg.tar.gz", 4);
+        writer.write_all(b"abcdefgh").unwrap();
+
+        let parts = writer.finish().unwrap();
+
+        assert_eq!(parts.len(), 2);
+        assert!(!temp.path().join("pkg.tar.gz.ac").exists());
+    }
+
+    /// A package tree with nested directories, a name with spaces (as in
+    /// `Earth nav data`) and binary content.
+    fn write_package_tree(root: &Path) -> PathBuf {
+        let pkg = root.join("zzXEL_na_ortho");
+        let files: [(&str, &[u8]); 3] = [
+            ("Earth nav data/+40-080/+45-075.dsf", b"DSF bytes"),
+            ("terrain/12345_67890_ZL16.ter", b"A\n800\nTERRAIN\n"),
+            (
+                "textures/12345_67890_ZL16.dds",
+                &[0x44, 0x44, 0x53, 0x20, 0, 255],
+            ),
+        ];
+        for (name, data) in files {
+            let path = pkg.join(name);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, data).unwrap();
+        }
+        pkg
+    }
+
+    fn build(package_dir: &Path, dist_dir: &Path) -> ArchiveBuildResult {
+        build_archive(
+            package_dir,
+            dist_dir,
+            "na",
+            PackageType::Ortho,
+            &Version::new(1, 0, 0),
+            &RepoConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_archive_unpacks_to_the_package_directory_and_everything_in_it() {
+        let temp = TempDir::new().unwrap();
+        let pkg = write_package_tree(&temp.path().join("src"));
+        let result = build(&pkg, &temp.path().join("dist"));
+
+        let mut archive_bytes = Vec::new();
+        for part in &result.parts {
+            archive_bytes.extend(fs::read(&part.path).unwrap());
+        }
+        let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(&archive_bytes[..]));
+        let mut files = std::collections::BTreeMap::new();
+        for entry in archive.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.header().entry_type().is_file() {
+                let name = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut data = Vec::new();
+                std::io::Read::read_to_end(&mut entry, &mut data).unwrap();
+                files.insert(name, data);
+            }
+        }
+
+        assert_eq!(
+            files.keys().cloned().collect::<Vec<_>>(),
+            [
+                "zzXEL_na_ortho/Earth nav data/+40-080/+45-075.dsf",
+                "zzXEL_na_ortho/terrain/12345_67890_ZL16.ter",
+                "zzXEL_na_ortho/textures/12345_67890_ZL16.dds",
+            ]
+        );
+        assert_eq!(
+            files["zzXEL_na_ortho/textures/12345_67890_ZL16.dds"],
+            [0x44, 0x44, 0x53, 0x20, 0, 255]
+        );
+    }
+
+    #[test]
+    fn building_the_same_tree_twice_gives_the_same_checksums() {
+        let temp = TempDir::new().unwrap();
+        let pkg = write_package_tree(&temp.path().join("src"));
+
+        let first = build(&pkg, &temp.path().join("dist1"));
+        let second = build(&pkg, &temp.path().join("dist2"));
+
+        let checksums = |r: &ArchiveBuildResult| {
+            r.parts
+                .iter()
+                .map(|p| p.checksum.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(checksums(&first), checksums(&second));
     }
 
     #[test]

@@ -250,7 +250,7 @@ Packages are distributed as gzip-compressed tar archives, optionally split into 
 
 ### Splitting
 
-Large archives are split using the `split` command convention:
+Large archives are cut into parts named after the `split -b` convention (the publisher produces them in process, byte for byte as `split` would):
 - `zzXEL_eur-1.0.0.tar.gz.aa`
 - `zzXEL_eur-1.0.0.tar.gz.ab`
 - `zzXEL_eur-1.0.0.tar.gz.ac`
