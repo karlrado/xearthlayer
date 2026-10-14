@@ -141,9 +141,11 @@ impl Preflight<BootstrapContext> for ConfigUpgradeWarning {
             return Status::Satisfied;
         }
         match analyze_config(&self.path) {
+            // A retired value is a deprecated setting from the user's side:
+            // something in their file that upgrade will change.
             Ok(analysis) if analysis.needs_upgrade => Status::Warning(Self::message(
                 analysis.missing_keys.len(),
-                analysis.deprecated_keys.len(),
+                analysis.deprecated_keys.len() + analysis.migrated_values.len(),
             )),
             Ok(_) => Status::Satisfied,
             Err(e) => {
@@ -289,6 +291,27 @@ mod tests {
              Use 'xearthlayer config upgrade --dry-run' to preview changes first.\n"
         );
         assert!(!ConfigUpgradeWarning::message(3, 0).contains("deprecated"));
+    }
+
+    #[test]
+    fn upgrade_warning_counts_a_retired_value_as_deprecated() {
+        // A current config whose only staleness is `mode = auto` (#277) must
+        // still be warned about, or the rewrite never gets prompted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        ConfigFile::default().save_to(&path).unwrap();
+        let contents = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            contents.replace("\nmode = opportunistic\n", "\nmode = auto\n"),
+        )
+        .unwrap();
+
+        let check = ConfigUpgradeWarning::with_path(path);
+        assert_eq!(
+            check.inspect(&ctx_for("run")),
+            Status::Warning(ConfigUpgradeWarning::message(0, 1))
+        );
     }
 
     #[test]

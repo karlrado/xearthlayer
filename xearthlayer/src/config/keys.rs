@@ -83,11 +83,6 @@ pub enum ConfigKey {
     PrefetchWebApiPort,
     PrefetchCycleIntervalMs,
 
-    // Adaptive prefetch calibration settings
-    PrefetchCalibrationAggressiveThreshold,
-    PrefetchCalibrationOpportunisticThreshold,
-    PrefetchCalibrationSampleDuration,
-
     // Transition ramp settings
     PrefetchTakeoffClimbFt,
     PrefetchTakeoffTimeoutSecs,
@@ -158,15 +153,6 @@ impl FromStr for ConfigKey {
             "prefetch.mode" => Ok(ConfigKey::PrefetchMode),
             "prefetch.web_api_port" => Ok(ConfigKey::PrefetchWebApiPort),
             "prefetch.cycle_interval_ms" => Ok(ConfigKey::PrefetchCycleIntervalMs),
-            "prefetch.calibration_aggressive_threshold" => {
-                Ok(ConfigKey::PrefetchCalibrationAggressiveThreshold)
-            }
-            "prefetch.calibration_opportunistic_threshold" => {
-                Ok(ConfigKey::PrefetchCalibrationOpportunisticThreshold)
-            }
-            "prefetch.calibration_sample_duration" => {
-                Ok(ConfigKey::PrefetchCalibrationSampleDuration)
-            }
             "prefetch.takeoff_climb_ft" => Ok(ConfigKey::PrefetchTakeoffClimbFt),
             "prefetch.takeoff_timeout_secs" => Ok(ConfigKey::PrefetchTakeoffTimeoutSecs),
             "prefetch.landing_hysteresis_secs" => Ok(ConfigKey::PrefetchLandingHysteresisSecs),
@@ -229,13 +215,6 @@ impl ConfigKey {
             ConfigKey::PrefetchMode => "prefetch.mode",
             ConfigKey::PrefetchWebApiPort => "prefetch.web_api_port",
             ConfigKey::PrefetchCycleIntervalMs => "prefetch.cycle_interval_ms",
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => {
-                "prefetch.calibration_aggressive_threshold"
-            }
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => {
-                "prefetch.calibration_opportunistic_threshold"
-            }
-            ConfigKey::PrefetchCalibrationSampleDuration => "prefetch.calibration_sample_duration",
             ConfigKey::PrefetchTakeoffClimbFt => "prefetch.takeoff_climb_ft",
             ConfigKey::PrefetchTakeoffTimeoutSecs => "prefetch.takeoff_timeout_secs",
             ConfigKey::PrefetchLandingHysteresisSecs => "prefetch.landing_hysteresis_secs",
@@ -351,16 +330,6 @@ impl ConfigKey {
             ConfigKey::PrefetchMode => config.prefetch.mode.clone(),
             ConfigKey::PrefetchWebApiPort => config.prefetch.web_api_port.to_string(),
             ConfigKey::PrefetchCycleIntervalMs => config.prefetch.cycle_interval_ms.to_string(),
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => {
-                config.prefetch.calibration_aggressive_threshold.to_string()
-            }
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => config
-                .prefetch
-                .calibration_opportunistic_threshold
-                .to_string(),
-            ConfigKey::PrefetchCalibrationSampleDuration => {
-                config.prefetch.calibration_sample_duration.to_string()
-            }
             ConfigKey::PrefetchTakeoffClimbFt => config.prefetch.takeoff_climb_ft.to_string(),
             ConfigKey::PrefetchTakeoffTimeoutSecs => {
                 config.prefetch.takeoff_timeout_secs.to_string()
@@ -507,15 +476,6 @@ impl ConfigKey {
             ConfigKey::PrefetchCycleIntervalMs => {
                 config.prefetch.cycle_interval_ms = value.parse().unwrap();
             }
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => {
-                config.prefetch.calibration_aggressive_threshold = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => {
-                config.prefetch.calibration_opportunistic_threshold = value.parse().unwrap();
-            }
-            ConfigKey::PrefetchCalibrationSampleDuration => {
-                config.prefetch.calibration_sample_duration = value.parse().unwrap();
-            }
             ConfigKey::PrefetchTakeoffClimbFt => {
                 config.prefetch.takeoff_climb_ft = value.parse().unwrap();
             }
@@ -617,17 +577,11 @@ impl ConfigKey {
             ConfigKey::PackagesConcurrentDownloads => Box::new(IntegerRangeSpec::new(1, 10)),
             ConfigKey::LoggingFile => Box::new(PathSpec),
             ConfigKey::PrefetchEnabled => Box::new(BooleanSpec),
-            ConfigKey::PrefetchMode => Box::new(OneOfSpec::new(&[
-                "auto",
-                "aggressive",
-                "opportunistic",
-                "disabled",
-            ])),
+            ConfigKey::PrefetchMode => {
+                Box::new(OneOfSpec::new(&["aggressive", "opportunistic", "disabled"]))
+            }
             ConfigKey::PrefetchWebApiPort => Box::new(IntegerRangeSpec::new(1024, 65535)),
             ConfigKey::PrefetchCycleIntervalMs => Box::new(PositiveIntegerSpec),
-            ConfigKey::PrefetchCalibrationAggressiveThreshold => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold => Box::new(PositiveNumberSpec),
-            ConfigKey::PrefetchCalibrationSampleDuration => Box::new(PositiveIntegerSpec),
             ConfigKey::PrefetchTakeoffClimbFt => Box::new(FloatRangeSpec::new(200.0, 5000.0)),
             ConfigKey::PrefetchTakeoffTimeoutSecs => Box::new(IntegerRangeSpec::new(30, 300)),
             ConfigKey::PrefetchLandingHysteresisSecs => Box::new(IntegerRangeSpec::new(5, 60)),
@@ -689,9 +643,6 @@ impl ConfigKey {
             ConfigKey::PrefetchMode,
             ConfigKey::PrefetchWebApiPort,
             ConfigKey::PrefetchCycleIntervalMs,
-            ConfigKey::PrefetchCalibrationAggressiveThreshold,
-            ConfigKey::PrefetchCalibrationOpportunisticThreshold,
-            ConfigKey::PrefetchCalibrationSampleDuration,
             ConfigKey::PrefetchTakeoffClimbFt,
             ConfigKey::PrefetchTakeoffTimeoutSecs,
             ConfigKey::PrefetchLandingHysteresisSecs,
@@ -792,24 +743,6 @@ impl ValueSpecification for PositiveIntegerSpec {
             .parse::<u64>()
             .map(|_| ())
             .map_err(|_| "must be a positive integer".to_string())
-    }
-}
-
-/// Specification for positive floating-point number values.
-struct PositiveNumberSpec;
-
-impl ValueSpecification for PositiveNumberSpec {
-    fn is_satisfied_by(&self, value: &str) -> Result<(), String> {
-        value
-            .parse::<f64>()
-            .map_err(|_| "must be a positive number".to_string())
-            .and_then(|n| {
-                if n >= 0.0 {
-                    Ok(())
-                } else {
-                    Err("must be a positive number".to_string())
-                }
-            })
     }
 }
 
@@ -1395,6 +1328,25 @@ mod tests {
                 ConfigKey::from_str(key).is_err(),
                 "{key} should no longer resolve to a ConfigKey"
             );
+        }
+    }
+
+    #[test]
+    fn prefetch_mode_no_longer_accepts_auto() {
+        assert!(ConfigKey::PrefetchMode.validate("auto").is_err());
+        for mode in ["aggressive", "opportunistic", "disabled"] {
+            assert!(ConfigKey::PrefetchMode.validate(mode).is_ok(), "{mode}");
+        }
+    }
+
+    #[test]
+    fn calibration_keys_are_no_longer_settable() {
+        for key in [
+            "prefetch.calibration_aggressive_threshold",
+            "prefetch.calibration_opportunistic_threshold",
+            "prefetch.calibration_sample_duration",
+        ] {
+            assert!(key.parse::<ConfigKey>().is_err(), "{key}");
         }
     }
 }

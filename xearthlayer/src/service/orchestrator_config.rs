@@ -74,7 +74,7 @@ pub struct PrefetchConfig {
     /// Whether prefetch is enabled.
     pub enabled: bool,
 
-    /// Adaptive prefetch mode: "auto", "aggressive", "opportunistic", or "disabled".
+    /// Adaptive prefetch mode: "aggressive", "opportunistic", or "disabled".
     pub mode: String,
 
     /// Web API port for X-Plane SimState polling.
@@ -82,15 +82,6 @@ pub struct PrefetchConfig {
 
     /// Cycle interval (milliseconds).
     pub cycle_interval_ms: u64,
-
-    /// Calibration: aggressive mode threshold (tiles/sec).
-    pub calibration_aggressive_threshold: f64,
-
-    /// Calibration: opportunistic mode threshold (tiles/sec).
-    pub calibration_opportunistic_threshold: f64,
-
-    /// Calibration: sample duration (seconds).
-    pub calibration_sample_duration: u64,
 
     /// Altitude climb (feet) above takeoff MSL to release transition hold.
     pub takeoff_climb_ft: f32,
@@ -183,11 +174,6 @@ impl OrchestratorConfig {
             mode: config.prefetch.mode.clone(),
             web_api_port: config.prefetch.web_api_port,
             cycle_interval_ms: config.prefetch.cycle_interval_ms,
-            calibration_aggressive_threshold: config.prefetch.calibration_aggressive_threshold,
-            calibration_opportunistic_threshold: config
-                .prefetch
-                .calibration_opportunistic_threshold,
-            calibration_sample_duration: config.prefetch.calibration_sample_duration,
             takeoff_climb_ft: config.prefetch.takeoff_climb_ft,
             takeoff_timeout_secs: config.prefetch.takeoff_timeout_secs,
             landing_hysteresis_secs: config.prefetch.landing_hysteresis_secs,

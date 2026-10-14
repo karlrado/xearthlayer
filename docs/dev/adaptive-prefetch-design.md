@@ -18,7 +18,7 @@
 5. [Three-Window Model](#three-window-model)
 6. [SceneryWindow](#scenerywindow)
 7. [BoundaryStrategy](#boundarystrategy)
-8. [Performance Calibration](#performance-calibration)
+8. [Strategy Mode](#strategy-mode)
 9. [Integration Points](#integration-points)
 10. [Configuration](#configuration)
 11. [Error Handling & Edge Cases](#error-handling--edge-cases)
@@ -55,7 +55,6 @@ The system mirrors X-Plane's own loading model — two independent boundary moni
 3. **Observe window dimensions** — derive X-Plane's scenery window size from actual FUSE request data during initial scene load
 4. **Stay ahead** — trigger prefetch early enough to complete before X-Plane's reactive loading fires
 5. **Handle all flight phases** — turns, diagonal flight, teleports, rendering changes, sparse/ocean regions
-6. **Self-calibrate** based on actual system and network performance
 
 ### Non-Goals
 
@@ -176,7 +175,7 @@ xearthlayer/src/prefetch/
 │   ├── phase_detector.rs        # PhaseDetector (Ground/Transition/Cruise)
 │   ├── transition_throttle.rs   # TransitionThrottle (takeoff ramp-up)
 │   ├── config.rs                # AdaptivePrefetchConfig
-│   └── calibration/             # PerformanceCalibration, RollingCalibrator
+│   └── calibration.rs           # StrategyMode, PerformanceCalibration
 ```
 
 ### Removed Components
@@ -187,6 +186,7 @@ xearthlayer/src/prefetch/
 | `BandCalculator` | `band_calculator.rs` | Band model replaced by boundary prediction |
 | `BoundaryPrioritizer` | `boundary_prioritizer.rs` | Boundary logic absorbed into `SceneryWindow` monitors |
 | `TurnDetector` | `turn_detector.rs` | No longer needed; boundary monitors handle turns naturally |
+| `PerformanceCalibrator`, `RollingCalibrator`, `ThroughputObserver` | `calibration/` | Never wired: nothing fed them samples and nothing read the result (#277) |
 
 ---
 
@@ -891,44 +891,38 @@ pub trait AdaptivePrefetchStrategy: Send + Sync {
 
 ---
 
-## Performance Calibration
+## Strategy Mode
 
-### Calibration Phase
-
-During X-Plane's initial scenery load, the system measures tile generation throughput:
+The trigger mode comes from `prefetch.mode` and nothing else:
 
 ```rust
-pub struct PerformanceCalibration {
-    /// Tiles generated per second (sustained)
-    pub throughput_tiles_per_sec: f64,
-    /// Average time to generate one tile (milliseconds)
-    pub avg_tile_generation_ms: u64,
-    /// Standard deviation of generation time
-    pub tile_generation_stddev_ms: u64,
-    /// Confidence level (0.0 - 1.0) based on sample size
-    pub confidence: f64,
-    /// Recommended strategy based on throughput
-    pub recommended_strategy: StrategyMode,
-    /// Timestamp of calibration
-    pub calibrated_at: Instant,
-    /// Baseline throughput (for degradation detection)
-    pub baseline_throughput: f64,
-}
-
 pub enum StrategyMode {
-    Aggressive,      // > 30 tiles/sec: high-confidence prefetch
-    Opportunistic,   // 10-30 tiles/sec: moderate prefetch
-    Disabled,        // < 10 tiles/sec: skip prefetch
+    Aggressive,      // position-based trigger
+    Opportunistic,   // prefetch when the executor is quiet (default)
+    Disabled,        // never prefetch
 }
 ```
 
-### Rolling Recalibration
+### Why there is no automatic selection
 
-Flight conditions change (sparse oceanic → photogrammetry-heavy metro). The system adapts:
+Version 1.1 of this design measured tile throughput during the initial scenery
+load and picked a mode from it (above 30 tiles/sec aggressive, 10 to 30
+opportunistic, below 10 disabled), with a rolling recalibration every 15
+minutes. That machinery was built and unit tested but never wired: no
+production code fed it completions, and `with_calibration` had no caller, so
+the default `auto` mode always fell through to opportunistic.
 
-- Every 15 minutes: update throughput from sliding 5-minute window
-- Degradation: observed < 70% of baseline → downgrade mode
-- Recovery: observed > 90% of baseline → upgrade mode
+It was removed in #277 rather than wired. Every later change to the prefetcher
+(the sliding box, phase detection, the region state machine and its deferral
+ladder, the transition throttle) was flight tested and tuned against a
+prefetcher that was in fact running opportunistic. Turning selection on would
+change the behaviour those parameters were chosen for, on a signal that has
+never been exercised in the field. `auto` was retired with it; existing configs
+that say `mode = auto` load as `opportunistic`.
+
+`PerformanceCalibration` remains as a fixed estimate
+(`PerformanceCalibration::default_opportunistic()`) that `PrefetchPlan` uses to
+budget plan completion time.
 
 ---
 
@@ -1045,17 +1039,11 @@ enabled = true
 
 # Strategy mode selection
 # Values:
-#   auto          - Select based on calibration (recommended)
-#   aggressive    - Always use high-confidence prefetch
-#   opportunistic - Moderate prefetch
+#   opportunistic - Prefetch when the executor is quiet (default)
+#   aggressive    - Position-based prefetch
 #   disabled      - Never prefetch
-# Default: auto
-mode = auto
-
-# Automatically disable prefetch if system performance is too low
-# Values: auto, never
-# Default: auto
-low_performance_killswitch = auto
+# Default: opportunistic
+mode = opportunistic
 
 # Maximum tiles per prefetch cycle
 # Caps tiles submitted in a single prefetch operation
@@ -1136,15 +1124,9 @@ The following settings from v1.x are deprecated and should be added to `DEPRECAT
 | `track_stability_duration` | (removed) | No TurnDetector |
 | `strategy` | (removed) | No longer selecting between ground/cruise/flight_plan — coordinator auto-selects |
 | `time_budget_margin` | (removed) | Time budget replaced by boundary urgency |
-
-### Calibration Thresholds
-
-```ini
-[prefetch.calibration]
-aggressive_threshold = 30     # tiles/sec for aggressive mode
-opportunistic_threshold = 10  # tiles/sec for opportunistic mode
-sample_duration = 60          # seconds to measure during initial load
-```
+| `calibration_aggressive_threshold` | (removed, #277) | Configured a calibrator that never ran |
+| `calibration_opportunistic_threshold` | (removed, #277) | Configured a calibrator that never ran |
+| `calibration_sample_duration` | (removed, #277) | Configured a calibrator that never ran |
 
 ---
 
@@ -1287,3 +1269,4 @@ Replay flight 5 (LFLL diagonal orbit) log data through the new system and verify
 | 1.1 | January 2026 | Added rolling recalibration, priority-based backpressure, design considerations |
 | 2.0 | March 2026 | Major revision: replaced band-based cruise strategy with boundary-driven model. Three-window architecture (X-Plane / XEL / Target). Dual boundary monitors (lat/lon). Removed CruiseStrategy, BandCalculator, BoundaryPrioritizer, TurnDetector. Added SceneryWindow with window derivation, retention inference, and `Assumed` state for no-coverage starts. Two-phase commit for region tracking. GeoIndex extended with RetainedRegion and PrefetchedRegion layers. Updated configuration (deprecated 7 settings, added 6 new). Based on whitepaper v1.1 findings from 5 flights / 10.5+ hours of data. |
 | 2.1 | March 2026 | **Window dimension and loading depth correction.** Empirical map-based measurement at EDDF/YPAD/WSSS revealed window is ~3° lat × ~3°/cos(lat) lon, not 9×9°. FUSE burst analysis (65 classified events with telemetry) confirmed asymmetric loading depth: ROW loads 3 deep (73%), COL loads 2 deep (64%), both 3-4 wide. Trigger distance ~1° from window edge. Updated defaults: `default_window_rows` 9→3, `default_window_cols` 9→auto, `trigger_distance` 3.0→1.0, `load_depth` 3→0 (auto: 3 rows, 2 cols). See whitepaper v1.2 for methodology. |
+| 2.2 | October 2026 | Removed throughput calibration and the `auto` mode (#277). Mode is configuration only; see [Strategy Mode](#strategy-mode). |

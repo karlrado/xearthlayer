@@ -80,7 +80,8 @@ pub use keys::{ConfigKey, ConfigKeyError, SENSITIVE_VALUE_MASK};
 pub use size::{format_size, parse_size, Size, SizeParseError, GB, KB, MB};
 pub use texture::TextureConfig;
 pub use upgrade::{
-    analyze_config, upgrade_config, ConfigUpgradeAnalysis, UpgradeResult, DEPRECATED_KEYS,
+    analyze_config, deprecated_value, upgrade_config, ConfigUpgradeAnalysis, DeprecatedValue,
+    UpgradeResult, DEPRECATED_KEYS, DEPRECATED_VALUES,
 };
 // Re-export X-Plane utilities for backwards compatibility
 // Prefer using xearthlayer::xplane module directly for new code

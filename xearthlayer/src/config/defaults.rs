@@ -84,23 +84,6 @@ pub const DEFAULT_WEB_API_PORT: u16 = 8086;
 pub const DEFAULT_PREFETCH_CYCLE_INTERVAL_MS: u64 = 2000;
 
 // =============================================================================
-// Adaptive prefetch calibration defaults
-// =============================================================================
-
-/// Default aggressive threshold: 30 tiles/sec.
-/// Systems exceeding this use position-based prefetch triggers.
-pub const DEFAULT_CALIBRATION_AGGRESSIVE_THRESHOLD: f64 = 30.0;
-
-/// Default opportunistic threshold: 10 tiles/sec.
-/// Systems between this and aggressive use circuit breaker triggers.
-/// Below this, prefetch is disabled.
-pub const DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD: f64 = 10.0;
-
-/// Default calibration sample duration: 60 seconds.
-/// How long to measure throughput during initial calibration.
-pub const DEFAULT_CALIBRATION_SAMPLE_DURATION: u64 = 60;
-
-// =============================================================================
 // Transition ramp defaults
 // =============================================================================
 
@@ -276,12 +259,9 @@ impl Default for ConfigFile {
             },
             prefetch: PrefetchSettings {
                 enabled: true,
-                mode: "auto".to_string(),
+                mode: "opportunistic".to_string(),
                 web_api_port: DEFAULT_WEB_API_PORT,
                 cycle_interval_ms: DEFAULT_PREFETCH_CYCLE_INTERVAL_MS,
-                calibration_aggressive_threshold: DEFAULT_CALIBRATION_AGGRESSIVE_THRESHOLD,
-                calibration_opportunistic_threshold: DEFAULT_CALIBRATION_OPPORTUNISTIC_THRESHOLD,
-                calibration_sample_duration: DEFAULT_CALIBRATION_SAMPLE_DURATION,
                 takeoff_climb_ft: DEFAULT_TAKEOFF_CLIMB_FT,
                 takeoff_timeout_secs: DEFAULT_TAKEOFF_TIMEOUT_SECS,
                 landing_hysteresis_secs: DEFAULT_LANDING_HYSTERESIS_SECS,

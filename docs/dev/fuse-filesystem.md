@@ -268,7 +268,7 @@ platform-dependent:
 texture loading under macFUSE (`EXC_BAD_ACCESS` in the sim's texture loader),
 so generated textures use normal kernel caching. Consequences:
 
-- **Reduced observability** -- once the kernel caches a DDS file, repeat reads never reach FUSE. `SceneTracker`, `DdsAccessEvent`, and FUSE-load calibration only see the *cold first read* of each tile; `InferenceAdapter` position inference degrades to "tiles seen once since mount", so steady-state position tracking is effectively **Web API-only** on macOS
+- **Reduced observability** -- once the kernel caches a DDS file, repeat reads never reach FUSE. `SceneTracker` and `DdsAccessEvent` only see the *cold first read* of each tile; `InferenceAdapter` position inference degrades to "tiles seen once since mount", so steady-state position tracking is effectively **Web API-only** on macOS
 - **Prefetch is unaffected** in practice: the adaptive prefetcher is driven by Web API telemetry, and cold reads (the ones that matter for generation) always reach FUSE
 - Stale-data risk is acceptable: generated DDS content for a given tile/provider is immutable within a run
 ### Ranged Reads and Handle Reuse (#233, #234)

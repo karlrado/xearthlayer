@@ -104,7 +104,7 @@ impl Prefetcher for AdaptivePrefetchCoordinator {
     }
 
     fn description(&self) -> &'static str {
-        "Self-calibrating adaptive prefetch with phase detection and turn handling"
+        "Adaptive prefetch with phase detection and turn handling"
     }
 
     fn startup_info(&self) -> String {
@@ -380,7 +380,9 @@ mod tests {
         let coord = AdaptivePrefetchCoordinator::with_defaults();
 
         assert_eq!(coord.name(), "adaptive");
-        assert!(coord.description().contains("Self-calibrating"));
+        assert!(coord.description().contains("phase detection"));
+        // Nothing calibrates since #277; the description must not claim it does.
+        assert!(!coord.description().to_lowercase().contains("calibrat"));
         assert!(coord.startup_info().contains("adaptive"));
     }
 }

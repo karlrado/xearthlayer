@@ -164,7 +164,47 @@ pub const DEPRECATED_KEYS: &[&str] = &[
     // Retry count stays configurable through executor.max_retries.
     "executor.max_concurrent_jobs",
     "executor.retry_base_delay_ms",
+    // Removed in #277 - they configured a throughput calibrator that nothing
+    // fed and whose result nothing read, so no value here ever changed the mode.
+    "prefetch.calibration_aggressive_threshold",
+    "prefetch.calibration_opportunistic_threshold",
+    "prefetch.calibration_sample_duration",
 ];
+
+/// A value a setting no longer accepts, and the value that replaces it.
+///
+/// `DEPRECATED_KEYS` retires a whole setting. This retires one value of a
+/// setting that stays: the parser reads `value` as `replacement`, so an old
+/// config keeps loading, and `config upgrade` rewrites it on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeprecatedValue {
+    /// Setting in "section.key" format.
+    pub key: &'static str,
+    /// The retired value, matched case-insensitively.
+    pub value: &'static str,
+    /// What the retired value is read as.
+    pub replacement: &'static str,
+}
+
+/// Retired values of current settings.
+pub const DEPRECATED_VALUES: &[DeprecatedValue] = &[
+    // Removed in #277 - `auto` deferred to a calibration that was never
+    // supplied, so it always resolved to opportunistic.
+    DeprecatedValue {
+        key: "prefetch.mode",
+        value: "auto",
+        replacement: "opportunistic",
+    },
+];
+
+/// Look up the retired-value entry for `key = value`, if there is one.
+pub fn deprecated_value(key: &str, value: &str) -> Option<DeprecatedValue> {
+    let value = value.trim();
+    DEPRECATED_VALUES
+        .iter()
+        .find(|d| d.key == key && d.value.eq_ignore_ascii_case(value))
+        .copied()
+}
 
 /// Result of analyzing a configuration file for upgrade needs.
 #[derive(Debug, Clone)]
@@ -179,6 +219,9 @@ pub struct ConfigUpgradeAnalysis {
     /// These are preserved during upgrade but flagged for user review.
     pub unknown_keys: Vec<String>,
 
+    /// Settings in user's config holding a retired value, to be rewritten.
+    pub migrated_values: Vec<DeprecatedValue>,
+
     /// Whether any upgrade action is needed.
     pub needs_upgrade: bool,
 }
@@ -190,6 +233,7 @@ impl ConfigUpgradeAnalysis {
             missing_keys: Vec::new(),
             deprecated_keys: Vec::new(),
             unknown_keys: Vec::new(),
+            migrated_values: Vec::new(),
             needs_upgrade: false,
         }
     }
@@ -217,6 +261,10 @@ impl ConfigUpgradeAnalysis {
             parts.push(format!("{} obsolete setting(s)", self.unknown_keys.len()));
         }
 
+        if !self.migrated_values.is_empty() {
+            parts.push(format!("{} retired value(s)", self.migrated_values.len()));
+        }
+
         if parts.is_empty() {
             "Configuration is up to date.".to_string()
         } else {
@@ -237,6 +285,9 @@ pub struct UpgradeResult {
     /// Keys that were removed (deprecated).
     pub removed_keys: Vec<String>,
 
+    /// Retired values that were rewritten to their replacement.
+    pub migrated_values: Vec<DeprecatedValue>,
+
     /// Whether this was a dry run (no changes made).
     pub dry_run: bool,
 }
@@ -255,9 +306,10 @@ impl UpgradeResult {
         }
 
         msg.push_str(&format!(
-            "\nAdded {} setting(s), removed {} deprecated setting(s).",
+            "\nAdded {} setting(s), removed {} deprecated setting(s), rewrote {} retired value(s).",
             self.added_keys.len(),
-            self.removed_keys.len()
+            self.removed_keys.len(),
+            self.migrated_values.len()
         ));
 
         msg
@@ -295,10 +347,13 @@ pub fn analyze_config(path: &Path) -> Result<ConfigUpgradeAnalysis, ConfigFileEr
 
     // Build set of keys present in user's INI file
     let mut user_keys: HashSet<String> = HashSet::new();
+    let mut migrated_values: Vec<DeprecatedValue> = Vec::new();
     for (section, props) in ini.iter() {
         let section_name = section.unwrap_or("");
-        for (key, _) in props.iter() {
-            user_keys.insert(format!("{}.{}", section_name, key));
+        for (key, value) in props.iter() {
+            let name = format!("{}.{}", section_name, key);
+            migrated_values.extend(deprecated_value(&name, value));
+            user_keys.insert(name);
         }
     }
 
@@ -334,13 +389,16 @@ pub fn analyze_config(path: &Path) -> Result<ConfigUpgradeAnalysis, ConfigFileEr
 
     // Upgrade needed if there are missing keys, deprecated keys, OR unknown keys
     // Unknown keys are stale settings from old versions that should be cleaned up
-    let needs_upgrade =
-        !missing_keys.is_empty() || !deprecated_keys.is_empty() || !unknown_keys.is_empty();
+    let needs_upgrade = !missing_keys.is_empty()
+        || !deprecated_keys.is_empty()
+        || !unknown_keys.is_empty()
+        || !migrated_values.is_empty();
 
     Ok(ConfigUpgradeAnalysis {
         missing_keys,
         deprecated_keys,
         unknown_keys,
+        migrated_values,
         needs_upgrade,
     })
 }
@@ -385,6 +443,7 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
             backup_path: None,
             added_keys: Vec::new(),
             removed_keys: Vec::new(),
+            migrated_values: Vec::new(),
             dry_run,
         });
     }
@@ -395,6 +454,7 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
             backup_path: None,
             added_keys: analysis.missing_keys,
             removed_keys: analysis.deprecated_keys,
+            migrated_values: analysis.migrated_values,
             dry_run: true,
         });
     }
@@ -410,7 +470,8 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
         None
     };
 
-    // Load existing config (fills missing values with defaults)
+    // Load existing config (fills missing values with defaults, and the parser
+    // reads each retired value as its replacement)
     let config = ConfigFile::load_from(path)?;
 
     // Save back - this regenerates the complete INI with all settings
@@ -420,6 +481,7 @@ pub fn upgrade_config(path: &Path, dry_run: bool) -> Result<UpgradeResult, Confi
         backup_path,
         added_keys: analysis.missing_keys,
         removed_keys: analysis.deprecated_keys,
+        migrated_values: analysis.migrated_values,
         dry_run: false,
     })
 }
@@ -628,12 +690,14 @@ type = bing
             missing_keys: vec!["a".to_string(), "b".to_string()],
             deprecated_keys: vec!["c".to_string()],
             unknown_keys: Vec::new(),
+            migrated_values: DEPRECATED_VALUES.to_vec(),
             needs_upgrade: true,
         };
 
         let summary = analysis.summary();
         assert!(summary.contains("2 new setting(s)"));
         assert!(summary.contains("1 deprecated setting(s)"));
+        assert!(summary.contains("1 retired value(s)"));
     }
 
     #[test]
@@ -735,9 +799,98 @@ disk_io_concurrent = 64
             backup_path: None,
             added_keys: vec!["a".to_string()],
             removed_keys: Vec::new(),
+            migrated_values: Vec::new(),
             dry_run: true,
         };
 
         assert!(result.summary().contains("DRY RUN"));
+    }
+
+    /// Write a complete, current config whose prefetch mode is `mode`, so the
+    /// only thing an upgrade could find is the mode value itself.
+    fn current_config_with_prefetch_mode(path: &Path, mode: &str) {
+        ConfigFile::default().save_to(path).unwrap();
+        let contents = std::fs::read_to_string(path).unwrap();
+        let line = "\nmode = opportunistic\n";
+        assert_eq!(contents.matches(line).count(), 1, "one prefetch mode line");
+        std::fs::write(path, contents.replace(line, &format!("\nmode = {mode}\n"))).unwrap();
+    }
+
+    #[test]
+    fn test_deprecated_calibration_keys() {
+        // Removed in #277: nothing fed the calibrator and nothing read its result.
+        for key in [
+            "prefetch.calibration_aggressive_threshold",
+            "prefetch.calibration_opportunistic_threshold",
+            "prefetch.calibration_sample_duration",
+        ] {
+            assert!(DEPRECATED_KEYS.contains(&key), "{key}");
+        }
+    }
+
+    #[test]
+    fn analyze_flags_legacy_auto_prefetch_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        current_config_with_prefetch_mode(&config_path, "auto");
+
+        let analysis = analyze_config(&config_path).unwrap();
+
+        assert!(analysis.needs_upgrade, "a retired value is an upgrade");
+        assert!(analysis.missing_keys.is_empty());
+        assert!(analysis.deprecated_keys.is_empty());
+        assert_eq!(
+            analysis.migrated_values,
+            vec![DeprecatedValue {
+                key: "prefetch.mode",
+                value: "auto",
+                replacement: "opportunistic",
+            }]
+        );
+    }
+
+    #[test]
+    fn analyze_leaves_an_explicit_prefetch_mode_alone() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        current_config_with_prefetch_mode(&config_path, "aggressive");
+
+        let analysis = analyze_config(&config_path).unwrap();
+
+        assert!(analysis.migrated_values.is_empty());
+        assert!(!analysis.needs_upgrade);
+    }
+
+    #[test]
+    fn upgrade_rewrites_legacy_auto_prefetch_mode() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        current_config_with_prefetch_mode(&config_path, "auto");
+
+        let result = upgrade_config(&config_path, false).unwrap();
+
+        assert_eq!(result.migrated_values.len(), 1);
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("\nmode = opportunistic\n"));
+        assert!(!contents.contains("\nmode = auto\n"));
+        assert!(!analyze_config(&config_path).unwrap().needs_upgrade);
+    }
+
+    #[test]
+    fn upgrade_removes_the_inert_calibration_keys() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        std::fs::write(
+            &config_path,
+            "[prefetch]\nmode = auto\ncalibration_aggressive_threshold = 30\n\
+             calibration_opportunistic_threshold = 10\ncalibration_sample_duration = 60\n",
+        )
+        .unwrap();
+
+        let result = upgrade_config(&config_path, false).unwrap();
+
+        assert_eq!(result.removed_keys.len(), 3, "{:?}", result.removed_keys);
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!contents.contains("calibration_"));
     }
 }

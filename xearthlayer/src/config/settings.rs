@@ -151,11 +151,10 @@ pub struct LoggingSettings {
 pub struct PrefetchSettings {
     /// Enable predictive tile prefetching based on X-Plane telemetry
     pub enabled: bool,
-    /// Adaptive prefetch mode: "auto", "aggressive", "opportunistic", or "disabled"
+    /// Adaptive prefetch mode: "aggressive", "opportunistic", or "disabled"
     ///
-    /// - "auto": Select mode based on calibration results (recommended)
     /// - "aggressive": Position-based triggers (fast connections)
-    /// - "opportunistic": Circuit breaker triggers (moderate connections)
+    /// - "opportunistic": Circuit breaker triggers (default)
     /// - "disabled": Disable prefetch
     pub mode: String,
     /// Web API port for X-Plane SimState polling (default: 8086)
@@ -163,21 +162,6 @@ pub struct PrefetchSettings {
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
-    // Adaptive prefetch calibration settings
-    /// Minimum throughput for aggressive mode (tiles/sec).
-    /// If measured throughput exceeds this, aggressive (position-based) prefetch is enabled.
-    /// Default: 30.0
-    pub calibration_aggressive_threshold: f64,
-    /// Minimum throughput for opportunistic mode (tiles/sec).
-    /// If measured throughput is between this and aggressive_threshold,
-    /// opportunistic (circuit breaker) prefetch is enabled.
-    /// Below this threshold, prefetch is disabled.
-    /// Default: 10.0
-    pub calibration_opportunistic_threshold: f64,
-    /// How long to measure throughput during initial calibration (seconds).
-    /// Default: 60
-    pub calibration_sample_duration: u64,
-
     // Transition ramp settings
     /// Altitude climb (feet) above takeoff MSL to release transition hold.
     /// Default: 1000.0, Range: 200-5000

@@ -45,10 +45,9 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - **ArcGIS** - Free, global coverage
   - **MapBox** - Requires access token
   - **USGS** - Free, US coverage only
-- **Adaptive Prefetch System** - Self-calibrating tile prediction
+- **Adaptive Prefetch System** - Phase-aware tile prediction
   - Flight phase detection: Ground (ring pattern) vs Cruise (track-based bands)
-  - Performance calibration during X-Plane's initial scenery load
-  - Automatic mode selection: Aggressive, Opportunistic, or Disabled
+  - Configurable mode: Opportunistic (default), Aggressive, or Disabled
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
 - **Multiple compression backends**: ISPC SIMD (default), pure-Rust software, or GPU-accelerated via wgpu compute shaders
@@ -121,23 +120,23 @@ XEarthLayer requires regional scenery packages to be installed in order for it t
 
 ## Adaptive Prefetch System
 
-XEarthLayer reduces scenery loading stutters by prefetching tiles ahead of your aircraft. The system automatically calibrates itself based on your network and system performance.
+XEarthLayer reduces scenery loading stutters by prefetching tiles ahead of your aircraft.
 
 ### How It Works
 
-1. **Performance Calibration**: During X-Plane's initial scenery load (~12° × 12° area), XEarthLayer measures tile generation throughput to determine optimal prefetch mode.
-
-2. **Flight Phase Detection**: The system automatically switches between strategies:
+**Flight Phase Detection**: The system automatically switches between strategies:
    - **Ground Strategy**: Ring-based prefetch around your position (GS < 40kt)
    - **Cruise Strategy**: Track-based band prefetch ahead of your flight path (GS > 40kt)
 
 ### Prefetch Modes
 
+Set with `xearthlayer config set prefetch.mode <mode>`.
+
 | Mode | Trigger | When Used |
 |------|---------|-----------|
-| **Aggressive** | Position-based (0.3° into DSF tile) | Throughput > 30 tiles/sec |
-| **Opportunistic** | Executor load below threshold | Throughput 10-30 tiles/sec |
-| **Disabled** | Never | Throughput < 10 tiles/sec |
+| **Opportunistic** | Executor load below threshold | Default, most users |
+| **Aggressive** | Position-based (0.3° into DSF tile) | Fast connections |
+| **Disabled** | Never | Slow connections or debugging |
 
 ### Telemetry
 
