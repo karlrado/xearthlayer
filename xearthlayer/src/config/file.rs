@@ -137,4 +137,9 @@ mod tests {
             default.executor.request_timeout_secs
         );
     }
+
+    #[test]
+    fn default_prefetch_mode_is_opportunistic() {
+        assert_eq!(ConfigFile::default().prefetch.mode, "opportunistic");
+    }
 }

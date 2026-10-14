@@ -126,20 +126,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `spec_version` on both package formats is enforced: a MAJOR above `SUPPORTED_SPEC_MAJOR` (`package/spec.rs`) is refused with an upgrade message
 
 11. **Predictive Tile Caching** (`xearthlayer/src/prefetch/`)
-    - `AdaptivePrefetchCoordinator` - Self-calibrating prefetch with flight phase detection
+    - `AdaptivePrefetchCoordinator` - Prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
     - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
     - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
     - `SceneryWindow` - Window config and dimensions holder
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage/Deferred)
     - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
-    - `PerformanceCalibrator` - Measures throughput during initial load for mode selection
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)
     - `TransitionThrottle` - Grace period + ramp-up after Ground-to-Cruise transition
     - `LoopState` - Per-cycle runner state including `telemetry_paused` flag for stale telemetry safe mode
     - `PrefetchStateObserver` - FUSE-side divergence detector; demotes a `Prefetched`/`NoCoverage` region back to *absent* when FUSE has to generate a tile on demand there, rate-limited to one demotion per region per 120s window
     - Submits jobs to shared job executor daemon via `DdsClient` trait
-    - Mode selection: Aggressive (>30 tiles/sec), Opportunistic (10-30), or Disabled
+    - Mode is `prefetch.mode` alone: `opportunistic` (default), `aggressive` or `disabled`. The throughput calibrator that was meant to choose it had no input and no reader, and was removed in #277 along with the `auto` value; `PerformanceCalibration::default_opportunistic()` survives only as the fixed estimate `PrefetchPlan` budgets with
     - **Four-tier filtering**: Memory cache → Patched region exclusion (via `GeoIndex`) → Installed package disk (via `OrthoUnionIndex`) → XEL DDS disk cache (the write-only `cached_tiles` local-tracking shadow tier was deleted in #176 after it was confirmed to never be read)
     - **Backpressure takes the higher of two signals**: `executor_load()` (our resource pools) and `fuse_pressure()` (memory pinned by open virtual DDS handles, as a fraction of the ceiling in `pinned_budget::PinnedTileBudget`). They diverge at a boundary crossing, where most reads are cache-served and so invisible to the pools; that collision sets the memory floor per #227. Open handles rather than a read rate because `open`/`release` reach FUSE on every platform and reads do not (macOS page-cache serving). See #246
     - **Two-phase region commit**: Regions marked `InProgress` in GeoIndex during prefetch, promoted to `Prefetched` on completion
@@ -436,7 +435,7 @@ Key sections:
 - `[cache]` - Memory/disk sizes, directory, DDS disk ratio
 - `[generation]` - Thread count, timeout
 - `[texture]` - DDS format (bc1/bc3), compressor backend (software/ispc/gpu), GPU device selection
-- `[prefetch]` - Boundary-driven prefetch, web_api_port (default 8086), calibration, transition ramp
+- `[prefetch]` - Boundary-driven prefetch, mode, web_api_port (default 8086), transition ramp
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)

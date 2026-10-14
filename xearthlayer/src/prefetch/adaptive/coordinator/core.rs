@@ -126,9 +126,6 @@ pub struct AdaptivePrefetchCoordinator {
     /// Configuration.
     pub(super) config: AdaptivePrefetchConfig,
 
-    /// Performance calibration (determines mode).
-    pub(super) calibration: Option<PerformanceCalibration>,
-
     /// Flight phase detector.
     phase_detector: PhaseDetector,
 
@@ -236,7 +233,6 @@ impl std::fmt::Debug for AdaptivePrefetchCoordinator {
         f.debug_struct("AdaptivePrefetchCoordinator")
             .field("config.enabled", &self.config.enabled)
             .field("config.mode", &self.config.mode)
-            .field("has_calibration", &self.calibration.is_some())
             .field("has_dds_client", &self.dds_client.is_some())
             .field("has_metrics_client", &self.metrics_client.is_some())
             .field("status", &self.status)
@@ -255,7 +251,6 @@ impl AdaptivePrefetchCoordinator {
 
         Self {
             config,
-            calibration: None,
             phase_detector,
             transition_throttle,
             sim_state: crate::aircraft_position::web_api::sim_state::SimState::default(),
@@ -284,13 +279,6 @@ impl AdaptivePrefetchCoordinator {
     /// Create with default configuration.
     pub fn with_defaults() -> Self {
         Self::new(AdaptivePrefetchConfig::default())
-    }
-
-    /// Set the performance calibration.
-    pub fn with_calibration(mut self, calibration: PerformanceCalibration) -> Self {
-        self.status.mode = calibration.recommended_strategy;
-        self.calibration = Some(calibration);
-        self
     }
 
     /// Update the sim state from the Web API adapter.
@@ -405,22 +393,12 @@ impl AdaptivePrefetchCoordinator {
             .map(|index| index.tiles_in_region(*region))
     }
 
-    /// Get the current effective mode.
-    ///
-    /// Considers config override and calibration results.
+    /// Get the current effective mode, as configured by `prefetch.mode`.
     pub fn effective_mode(&self) -> StrategyMode {
         match self.config.mode {
             PrefetchMode::Aggressive => StrategyMode::Aggressive,
             PrefetchMode::Opportunistic => StrategyMode::Opportunistic,
             PrefetchMode::Disabled => StrategyMode::Disabled,
-            PrefetchMode::Auto => {
-                if let Some(ref cal) = self.calibration {
-                    cal.recommended_strategy
-                } else {
-                    // No calibration yet - default to opportunistic
-                    StrategyMode::Opportunistic
-                }
-            }
         }
     }
 
@@ -493,11 +471,7 @@ impl AdaptivePrefetchCoordinator {
             return None;
         }
 
-        // Get calibration (or use default)
-        let calibration = self
-            .calibration
-            .clone()
-            .unwrap_or_else(PerformanceCalibration::default_opportunistic);
+        let calibration = PerformanceCalibration::default_opportunistic();
 
         // Pick box shape per phase. Transition skips prefetch entirely so
         // X-Plane gets full resources during takeoff. Ground and Cruise
@@ -960,10 +934,7 @@ impl AdaptivePrefetchCoordinator {
             }
 
             let pending_count = filtered_pending.len();
-            let calibration = self
-                .calibration
-                .clone()
-                .unwrap_or_else(PerformanceCalibration::default_opportunistic);
+            let calibration = PerformanceCalibration::default_opportunistic();
             let plan = PrefetchPlan::with_tiles(
                 filtered_pending,
                 &calibration,
@@ -1399,17 +1370,8 @@ mod tests {
     fn test_coordinator_creation() {
         let coord = AdaptivePrefetchCoordinator::with_defaults();
         assert!(coord.config.enabled);
-        assert!(coord.calibration.is_none());
 
         assert!(coord.dds_client.is_none());
-    }
-
-    #[test]
-    fn test_coordinator_with_calibration() {
-        let cal = test_calibration();
-        let coord = AdaptivePrefetchCoordinator::with_defaults().with_calibration(cal);
-        assert!(coord.calibration.is_some());
-        assert_eq!(coord.status.mode, StrategyMode::Opportunistic);
     }
 
     #[test]
@@ -1425,30 +1387,25 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_effective_mode_auto_no_calibration() {
+    fn test_effective_mode_default_is_opportunistic() {
         let coord = AdaptivePrefetchCoordinator::with_defaults();
-        // Without calibration, auto defaults to opportunistic
         assert_eq!(coord.effective_mode(), StrategyMode::Opportunistic);
     }
 
     #[test]
-    fn test_effective_mode_auto_with_calibration() {
-        let mut cal = test_calibration();
-        cal.recommended_strategy = StrategyMode::Aggressive;
-
-        let coord = AdaptivePrefetchCoordinator::with_defaults().with_calibration(cal);
-        assert_eq!(coord.effective_mode(), StrategyMode::Aggressive);
-    }
-
-    #[test]
-    fn test_effective_mode_override() {
-        let config = AdaptivePrefetchConfig {
-            mode: PrefetchMode::Disabled,
-            ..Default::default()
-        };
-        let coord = AdaptivePrefetchCoordinator::new(config);
-        // Override takes precedence
-        assert_eq!(coord.effective_mode(), StrategyMode::Disabled);
+    fn test_effective_mode_honours_each_configured_mode() {
+        for (configured, effective) in [
+            (PrefetchMode::Aggressive, StrategyMode::Aggressive),
+            (PrefetchMode::Opportunistic, StrategyMode::Opportunistic),
+            (PrefetchMode::Disabled, StrategyMode::Disabled),
+        ] {
+            let config = AdaptivePrefetchConfig {
+                mode: configured,
+                ..Default::default()
+            };
+            let coord = AdaptivePrefetchCoordinator::new(config);
+            assert_eq!(coord.effective_mode(), effective, "{configured}");
+        }
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -1482,8 +1439,7 @@ mod tests {
 
     #[test]
     fn test_update_ground_phase() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
 
         // Ground conditions: low speed, low AGL
         let _plan = coord.update((53.5, 9.5), 45.0, 10.0, 0.0);
@@ -1493,8 +1449,7 @@ mod tests {
 
     #[test]
     fn test_update_cruise_phase() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
 
         // Cruise conditions: high speed
         coord.update((53.5, 9.5), 45.0, 200.0, 0.0);
@@ -1513,8 +1468,7 @@ mod tests {
 
     #[test]
     fn test_cruise_extent_scales_with_ground_speed() {
-        let cal = test_calibration();
-        let mut coord = AdaptivePrefetchCoordinator::with_defaults().with_calibration(cal);
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
 
         // Fast-forward phase detector into Cruise using short hysteresis + takeoff timeout.
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
@@ -1610,8 +1564,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_telemetry_no_dds_client() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
         let state = AircraftState::new(53.5, 9.5, 90.0, 10.0, 5.0, false); // Ground conditions
 
         // No DDS client - returns Some(0) because plan is generated but not executed
@@ -1622,8 +1575,7 @@ mod tests {
 
     #[test]
     fn test_startup_info_string() {
-        let coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let coord = AdaptivePrefetchCoordinator::with_defaults();
 
         let info = coord.startup_info_string();
         assert!(info.contains("adaptive"));
@@ -1662,9 +1614,7 @@ mod tests {
         );
 
         // Create coordinator with the index
-        let coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_calibration(test_calibration())
-            .with_ortho_union_index(index);
+        let coord = AdaptivePrefetchCoordinator::with_defaults().with_ortho_union_index(index);
 
         // Verify the index is set
         assert!(coord.ortho_union_index.is_some());
@@ -1713,7 +1663,6 @@ mod tests {
         );
 
         let mut coord = AdaptivePrefetchCoordinator::with_defaults()
-            .with_calibration(test_calibration())
             .with_geo_index(geo_index)
             .with_scenery_index(scenery_index);
 
@@ -1875,8 +1824,7 @@ mod tests {
 
     #[test]
     fn test_phase_change_activates_throttle() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
         // Start on ground
@@ -1905,8 +1853,7 @@ mod tests {
 
     #[test]
     fn test_throttle_resets_on_landing() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
         // Transition to cruise
@@ -2087,7 +2034,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_scenery_index(empty_index);
@@ -2152,7 +2098,6 @@ mod tests {
         // Deliberately no `.with_scenery_index(...)` — this is the production
         // shape when `tile_count() == 0` in service/orchestrator/prefetch.rs.
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
@@ -3125,7 +3070,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_scene_tracker(tracker)
             .with_geo_index(Arc::clone(&geo_index))
             .with_scenery_index(Arc::clone(&scenery_index));
@@ -3200,7 +3144,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_scenery_index(wide_scenery_index_at_50_10());
@@ -3283,7 +3226,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
@@ -3339,7 +3281,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
         // Fast-forward phase to cruise so transition throttle activates
@@ -3411,7 +3352,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
         // Fast-forward to cruise
@@ -3550,7 +3490,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
         // Fast-forward to cruise
@@ -3601,7 +3540,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>);
 
         let tiles: Vec<TileCoord> = (0..5000)
@@ -3643,9 +3581,7 @@ mod tests {
             mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_geo_index(geo_index);
+        let mut coord = AdaptivePrefetchCoordinator::new(config).with_geo_index(geo_index);
 
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
@@ -3679,9 +3615,7 @@ mod tests {
             mode: PrefetchMode::Aggressive,
             ..Default::default()
         };
-        let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
-            .with_geo_index(geo_index);
+        let mut coord = AdaptivePrefetchCoordinator::new(config).with_geo_index(geo_index);
 
         coord.phase_detector.hysteresis_duration = std::time::Duration::from_millis(1);
 
@@ -3722,7 +3656,6 @@ mod tests {
         let scenery_index = make_scenery_index_covering(40..=60, -15..=25, 16);
 
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(geo_index)
             .with_scenery_index(scenery_index);
 
@@ -3779,7 +3712,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_scenery_index(wide_scenery_index_at_48_15());
 
@@ -3834,8 +3766,7 @@ mod tests {
     fn test_coordinator_skips_when_scenery_loading() {
         use crate::aircraft_position::web_api::sim_state::SimState;
 
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
 
         let loading = SimState {
             scenery_loading: true,
@@ -3851,8 +3782,7 @@ mod tests {
     fn test_coordinator_skips_during_replay() {
         use crate::aircraft_position::web_api::sim_state::SimState;
 
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
 
         let replay = SimState {
             replay: true,
@@ -3876,7 +3806,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(geo_index)
             .with_scenery_index(wide_scenery_index_at_48_15());
 
@@ -3911,8 +3840,7 @@ mod tests {
 
     #[test]
     fn test_reset_phase_from_on_ground_true() {
-        let mut coord =
-            AdaptivePrefetchCoordinator::with_defaults().with_calibration(test_calibration());
+        let mut coord = AdaptivePrefetchCoordinator::with_defaults();
 
         // Drive into cruise via the phase detector directly (avoids hysteresis wait)
         coord.phase_detector.set_phase(FlightPhase::Cruise);
@@ -4006,7 +3934,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_scenery_index(wide_scenery_index_at_50_10());
@@ -4057,7 +3984,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_scenery_index(wide_scenery_index_at_50_10());
@@ -4098,7 +4024,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_scenery_index(wide_scenery_index_at_50_10());
@@ -4165,7 +4090,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_dds_disk_checker(Arc::clone(&checker))
@@ -4223,7 +4147,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_dds_disk_checker(Arc::clone(&checker))
@@ -4339,7 +4262,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_calibration(test_calibration())
             .with_geo_index(Arc::clone(&geo_index))
             .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
             .with_memory_cache(always_hit_memory)

@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use super::file::ConfigFileError;
 use super::settings::ConfigFile;
 use super::size::parse_size;
+use super::upgrade::deprecated_value;
 use crate::dds::DdsFormat;
 
 /// Parse an `Ini` object into a `ConfigFile`.
@@ -221,9 +222,12 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
             config.prefetch.enabled = parse_bool(v);
         }
         if let Some(v) = section.get("mode") {
-            let v = v.trim().to_lowercase();
+            let v = match deprecated_value("prefetch.mode", v) {
+                Some(retired) => retired.replacement.to_string(),
+                None => v.trim().to_lowercase(),
+            };
             match v.as_str() {
-                "auto" | "aggressive" | "opportunistic" | "disabled" => {
+                "aggressive" | "opportunistic" | "disabled" => {
                     config.prefetch.mode = v;
                 }
                 _ => {
@@ -231,8 +235,7 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
                         section: "prefetch".to_string(),
                         key: "mode".to_string(),
                         value: v.to_string(),
-                        reason: "must be 'auto', 'aggressive', 'opportunistic', or 'disabled'"
-                            .to_string(),
+                        reason: "must be 'aggressive', 'opportunistic', or 'disabled'".to_string(),
                     });
                 }
             }
@@ -261,34 +264,6 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
         // Legacy settings radial_radius, tile_based_rows_ahead are deprecated (v0.4.0)
         // They are ignored if present in config file (use 'xearthlayer config upgrade')
-        // Adaptive prefetch calibration settings
-        if let Some(v) = section.get("calibration_aggressive_threshold") {
-            config.prefetch.calibration_aggressive_threshold =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "calibration_aggressive_threshold".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive number (tiles/sec)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("calibration_opportunistic_threshold") {
-            config.prefetch.calibration_opportunistic_threshold =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "calibration_opportunistic_threshold".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive number (tiles/sec)".to_string(),
-                })?;
-        }
-        if let Some(v) = section.get("calibration_sample_duration") {
-            config.prefetch.calibration_sample_duration =
-                v.parse().map_err(|_| ConfigFileError::InvalidValue {
-                    section: "prefetch".to_string(),
-                    key: "calibration_sample_duration".to_string(),
-                    value: v.to_string(),
-                    reason: "must be a positive integer (seconds)".to_string(),
-                })?;
-        }
         // Transition ramp settings
         if let Some(v) = section.get("takeoff_climb_ft") {
             config.prefetch.takeoff_climb_ft =
@@ -784,5 +759,29 @@ max_retries = 5
             config.executor.max_retries, 5,
             "surrounding keys still parse"
         );
+    }
+
+    /// `auto` named a calibration-driven mode selector that never ran (#277),
+    /// so it always meant opportunistic. Configs that still say so must load,
+    /// and load as what they actually did.
+    #[test]
+    fn legacy_auto_prefetch_mode_loads_as_opportunistic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        std::fs::write(&path, "[prefetch]\nmode = AUTO\n").unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&path).unwrap().prefetch.mode,
+            "opportunistic"
+        );
+    }
+
+    #[test]
+    fn explicit_prefetch_modes_load_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        for mode in ["aggressive", "opportunistic", "disabled"] {
+            std::fs::write(&path, format!("[prefetch]\nmode = {mode}\n")).unwrap();
+            assert_eq!(ConfigFile::load_from(&path).unwrap().prefetch.mode, mode);
+        }
     }
 }

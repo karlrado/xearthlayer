@@ -165,11 +165,10 @@ file = {}
 ; Enable predictive tile prefetching based on X-Plane telemetry (default: true)
 ; Requires X-Plane to send ForeFlight data: Settings > Network > Send to ForeFlight
 enabled = {}
-; Adaptive prefetch mode (default: auto)
-;   auto         - Select mode based on throughput calibration (recommended)
-;   aggressive   - Position-based triggers (fast connections)
-;   opportunistic - Circuit breaker triggers (moderate connections)
-;   disabled     - Disable prefetch entirely
+; Adaptive prefetch mode (default: opportunistic)
+;   opportunistic - Circuit breaker triggers (recommended)
+;   aggressive    - Position-based triggers (fast connections)
+;   disabled      - Disable prefetch entirely
 mode = {}
 ; Web API port for X-Plane SimState polling (default: 8086, range: 1024-65535)
 web_api_port = {}
@@ -177,17 +176,6 @@ web_api_port = {}
 ; Interval between prefetch cycles in milliseconds (default: 2000)
 ; Higher values reduce prefetch aggressiveness
 cycle_interval_ms = {}
-
-; Adaptive prefetch calibration
-; Minimum throughput for aggressive mode (tiles/sec, default: 30)
-; Systems exceeding this use position-based prefetch triggers
-calibration_aggressive_threshold = {}
-; Minimum throughput for opportunistic mode (tiles/sec, default: 10)
-; Systems between this and aggressive use circuit breaker triggers
-; Below this, prefetch is disabled
-calibration_opportunistic_threshold = {}
-; How long to measure throughput during initial calibration (seconds, default: 60)
-calibration_sample_duration = {}
 
 ; Transition ramp settings (takeoff phase management)
 ; Altitude climb (feet) above takeoff MSL to release transition hold (default: 1000, range: 200-5000)
@@ -284,9 +272,6 @@ congestion_threshold = {}
         config.prefetch.mode,
         config.prefetch.web_api_port,
         config.prefetch.cycle_interval_ms,
-        config.prefetch.calibration_aggressive_threshold,
-        config.prefetch.calibration_opportunistic_threshold,
-        config.prefetch.calibration_sample_duration,
         config.prefetch.takeoff_climb_ft,
         config.prefetch.takeoff_timeout_secs,
         config.prefetch.landing_hysteresis_secs,

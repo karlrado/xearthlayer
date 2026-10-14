@@ -260,33 +260,25 @@ The base delay is not configurable.
 
 ### [prefetch]
 
-Controls the Adaptive Prefetch System, which pre-loads tiles ahead of the aircraft to reduce FPS drops during flight. The system automatically calibrates itself based on your network and system performance.
+Controls the Adaptive Prefetch System, which pre-loads tiles ahead of the aircraft to reduce FPS drops during flight.
 
 **Adaptive Prefetch Architecture (v0.3.0+):**
 
-The system uses flight phase detection and performance calibration:
+The system uses flight phase detection:
 
-1. **Performance Calibration**: During X-Plane's initial scenery load, XEarthLayer measures tile generation throughput to determine the optimal prefetch mode.
-
-2. **Flight Phase Strategies**:
+1. **Flight Phase Strategies**:
    - **Ground Strategy**: Ring-based prefetch around position (GS < 40kt, AGL < 20ft)
    - **Cruise Strategy**: Boundary-driven row/column prefetch using SceneryWindow and BoundaryMonitor (GS > 40kt)
 
-3. **Mode Selection**: Based on calibration throughput:
-   - **Aggressive**: >30 tiles/sec - Position-based trigger (0.3° into DSF tile)
-   - **Opportunistic**: 10-30 tiles/sec - Executor backpressure-based trigger
-   - **Disabled**: <10 tiles/sec - Prefetch skipped (won't complete in time)
+2. **Mode Selection**: Set by `mode`. Nothing chooses a mode automatically; `opportunistic` is the default and the setting every recent release has been tuned against.
 
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
-| `mode` | string | `auto` | Mode selection: `auto`, `aggressive`, `opportunistic`, `disabled` |
+| `mode` | string | `opportunistic` | Mode selection: `aggressive`, `opportunistic`, `disabled` |
 | `web_api_port` | integer | `8086` | X-Plane Web API port for telemetry and sim state (1024-65535) |
 | `max_tiles_per_cycle` | integer | `200` | Maximum tiles to submit per prefetch cycle |
 | `cycle_interval_ms` | integer | `2000` | Interval between prefetch cycles (milliseconds) |
-| `calibration_aggressive_threshold` | float | `30.0` | Tiles/sec threshold for aggressive mode |
-| `calibration_opportunistic_threshold` | float | `10.0` | Tiles/sec threshold for opportunistic mode |
-| `calibration_sample_duration` | integer | `60` | Duration (secs) to measure throughput during calibration |
 | `takeoff_climb_ft` | float | `1000` | Altitude climb (ft) above takeoff MSL to release transition hold (200-5000) |
 | `takeoff_timeout_secs` | integer | `90` | Maximum seconds before timeout release (30-300) |
 | `landing_hysteresis_secs` | integer | `15` | Sustained seconds at GS < 40kt before landing detection (5-60) |
@@ -303,26 +295,22 @@ The system uses flight phase detection and performance calibration:
 
 | Mode | Trigger | When Used |
 |------|---------|-----------|
-| `auto` | Based on calibration (recommended) | Most users |
-| `aggressive` | Position-based (0.3° into DSF tile) | Fast connections (>30 tiles/sec) |
-| `opportunistic` | Executor backpressure | Moderate connections (10-30 tiles/sec) |
+| `opportunistic` | Executor backpressure (default) | Most users |
+| `aggressive` | Position-based (0.3° into DSF tile) | Fast connections |
 | `disabled` | Never | Slow connections or debugging |
+
+`auto` was accepted before v0.5.0. It deferred to a throughput calibration that never ran, so it always behaved as `opportunistic`. Older config files that still say `mode = auto` load as `opportunistic`, and `xearthlayer config upgrade` rewrites the value.
 
 **Example:**
 ```ini
 [prefetch]
 enabled = true
-mode = auto                    ; Let calibration determine mode
+mode = opportunistic           ; aggressive, opportunistic, disabled
 ; web_api_port = 8086
 
 ; Rate limiting
 max_tiles_per_cycle = 3000     ; Tiles per cycle
 cycle_interval_ms = 2000       ; Cycle interval (ms)
-
-; Calibration thresholds (tiles/sec)
-calibration_aggressive_threshold = 30.0      ; Above = aggressive mode
-calibration_opportunistic_threshold = 10.0   ; Above = opportunistic, below = disabled
-calibration_sample_duration = 60             ; Calibration period (seconds)
 
 ; Transition ramp (takeoff phase management)
 takeoff_climb_ft = 1000                      ; Feet above takeoff MSL to release hold
@@ -512,19 +500,14 @@ timeout = 10
 ; max_retries = 3                  ; Download retry attempts
 
 [prefetch]
-; Adaptive Prefetch System (v0.3.0+) - self-calibrating tile prefetching
+; Adaptive Prefetch System (v0.3.0+)
 enabled = true
-mode = auto                    ; auto, aggressive, opportunistic, disabled
+mode = opportunistic           ; aggressive, opportunistic, disabled
 ; web_api_port = 8086
 
 ; Rate limiting
 ; max_tiles_per_cycle = 3000   ; tiles per cycle
 ; cycle_interval_ms = 2000     ; cycle interval (ms)
-
-; Performance calibration thresholds (tiles/sec)
-; calibration_aggressive_threshold = 30.0    ; above = aggressive mode
-; calibration_opportunistic_threshold = 10.0 ; above = opportunistic, below = disabled
-; calibration_sample_duration = 60           ; calibration period (seconds)
 
 ; Transition ramp (takeoff phase management)
 ; takeoff_climb_ft = 1000                    ; feet above takeoff MSL to release
@@ -657,13 +640,10 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `executor.request_timeout_secs` | positive integer | Per-chunk HTTP timeout (seconds) |
 | `executor.max_retries` | positive integer | Max retry attempts per chunk |
 | `prefetch.enabled` | `true`, `false` | Enable predictive prefetching |
-| `prefetch.mode` | `auto`, `aggressive`, `opportunistic`, `disabled` | Prefetch mode (auto uses calibration) |
+| `prefetch.mode` | `aggressive`, `opportunistic`, `disabled` | Prefetch mode (default `opportunistic`) |
 | `prefetch.web_api_port` | 1024-65535 | X-Plane Web API port for telemetry and sim state |
 | `prefetch.max_tiles_per_cycle` | positive integer | Max tiles per prefetch cycle |
 | `prefetch.cycle_interval_ms` | positive integer | Prefetch cycle interval (ms) |
-| `prefetch.calibration_aggressive_threshold` | positive number | Tiles/sec for aggressive mode |
-| `prefetch.calibration_opportunistic_threshold` | positive number | Tiles/sec for opportunistic mode |
-| `prefetch.calibration_sample_duration` | positive integer | Calibration period (seconds) |
 | `prefetch.takeoff_climb_ft` | 200-5000 | Feet above takeoff MSL to release hold |
 | `prefetch.takeoff_timeout_secs` | 30-300 | Max seconds before timeout release |
 | `prefetch.landing_hysteresis_secs` | 5-60 | Sustained GS < 40kt for landing detection |
