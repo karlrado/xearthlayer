@@ -39,7 +39,7 @@ use crate::pinned_budget::PinnedTileBudget;
 use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
 use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -270,6 +270,7 @@ impl DdsClient for ChannelDdsClient {
             cancellation,
             response_tx: Some(tx),
             origin,
+            created: Instant::now(),
         };
 
         // Try non-blocking send first (fast path)

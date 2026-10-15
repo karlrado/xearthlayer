@@ -35,7 +35,7 @@
 use crate::coord::TileCoord;
 use crate::executor::Priority;
 use bytes::Bytes;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -145,6 +145,11 @@ pub struct JobRequest {
 
     /// Origin of the request for telemetry.
     pub origin: RequestOrigin,
+
+    /// When the producer made the request. FUSE latency is measured from
+    /// here, not from when the daemon took it off the channel: X-Plane is
+    /// already waiting while the request is queued.
+    pub created: Instant,
 }
 
 impl JobRequest {
@@ -172,6 +177,7 @@ impl JobRequest {
             cancellation,
             response_tx: Some(tx),
             origin: RequestOrigin::Fuse,
+            created: Instant::now(),
         };
         (request, rx)
     }
@@ -191,6 +197,7 @@ impl JobRequest {
             cancellation: CancellationToken::new(),
             response_tx: None,
             origin: RequestOrigin::Prefetch,
+            created: Instant::now(),
         }
     }
 
@@ -210,6 +217,7 @@ impl JobRequest {
             cancellation: CancellationToken::new(),
             response_tx: Some(tx),
             origin: RequestOrigin::Prewarm,
+            created: Instant::now(),
         };
         (request, rx)
     }
@@ -229,6 +237,7 @@ impl JobRequest {
             cancellation: CancellationToken::new(),
             response_tx: Some(tx),
             origin: RequestOrigin::Manual,
+            created: Instant::now(),
         };
         (request, rx)
     }

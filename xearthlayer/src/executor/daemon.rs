@@ -66,7 +66,7 @@ use crate::runtime::{DdsResponse, JobRequest};
 use bytes::Bytes;
 use dashmap::DashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn, Instrument};
@@ -593,7 +593,9 @@ where
             metrics_client,
             demand,
         } = *ctx;
-        let start = Instant::now();
+        // The producer's clock, so every duration below counts the time the
+        // request sat queued on the channel: X-Plane was already waiting.
+        let start = request.created;
         let tile = request.tile;
         let priority = request.priority;
         let origin = request.origin;
@@ -1467,6 +1469,51 @@ mod tests {
         assert_eq!(response.data, Bytes::from_static(b"ON-DISK"));
         assert!(response.cache_hit, "a skipped job reports AlreadyCached");
         assert!(response.is_success());
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// X-Plane starts waiting when FUSE makes the request, not when the
+    /// daemon takes it off the channel, so time spent queued is latency.
+    #[tokio::test]
+    async fn test_fuse_latency_includes_time_queued_before_the_daemon() {
+        use crate::metrics::MetricEvent;
+        const QUEUED: Duration = Duration::from_millis(150);
+
+        let (metrics_tx, mut metrics_rx) = mpsc::unbounded_channel();
+        let (daemon, tx) = ExecutorDaemon::with_metrics_client(
+            ExecutorDaemonConfig::default(),
+            Arc::new(MockJobFactory::new()),
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+            Arc::new(crate::executor::NullTelemetrySink),
+            MetricsClient::new(metrics_tx),
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+        tokio::time::sleep(QUEUED).await;
+        tx.send(request).await.unwrap();
+        assert!(rx.await.unwrap().is_success());
+
+        let mut latency_us = None;
+        while let Ok(event) = metrics_rx.try_recv() {
+            if let MetricEvent::JobCompleted {
+                duration_us,
+                is_fuse: true,
+                ..
+            } = event
+            {
+                latency_us = Some(duration_us);
+            }
+        }
+        let latency = Duration::from_micros(latency_us.expect("a FUSE job completed"));
+        assert!(
+            latency >= QUEUED,
+            "latency {latency:?} must include the {QUEUED:?} the request sat queued"
+        );
 
         shutdown.cancel();
         let _ = run.await;
