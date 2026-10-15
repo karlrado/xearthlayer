@@ -77,6 +77,12 @@ impl LocalPrefetchLane {
         }
     }
 
+    /// The executor pools this lane runs on; lets tests check lane isolation.
+    #[cfg(test)]
+    pub(crate) fn resource_pools(&self) -> &Arc<ResourcePools> {
+        &self.pools
+    }
+
     /// Local-only: cache GC housekeeping runs on this lane's executor. When
     /// prefetch is offloaded, GC must move back to a local executor.
     pub fn job_submitter(&self) -> JobSubmitter {

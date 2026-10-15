@@ -365,6 +365,12 @@ impl ChannelDdsClient {
         self.pinned_budget = Some(budget);
         self
     }
+
+    /// The pools this client reports load from; lets tests check lane isolation.
+    #[cfg(test)]
+    pub(crate) fn resource_pools(&self) -> Option<&Arc<ResourcePools>> {
+        self.resource_pools.as_ref()
+    }
 }
 
 impl DdsClient for ChannelDdsClient {

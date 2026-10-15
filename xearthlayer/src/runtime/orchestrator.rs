@@ -444,6 +444,11 @@ mod tests {
             self.priority
         }
 
+        // As the real DDS job does, so job admission is exercised too.
+        fn concurrency_group(&self) -> Option<&str> {
+            Some(TILE_GENERATION_GROUP)
+        }
+
         fn create_tasks(&self) -> Vec<Box<dyn Task>> {
             vec![Box::new(MockTask { delay: self.delay })]
         }
@@ -563,6 +568,43 @@ mod tests {
             busy <= idle + Duration::from_millis(40),
             "demand took {busy:?} behind a full prefetch lane vs {idle:?} idle"
         );
+    }
+
+    /// Structural, so it fails on a shared executor where priority dispatch
+    /// would let the timing test pass anyway: prefetch work must occupy only
+    /// the prefetch lane's pools.
+    #[tokio::test]
+    async fn prefetch_work_never_occupies_the_demand_pools() {
+        let runtime = build_test_runtime();
+        let lane = runtime.prefetch_lane();
+        let demand_pools = Arc::clone(
+            runtime
+                .channel_dds_client()
+                .resource_pools()
+                .expect("demand client reports its pools"),
+        );
+        let prefetch_pools = Arc::clone(lane.resource_pools());
+        assert!(
+            !Arc::ptr_eq(&demand_pools, &prefetch_pools),
+            "the lanes must not share resource pools"
+        );
+
+        for i in 0..200 {
+            lane.submit(tile_at(1000 + i))
+                .expect("prefetch lane accepts");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        assert!(
+            prefetch_pools.in_flight(ResourceType::CPU) > 0,
+            "prefetch work should be running on the prefetch pools"
+        );
+        assert_eq!(
+            demand_pools.in_flight(ResourceType::CPU),
+            0,
+            "prefetch work must not hold demand pool permits"
+        );
+        runtime.shutdown().await;
     }
 
     #[tokio::test]
