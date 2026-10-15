@@ -114,6 +114,10 @@ pub struct XEarthLayerRuntime {
     /// Memory pinned by open virtual DDS handles (#246).
     pinned_budget: Arc<PinnedTileBudget>,
 
+    /// The demand lane's pools; lets tests check lane isolation.
+    #[cfg(test)]
+    demand_pools: Arc<crate::executor::ResourcePools>,
+
     /// Handles to the demand and prefetch daemon tasks.
     daemon_handles: Vec<JoinHandle<()>>,
 
@@ -246,9 +250,10 @@ impl XEarthLayerRuntime {
         // Created here, before the filesystem exists, because the client is
         // what carries it to the mount (#246).
         let pinned_budget = Arc::new(PinnedTileBudget::new());
+        #[cfg(test)]
+        let demand_pools = demand_daemon.resource_pools();
         let dds_client = Arc::new(
-            ChannelDdsClient::with_resource_pools(demand_tx, demand_daemon.resource_pools())
-                .with_pinned_budget(Arc::clone(&pinned_budget)),
+            ChannelDdsClient::new(demand_tx).with_pinned_budget(Arc::clone(&pinned_budget)),
         );
         let prefetch_lane = Arc::new(LocalPrefetchLane::new(
             prefetch_tx,
@@ -275,6 +280,8 @@ impl XEarthLayerRuntime {
             prefetch_lane,
             demand,
             pinned_budget,
+            #[cfg(test)]
+            demand_pools,
             daemon_handles,
             shutdown_token,
             tile_progress_tracker,
@@ -577,12 +584,7 @@ mod tests {
     async fn prefetch_work_never_occupies_the_demand_pools() {
         let runtime = build_test_runtime();
         let lane = runtime.prefetch_lane();
-        let demand_pools = Arc::clone(
-            runtime
-                .channel_dds_client()
-                .resource_pools()
-                .expect("demand client reports its pools"),
-        );
+        let demand_pools = Arc::clone(&runtime.demand_pools);
         let prefetch_pools = Arc::clone(lane.resource_pools());
         assert!(
             !Arc::ptr_eq(&demand_pools, &prefetch_pools),

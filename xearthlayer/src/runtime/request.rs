@@ -194,25 +194,6 @@ impl JobRequest {
         }
     }
 
-    /// Creates a prefetch request with a shared cancellation token.
-    ///
-    /// Useful when the prefetcher wants to cancel all pending requests
-    /// during shutdown.
-    ///
-    /// # Arguments
-    ///
-    /// * `tile` - The tile coordinates to generate
-    /// * `cancellation` - Shared cancellation token
-    pub fn prefetch_with_cancellation(tile: TileCoord, cancellation: CancellationToken) -> Self {
-        Self {
-            tile,
-            priority: Priority::PREFETCH,
-            cancellation,
-            response_tx: None,
-            origin: RequestOrigin::Prefetch,
-        }
-    }
-
     /// Creates a prewarm request with response channel.
     ///
     /// Prewarm requests run at low priority but track completion
@@ -404,17 +385,6 @@ mod tests {
         assert!(!request.expects_response());
         assert_eq!(request.origin, RequestOrigin::Prefetch);
         assert_eq!(request.priority, Priority::PREFETCH);
-    }
-
-    #[test]
-    fn test_prefetch_with_shared_cancellation() {
-        let token = CancellationToken::new();
-        let request = JobRequest::prefetch_with_cancellation(test_tile(), token.clone());
-
-        // Cancelling the token should reflect in the request
-        assert!(!request.cancellation.is_cancelled());
-        token.cancel();
-        assert!(request.cancellation.is_cancelled());
     }
 
     #[test]
