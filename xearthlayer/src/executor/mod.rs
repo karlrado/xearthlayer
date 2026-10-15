@@ -115,6 +115,7 @@ mod demand;
 mod download_config;
 mod handle;
 mod job;
+mod lane_sizing;
 mod policy;
 mod queue;
 mod resource_pool;
@@ -191,6 +192,7 @@ pub use daemon::{
     DaemonMemoryCache, ExecutorDaemon, ExecutorDaemonConfig, DEFAULT_REQUEST_CHANNEL_CAPACITY,
 };
 pub use demand::{DemandGuard, DemandTracker};
+pub use lane_sizing::LaneSizing;
 
 // Cache adapter (decoupled from pipeline module)
 pub use cache_adapter::ExecutorCacheAdapter;

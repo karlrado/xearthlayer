@@ -201,6 +201,9 @@ pub struct PrefetchSettings {
     /// Controls how much the prefetch box shifts forward in the direction of travel.
     /// Default: 0.8, Range: 0.5-0.9
     pub box_max_bias: f64,
+    /// Share of the demand lane's capacity given to prefetch.
+    /// Default: 0.35, Range: 0.05-0.50
+    pub capacity_share: f64,
 }
 
 /// Control plane configuration for job management and health monitoring.

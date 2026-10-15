@@ -204,6 +204,11 @@ box_extent = {}
 ; Controls how much the prefetch box shifts forward in the direction of travel
 ; 0.5 = symmetric, 0.8 = 80% ahead / 20% behind on the primary axis
 box_max_bias = {}
+; Share of the machine given to prefetch, as a fraction of the capacity FUSE
+; demand gets (default: 0.35, range: 0.05-0.50). Prefetch never delays X-Plane's
+; own tile requests; this sets how much CPU and network it may use alongside the
+; simulator. Lower it if prefetch costs frame rate.
+capacity_share = {}
 
 [prewarm]
 ; Settings for cold-start cache pre-warming.
@@ -281,6 +286,7 @@ congestion_threshold = {}
         config.prefetch.stale_region_timeout,
         config.prefetch.box_extent,
         config.prefetch.box_max_bias,
+        config.prefetch.capacity_share,
         config.prewarm.grid_rows,
         config.prewarm.grid_cols,
         config.patches.enabled,

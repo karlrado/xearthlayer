@@ -285,6 +285,7 @@ Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and paus
 | `ramp_start_fraction` | float | `0.25` | Starting prefetch fraction when ramp begins (0.1-0.5) |
 | `box_extent` | float | `7.0` | Prefetch box size per axis in degrees (7.0-15.0): the ground box, and the cruise maximum. 7° covers up to 7×7 regions, well beyond X-Plane's ~3° window |
 | `box_max_bias` | float | `0.8` | Maximum forward bias fraction (0.5-0.9). 0.5 = symmetric, 0.8 = 80% ahead and 20% behind at cardinal headings |
+| `capacity_share` | float | `0.35` | Prefetch capacity as a fraction of the capacity FUSE demand gets (0.05-0.50). Prefetch never delays X-Plane tile requests; lower this if prefetch costs frame rate |
 | `window_buffer` | integer | `1` | Regions kept beyond the box on each side before their prefetch state is forgotten (0-3) |
 | `stale_region_timeout` | integer | `120` | Seconds before an InProgress region is considered stale (30-600) |
 
@@ -645,6 +646,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `prefetch.stale_region_timeout` | 30-600 | Seconds before InProgress region is stale |
 | `prefetch.box_extent` | 7.0-15.0 | Prefetch box degrees per axis (ground box, cruise maximum) |
 | `prefetch.box_max_bias` | 0.5-0.9 | Forward bias fraction on the primary axis |
+| `prefetch.capacity_share` | 0.05-0.50 | Prefetch capacity as a fraction of demand capacity |
 | `prewarm.grid_rows` | positive integer | Latitude extent in DSF tiles for prewarm |
 | `prewarm.grid_cols` | positive integer | Longitude extent in DSF tiles for prewarm |
 | `xplane.scenery_dir` | path | X-Plane Custom Scenery directory |
