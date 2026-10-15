@@ -32,7 +32,7 @@ use ratatui::{
     Frame,
 };
 use xearthlayer::metrics::TelemetrySnapshot;
-use xearthlayer::prefetch::PrefetchStatusSnapshot;
+use xearthlayer::prefetch::{resolve_state, PrefetchStatusSnapshot, StateInputs};
 use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
 use xearthlayer::update::UpdateInfo;
 
@@ -204,11 +204,16 @@ fn render_prefetch_system(
 
     // The pause and the lane's occupancy are published by the metrics side;
     // the coordinator cannot see either.
-    let lane_busy = telemetry.prefetch_lane_load > 0.0 || telemetry.prefetch_lane_queued > 0;
-    let state = prefetch
-        .prefetch_state
-        .with_lane(telemetry.prefetch_paused, lane_busy);
+    let lane_busy = prefetch.state_inputs.lane_busy
+        || telemetry.prefetch_lane_load > 0.0
+        || telemetry.prefetch_lane_queued > 0;
+    let state = resolve_state(StateInputs {
+        demand_paused: telemetry.prefetch_paused,
+        lane_busy,
+        ..prefetch.state_inputs
+    });
     let lane = LaneView {
+        // An estimate: lane load is the busiest pool's utilisation, not a job count.
         running: (telemetry.prefetch_lane_load * lane_config.group as f64).round() as usize,
         group: lane_config.group,
         queued: telemetry.prefetch_lane_queued,
@@ -217,7 +222,7 @@ fn render_prefetch_system(
     frame.render_widget(
         PrefetchSystemWidget::new(
             &state,
-            prefetch.phase,
+            prefetch.state_inputs.phase,
             prefetch.detailed_stats.as_ref(),
             lane,
             telemetry.fuse_latency.as_ref(),

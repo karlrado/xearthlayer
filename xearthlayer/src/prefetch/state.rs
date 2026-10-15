@@ -80,21 +80,6 @@ impl PrefetchState {
             Self::Idle => "Idle".to_string(),
         }
     }
-
-    /// Fold in what only the metrics side knows: whether the lane is stood
-    /// down for demand, and whether it has work in flight.
-    ///
-    /// The coordinator resolves its own view; the pause lives with the lane
-    /// gate and is published through telemetry. This applies the same
-    /// precedence, so the result equals `resolve_state` with all inputs.
-    pub fn with_lane(self, demand_paused: bool, lane_busy: bool) -> Self {
-        match self {
-            Self::Disabled => Self::Disabled,
-            _ if demand_paused => Self::PausedForDemand,
-            Self::Idle if lane_busy => Self::Active,
-            other => other,
-        }
-    }
 }
 
 /// Everything [`resolve_state`] needs to choose a state.
@@ -107,6 +92,20 @@ pub struct StateInputs {
     /// `None` when the throttle is idle (full throughput).
     pub throttle_fraction: Option<f64>,
     pub lane_busy: bool,
+}
+
+impl Default for StateInputs {
+    /// A running prefetcher with nothing to report yet.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            demand_paused: false,
+            phase: FlightPhase::default(),
+            deferred_last_cycle: false,
+            throttle_fraction: None,
+            lane_busy: false,
+        }
+    }
 }
 
 /// Choose the single state to show, first match in precedence order.
@@ -227,17 +226,18 @@ impl SharedPrefetchStatus {
         }
     }
 
-    /// Update the flight phase shown beside the prefetch state.
-    pub fn update_phase(&self, phase: FlightPhase) {
+    /// Publish the coordinator's raw state inputs. The dashboard completes
+    /// them (demand pause, lane occupancy) and calls [`resolve_state`] once.
+    pub fn update_state_inputs(&self, inputs: StateInputs) {
         if let Ok(mut inner) = self.inner.write() {
-            inner.phase = phase;
+            inner.state_inputs = inputs;
         }
     }
 
-    /// Update the state the prefetcher is in.
-    pub fn update_prefetch_state(&self, state: PrefetchState) {
+    /// Record that no coordinator runs (`--no-prefetch`, `prefetch.enabled = false`).
+    pub fn mark_disabled(&self) {
         if let Ok(mut inner) = self.inner.write() {
-            inner.prefetch_state = state;
+            inner.state_inputs.enabled = false;
         }
     }
 
@@ -290,10 +290,8 @@ pub struct PrefetchStatusSnapshot {
     pub stats: PrefetchStatsSnapshot,
     /// GPS/telemetry connection status.
     pub gps_status: GpsStatus,
-    /// What the prefetcher is doing, as resolved by the coordinator.
-    pub prefetch_state: PrefetchState,
-    /// Flight phase the coordinator last detected.
-    pub phase: FlightPhase,
+    /// Raw inputs to [`resolve_state`], as last published by the coordinator.
+    pub state_inputs: StateInputs,
     /// Detailed prefetch statistics for dashboard display.
     pub detailed_stats: Option<DetailedPrefetchStats>,
     /// Current prefetch box extent in degrees (speed-proportional; 0.0 when unknown).
@@ -330,6 +328,11 @@ pub struct AircraftSnapshot {
 }
 
 impl PrefetchStatusSnapshot {
+    /// The state as the coordinator alone sees it (no demand pause).
+    pub fn coordinator_state(&self) -> PrefetchState {
+        resolve_state(self.state_inputs)
+    }
+
     /// Format the aircraft state as a single line.
     pub fn aircraft_line(&self) -> String {
         if let Some(ref ac) = self.aircraft {
@@ -579,22 +582,13 @@ mod tests {
     }
 
     #[test]
-    fn with_lane_applies_the_same_precedence() {
+    fn mark_disabled_resolves_to_disabled_in_the_snapshot() {
+        let status = SharedPrefetchStatus::new();
+        assert_eq!(status.snapshot().coordinator_state(), PrefetchState::Idle);
+        status.mark_disabled();
         assert_eq!(
-            PrefetchState::Disabled.with_lane(true, true),
+            status.snapshot().coordinator_state(),
             PrefetchState::Disabled
-        );
-        assert_eq!(
-            PrefetchState::DeferredLoad.with_lane(true, false),
-            PrefetchState::PausedForDemand
-        );
-        assert_eq!(
-            PrefetchState::Idle.with_lane(false, true),
-            PrefetchState::Active
-        );
-        assert_eq!(
-            PrefetchState::Ramping { percent: 40 }.with_lane(false, true),
-            PrefetchState::Ramping { percent: 40 }
         );
     }
 

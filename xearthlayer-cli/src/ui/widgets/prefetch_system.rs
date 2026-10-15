@@ -75,14 +75,16 @@ impl<'a> PrefetchSystemWidget<'a> {
         }
     }
 
-    /// Red once a wait outlasts the timeout, amber when the tail is past half
-    /// of it, green otherwise. The summary includes failed and timed-out
+    /// Red once a wait outlasts the timeout, amber when p95 or max is past
+    /// half of it, green otherwise. The summary includes failed and timed-out
     /// waits, so red is reachable.
     fn latency_color(&self, summary: &LatencySummary) -> Color {
         let timeout_us = self.generation_timeout.as_micros();
         if u128::from(summary.max_us) > timeout_us {
             Color::Red
-        } else if u128::from(summary.p95_us) * 2 > timeout_us {
+        } else if u128::from(summary.p95_us) * 2 > timeout_us
+            || u128::from(summary.max_us) * 2 > timeout_us
+        {
             Color::Yellow
         } else {
             Color::Green
@@ -105,7 +107,7 @@ impl<'a> PrefetchSystemWidget<'a> {
 
     fn lane_line(&self) -> Line<'static> {
         Line::from(vec![
-            Span::styled("   Lane:     ", Style::default().fg(LABEL_COLOR)),
+            Span::styled("             ", Style::default().fg(LABEL_COLOR)),
             Span::styled(
                 format!(
                     "lane {}/{} · {} queued",
@@ -276,6 +278,10 @@ mod tests {
 
         let slow = summary(100, 6_000, 9_000);
         let (buf, out) = render(widget(&state, Some(&slow)));
+        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Yellow);
+
+        let long_tail = summary(100, 800, 6_000);
+        let (buf, out) = render(widget(&state, Some(&long_tail)));
         assert_eq!(latency_fg(&buf, &out, "p50"), Color::Yellow);
 
         let timed_out = summary(100, 6_000, 10_500);

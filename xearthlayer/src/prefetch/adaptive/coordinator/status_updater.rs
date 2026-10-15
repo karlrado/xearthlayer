@@ -4,9 +4,7 @@
 //! internal state to the [`SharedPrefetchStatus`] consumed by the dashboard.
 
 use crate::coord::TileCoord;
-use crate::prefetch::state::{
-    resolve_state, DetailedPrefetchStats, PrefetchState, SharedPrefetchStatus, StateInputs,
-};
+use crate::prefetch::state::{DetailedPrefetchStats, SharedPrefetchStatus, StateInputs};
 
 use super::super::calibration::StrategyMode;
 use super::super::strategy::PrefetchPlan;
@@ -39,8 +37,7 @@ pub(crate) fn update_status_with_plan(
 ) {
     shared_status.update_inferred_position(position.0, position.1);
 
-    shared_status.update_prefetch_state(coordinator_state(coordinator_status, submitted > 0));
-    shared_status.update_phase(coordinator_status.phase);
+    shared_status.update_state_inputs(state_inputs(coordinator_status, submitted > 0));
     shared_status.update_box_extent(coordinator_status.box_extent);
     shared_status.update_box_bounds(coordinator_status.box_bounds);
 
@@ -82,8 +79,7 @@ pub(crate) fn update_status_no_plan(
     coordinator_status: &CoordinatorStatus,
     stats: &CycleStats,
 ) {
-    shared_status.update_prefetch_state(coordinator_state(coordinator_status, false));
-    shared_status.update_phase(coordinator_status.phase);
+    shared_status.update_state_inputs(state_inputs(coordinator_status, false));
     shared_status.update_box_extent(coordinator_status.box_extent);
     shared_status.update_box_bounds(coordinator_status.box_bounds);
 
@@ -103,17 +99,18 @@ pub(crate) fn update_status_no_plan(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The coordinator's view of its state. The demand pause lives with the lane
-/// gate, so the dashboard folds that in from telemetry (`with_lane`).
-fn coordinator_state(status: &CoordinatorStatus, lane_busy: bool) -> PrefetchState {
-    resolve_state(StateInputs {
+/// The coordinator's half of [`StateInputs`]. The demand pause and the lane's
+/// occupancy live with the lane gate, so the dashboard adds them from telemetry
+/// and resolves once.
+fn state_inputs(status: &CoordinatorStatus, lane_busy: bool) -> StateInputs {
+    StateInputs {
         enabled: status.enabled && status.mode != StrategyMode::Disabled,
         demand_paused: false,
         phase: status.phase,
         deferred_last_cycle: status.deferred_last_cycle,
         throttle_fraction: status.throttle_fraction,
         lane_busy,
-    })
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +118,7 @@ mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::test_calibration;
     use crate::prefetch::adaptive::FlightPhase;
+    use crate::prefetch::state::{resolve_state, PrefetchState};
 
     fn test_stats(cycles: u64, submitted: u64, hits: u64, deferred: u64) -> CycleStats {
         CycleStats {
@@ -137,18 +135,24 @@ mod tests {
             phase: FlightPhase::Cruise,
             ..Default::default()
         };
-        assert_eq!(coordinator_state(&status, false), PrefetchState::Idle);
-        assert_eq!(coordinator_state(&status, true), PrefetchState::Active);
+        assert_eq!(
+            resolve_state(state_inputs(&status, false)),
+            PrefetchState::Idle
+        );
+        assert_eq!(
+            resolve_state(state_inputs(&status, true)),
+            PrefetchState::Active
+        );
 
         status.throttle_fraction = Some(0.25);
         assert_eq!(
-            coordinator_state(&status, true),
+            resolve_state(state_inputs(&status, true)),
             PrefetchState::Ramping { percent: 25 }
         );
 
         status.deferred_last_cycle = true;
         assert_eq!(
-            coordinator_state(&status, true),
+            resolve_state(state_inputs(&status, true)),
             PrefetchState::DeferredLoad
         );
     }
@@ -174,7 +178,7 @@ mod tests {
         update_status_no_plan(&status, &coord_status, &test_stats(0, 0, 0, 0));
 
         let snapshot = status.snapshot();
-        assert_eq!(snapshot.prefetch_state, PrefetchState::Disabled);
+        assert_eq!(snapshot.coordinator_state(), PrefetchState::Disabled);
     }
 
     #[test]
@@ -226,7 +230,7 @@ mod tests {
         );
 
         let snapshot = status.snapshot();
-        assert_eq!(snapshot.prefetch_state, PrefetchState::Active);
+        assert_eq!(snapshot.coordinator_state(), PrefetchState::Active);
         let detailed = snapshot.detailed_stats.unwrap();
         assert_eq!(detailed.tiles_submitted_last_cycle, 2);
         assert_eq!(detailed.tiles_submitted_total, 200);

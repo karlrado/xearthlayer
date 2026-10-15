@@ -361,7 +361,7 @@ fn collect_stats(state: &DebugMapState) -> StatsInfo {
         memory_cache_hit_rate: 0.0, // TODO: wire from TelemetrySnapshot when available
         tiles_submitted,
         deferred_cycles,
-        prefetch_state: snapshot.prefetch_state.label(),
+        prefetch_state: snapshot.coordinator_state().label(),
         active_strategy,
     }
 }

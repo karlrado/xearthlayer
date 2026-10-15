@@ -1770,7 +1770,7 @@ mod tests {
 
         // Status should be updated to show Disabled
         let snapshot = shared_status.snapshot();
-        assert_eq!(snapshot.prefetch_state, PrefetchState::Disabled);
+        assert_eq!(snapshot.coordinator_state(), PrefetchState::Disabled);
 
         // Position should be updated
         assert!(snapshot.aircraft.is_some());
