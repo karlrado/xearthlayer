@@ -57,8 +57,8 @@
 
 use crate::coord::TileCoord;
 use crate::executor::{
-    ExecutorConfig, JobExecutor, JobStatus, JobSubmitter as ExecutorSubmitter, TelemetrySink,
-    TracingTelemetrySink,
+    DemandGuard, DemandTracker, ExecutorConfig, Job, JobExecutor, JobHandle, JobStatus,
+    JobSubmitter as ExecutorSubmitter, SubmitError, TelemetrySink, TracingTelemetrySink,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -343,6 +343,9 @@ where
 
     /// Optional metrics client for event-based metrics.
     metrics_client: Option<MetricsClient>,
+
+    /// Counts submitted jobs as FUSE demand (demand lane only).
+    demand: Option<DemandTracker>,
 }
 
 impl<F, M, DD> ExecutorDaemon<F, M, DD>
@@ -404,6 +407,7 @@ where
             dds_disk_cache,
             request_rx,
             metrics_client: None,
+            demand: None,
         };
 
         (daemon, request_tx)
@@ -446,9 +450,16 @@ where
             dds_disk_cache,
             request_rx,
             metrics_client: Some(metrics_client),
+            demand: None,
         };
 
         (daemon, request_tx)
+    }
+
+    /// Counts this daemon's submitted jobs as FUSE demand (demand lane only).
+    pub fn with_demand_tracker(mut self, tracker: DemandTracker) -> Self {
+        self.demand = Some(tracker);
+        self
     }
 
     /// Returns a clone of the internal job submitter.
@@ -491,6 +502,7 @@ where
             dds_disk_cache,
             mut request_rx,
             metrics_client,
+            demand,
         } = self;
 
         // Create shared coalescer for daemon-level request deduplication
@@ -527,6 +539,7 @@ where
                         &dds_disk_cache,
                         &coalescer,
                         &metrics_client,
+                        &demand,
                     ).await;
                 }
             }
@@ -537,6 +550,23 @@ where
         info!("Executor daemon stopped");
     }
 
+    /// Submits `job`, holding a demand guard for as long as it is in flight.
+    /// On error the guard is dropped here, which is how the shed and
+    /// failed-submit exits release their demand.
+    fn submit_tracked(
+        submitter: &ExecutorSubmitter,
+        job: Box<dyn Job>,
+        demand: &Option<DemandTracker>,
+    ) -> Result<(JobHandle, Option<DemandGuard>), SubmitError> {
+        let guard = demand.as_ref().map(DemandTracker::begin);
+        submitter
+            .try_submit_boxed(job)
+            .map(|handle| (handle, guard))
+    }
+
+    // Eight parameters: each is a distinct shared dependency of the request
+    // path, passed rather than bundled to keep `run` destructuring explicit.
+    #[allow(clippy::too_many_arguments)]
     async fn handle_request(
         request: JobRequest,
         submitter: &ExecutorSubmitter,
@@ -545,6 +575,7 @@ where
         dds_disk_cache: &Arc<DD>,
         coalescer: &Arc<DaemonCoalescer>,
         metrics_client: &Option<MetricsClient>,
+        demand: &Option<DemandTracker>,
     ) {
         let start = Instant::now();
         let tile = request.tile;
@@ -765,11 +796,11 @@ where
 
         let handle = {
             let _span = tracing::trace_span!(target: "profiling", "job_submit").entered();
-            submitter.try_submit_boxed(job)
+            Self::submit_tracked(submitter, job, demand)
         };
 
         match handle {
-            Ok(mut handle) => {
+            Ok((mut handle, demand_guard)) => {
                 debug!(job_id = %job_id, "Job submitted to executor");
 
                 // Track job submitted (FUSE requests are from RequestOrigin::Fuse)
@@ -785,6 +816,10 @@ where
                 let dsf_tile_for_log = dsf_tile.clone();
 
                 tokio::spawn(async move {
+                    // Released when this task ends, on the success, failure
+                    // and cancellation arms alike.
+                    let _demand_guard = demand_guard;
+
                     // Wait for job completion
                     tokio::select! {
                         job_result = handle.wait() => {
@@ -990,12 +1025,21 @@ mod tests {
     /// Mock job factory that tracks job creation count
     struct MockJobFactory {
         jobs_created: AtomicUsize,
+        fail: bool,
     }
 
     impl MockJobFactory {
         fn new() -> Self {
             Self {
                 jobs_created: AtomicUsize::new(0),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                jobs_created: AtomicUsize::new(0),
+                fail: true,
             }
         }
 
@@ -1010,6 +1054,7 @@ mod tests {
         priority: Priority,
         tile: TileCoord,
         delay: Duration,
+        fail: bool,
     }
 
     impl MockJob {
@@ -1019,7 +1064,32 @@ mod tests {
                 priority,
                 tile,
                 delay,
+                fail: false,
             }
+        }
+    }
+
+    /// Task that always fails, for the failure exit of a job.
+    struct FailingMockTask;
+
+    impl Task for FailingMockTask {
+        fn name(&self) -> &str {
+            "BuildAndCacheDds"
+        }
+
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            Box::pin(async {
+                crate::executor::TaskResult::Failed(crate::executor::TaskError::new("mock failure"))
+            })
         }
     }
 
@@ -1041,6 +1111,9 @@ mod tests {
         }
 
         fn create_tasks(&self) -> Vec<Box<dyn Task>> {
+            if self.fail {
+                return vec![Box::new(FailingMockTask)];
+            }
             // Create a task that simulates work and produces output
             vec![Box::new(MockDdsTask {
                 tile: self.tile,
@@ -1101,8 +1174,122 @@ mod tests {
         fn create_job(&self, tile: TileCoord, priority: Priority) -> Box<dyn Job> {
             self.jobs_created.fetch_add(1, Ordering::SeqCst);
             // Use 50ms delay to simulate real job timing
-            Box::new(MockJob::new(tile, priority, Duration::from_millis(50)))
+            let mut job = MockJob::new(tile, priority, Duration::from_millis(50));
+            job.fail = self.fail;
+            Box::new(job)
         }
+    }
+
+    type TestDaemon =
+        ExecutorDaemon<MockJobFactory, MockMemoryCache, crate::executor::NullDdsDiskCache>;
+
+    fn demand_daemon(
+        factory: Arc<MockJobFactory>,
+    ) -> (TestDaemon, mpsc::Sender<JobRequest>, DemandTracker) {
+        let tracker = DemandTracker::new();
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            factory,
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+        );
+        (daemon.with_demand_tracker(tracker.clone()), tx, tracker)
+    }
+
+    async fn settle(tracker: &DemandTracker) {
+        for _ in 0..200 {
+            if tracker.in_flight() == 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "demand count never returned to zero: {}",
+            tracker.in_flight()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_demand_count_returns_to_zero_after_success() {
+        let (daemon, tx, tracker) = demand_daemon(Arc::new(MockJobFactory::new()));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+        let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+        tx.send(request).await.unwrap();
+        assert!(rx.await.unwrap().is_success());
+        settle(&tracker).await;
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    #[tokio::test]
+    async fn test_demand_count_returns_to_zero_after_failure() {
+        let (daemon, tx, tracker) = demand_daemon(Arc::new(MockJobFactory::failing()));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+        let (request, rx) = JobRequest::fuse(test_tile(), CancellationToken::new());
+        tx.send(request).await.unwrap();
+        assert!(!rx.await.unwrap().is_success());
+        settle(&tracker).await;
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    #[tokio::test]
+    async fn test_demand_count_returns_to_zero_after_cancellation() {
+        let (daemon, tx, tracker) = demand_daemon(Arc::new(MockJobFactory::new()));
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+        let token = CancellationToken::new();
+        let (request, _rx) = JobRequest::fuse(test_tile(), token.clone());
+        tx.send(request).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(
+            tracker.in_flight(),
+            1,
+            "the job must be counted while it runs"
+        );
+        token.cancel();
+        settle(&tracker).await;
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    fn mock_job() -> Box<dyn Job> {
+        Box::new(MockJob::new(
+            test_tile(),
+            Priority::ON_DEMAND,
+            Duration::ZERO,
+        ))
+    }
+
+    #[test]
+    fn test_shed_submit_releases_demand() {
+        let config = ExecutorConfig {
+            job_channel_capacity: 1,
+            ..Default::default()
+        };
+        let (executor, submitter) = JobExecutor::new(config);
+        let tracker = DemandTracker::new();
+        let demand = Some(tracker.clone());
+        let _first = TestDaemon::submit_tracked(&submitter, mock_job(), &demand).unwrap();
+        let shed = TestDaemon::submit_tracked(&submitter, mock_job(), &demand);
+        assert!(shed
+            .err()
+            .expect("second submit is shed")
+            .is_back_pressure());
+        assert_eq!(tracker.in_flight(), 1, "only the accepted job is in flight");
+        drop(executor);
+    }
+
+    #[test]
+    fn test_failed_submit_releases_demand() {
+        let (executor, submitter) = JobExecutor::new(Default::default());
+        drop(executor);
+        let tracker = DemandTracker::new();
+        let result = TestDaemon::submit_tracked(&submitter, mock_job(), &Some(tracker.clone()));
+        assert!(result.is_err());
+        assert_eq!(tracker.in_flight(), 0);
     }
 
     #[test]
