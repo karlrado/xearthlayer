@@ -221,6 +221,12 @@ disk cache and the chunk disk cache by `Arc`; writes are idempotent. Coalescing 
 per lane. The coordinator, the region state machine and the demand lane stay on
 the primary in every mode.
 
+**What the lanes share.** Besides the three caches, both lanes' job factories hold
+the same texture encoder. With the CPU backends (`software`, `ispc`) that is only
+shared code, but with `texture.compressor = gpu` every encode from both lanes goes
+through one channel to one GPU worker (`dds/gpu_channel.rs`), so a prefetch encode
+can sit ahead of a FUSE encode there.
+
 **Admission pause.** `DemandTracker` (`executor/demand.rs`) counts demand jobs in
 flight, a job being a FUSE cache miss that has a generation running. The count is
 held by an RAII `DemandGuard` released on every exit (success, failure, the FUSE
@@ -277,7 +283,8 @@ pub trait PrefetchLane: Send + Sync {
 `submit` is fire-and-forget. `submit_with_receipt` is for prewarm, which needs
 per-tile progress: the `LaneReceipt` resolves to a `LaneOutcome` (`Generated`,
 `AlreadyCached`, `Failed`, `Dropped`) and never carries tile bytes. `load()` is
-0.0 to 1.0 and feeds coordinator backpressure. `LaneError` is `Full` (retry later)
+0.0 to 1.0 and feeds coordinator backpressure: how saturated the lane's queue is,
+measured as jobs waiting for admission against the `tile_generation` group size. `LaneError` is `Full` (retry later)
 or `Closed`. The result of a submission is a complete tile appearing in the
 primary's DDS disk cache, which is how the coordinator already learns of completion
 (`promote_completed_regions`). Pause is not a trait method: the lane is built with
@@ -294,9 +301,13 @@ meets by writing through `CacheLayer`, and a remote lane would have to meet too:
 Cache GC housekeeping jobs run on the local prefetch lane through
 `LocalPrefetchLane::job_submitter()`, a local-only method outside the trait, so
 they pause with prefetch. Offloading would have to move GC back to a local executor
-because it maintains the primary's caches.
+because it maintains the primary's caches. GC jobs count among the lane's running
+jobs, so a GC run shows as lane activity in the TUI and the sample line even when
+no prefetch is in flight.
 
----
+Cancelling prewarm stops it issuing tiles, but work already submitted to the lane
+runs to completion: a receipt carries no cancellation, so tiles in flight finish
+and land in the cache.
 
 ---
 
@@ -579,7 +590,7 @@ INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
      regions_deferred=... fuse_generations=... fuse_latency_p50_ms=...
      fuse_latency_p95_ms=... fuse_latency_max_ms=... fuse_latency_count=...
      fuse_timeouts=... demand_in_flight=... prefetch_paused_secs=...
-     skipped_cached=... lane_load=... lane_queued=...
+     skipped_cached=... lane_load=... lane_running=... lane_queued=...
 ```
 
 The lane fields (#296) are the no-harm instrument:
@@ -593,9 +604,11 @@ The lane fields (#296) are the no-harm instrument:
   during this sample.
 - `skipped_cached` is cumulative since process start: tiles the cache probe found
   already cached when their prefetch job was admitted.
-- `lane_load` is the prefetch lane's pool utilisation, 0.0 to 1.0. `lane_queued` is
-  its backlog: active jobs, queued tasks and jobs held waiting for admission, which
-  is where work sits while demand has the lane paused.
+- `lane_load` is `PrefetchLane::load()`, 0.0 to 1.0: jobs waiting for admission
+  against the lane's `tile_generation` group size. `lane_running` is the jobs the
+  lane has admitted and not finished. `lane_queued` is the jobs held waiting for
+  admission, by a full group or by the demand pause, which is where work sits
+  while demand has the lane paused.
 
 To compare prefetch on and off, run the same route with `prefetch.enabled = true`
 and `false` and compare `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
@@ -1007,9 +1020,13 @@ compares it against the same thresholds:
 - Load > 50%: submit reduced batch (50%)
 - Load < 50%: full submission
 
-**`PrefetchLane::load()`** is the prefetch lane's resource-pool utilisation: its own
-pipeline, meaning downloads, encoding and disk writes. The deferral log still
-names this figure `executor_load`.
+**`PrefetchLane::load()`** is how saturated the prefetch lane's queue is: jobs
+waiting for admission against its `tile_generation` group size, clamped to 1.0.
+A lane busy with work it has admitted reads 0.0; it reaches 1.0 when a full
+group's worth is queued behind the running one. It is not the lane's pool
+utilisation, because a small lane's pools read full whenever it is productively
+busy, which deferred most cycles. The deferral log still names this figure
+`executor_load`.
 
 **`PinnedTileBudget`'s pressure** is demand on the mount: memory pinned by open virtual DDS
 handles, as a fraction of the ceiling that bounds it. Added in

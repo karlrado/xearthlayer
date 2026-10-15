@@ -972,7 +972,6 @@ gate today.
 prefetch lane and so pause with it. The disk caches can run over budget during
 a long demand burst until GC resumes.
 
-
 ### Coalescing
 
 X-Plane often requests the same DDS file multiple times in rapid succession (during initial load and when panning the map). The job executor integrates with coalescing to prevent duplicate work.
