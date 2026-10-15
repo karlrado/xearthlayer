@@ -1,8 +1,7 @@
 //! DDS job factory for creating DdsGenerateJob instances.
 //!
 //! The factory pattern encapsulates the complex dependency wiring needed to create
-//! `DdsGenerateJob` instances. This allows tasks that spawn child jobs (like
-//! `GenerateTileListTask`) to remain lean and focused on their core logic.
+//! `DdsGenerateJob` instances.
 //!
 //! # HTTP Concurrency
 //!
