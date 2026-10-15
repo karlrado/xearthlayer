@@ -133,12 +133,13 @@ const LANE_LOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Publishes the prefetch lane's load and backlog until shutdown. A gauge
 /// polled on a timer rather than an event per change: the sample line only
-/// needs the latest value. The backlog is the executor's pending work count
-/// (active jobs plus queued tasks), the same figure its stall watchdog uses.
+/// needs the latest value. The queue figure is the executor's backlog: active
+/// jobs, queued tasks and jobs held waiting for admission, which is where the
+/// prefetch lane's work sits while demand has it paused.
 async fn report_lane_load(
     client: MetricsClient,
     lane: Arc<LocalPrefetchLane>,
-    backlog: Arc<std::sync::atomic::AtomicU64>,
+    backlog: Arc<std::sync::atomic::AtomicUsize>,
     shutdown: CancellationToken,
 ) {
     use crate::runtime::PrefetchLane;
@@ -148,7 +149,7 @@ async fn report_lane_load(
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => client.prefetch_lane_load(
                 lane.load(),
-                backlog.load(std::sync::atomic::Ordering::Relaxed) as usize,
+                backlog.load(std::sync::atomic::Ordering::Relaxed),
             ),
         }
     }
@@ -275,7 +276,7 @@ impl XEarthLayerRuntime {
             telemetry,
             metrics_client.clone(),
         );
-        let prefetch_backlog = prefetch_daemon.pending_work_count();
+        let prefetch_backlog = prefetch_daemon.backlog_count();
 
         // Created here, before the filesystem exists, because the client is
         // what carries it to the mount (#246).

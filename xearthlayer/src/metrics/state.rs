@@ -334,10 +334,13 @@ pub struct AggregatedState {
     pub prefetch_paused_accum: Duration,
     /// Prefetch lane pool utilisation, 0.0..=1.0 (gauge, #296).
     pub prefetch_lane_load: f64,
-    /// Prefetch lane backlog: active jobs plus queued tasks (gauge, #296).
+    /// Prefetch lane queue: active jobs, queued tasks and jobs held waiting
+    /// for admission (gauge, #296).
     pub prefetch_lane_queued: usize,
     /// The last closed sample's FUSE latency; what the TUI shows.
     pub fuse_latency: Option<LatencySummary>,
+    /// FUSE requests abandoned at the timeout in the last closed sample.
+    pub fuse_timeouts: usize,
     /// Total regions promoted via the normal completion path (counter).
     pub prefetch_promotions_normal: u64,
     /// Total regions promoted via the rescue path (counter).
@@ -426,6 +429,7 @@ impl AggregatedState {
             prefetch_lane_load: 0.0,
             prefetch_lane_queued: 0,
             fuse_latency: None,
+            fuse_timeouts: 0,
             prefetch_promotions_normal: 0,
             prefetch_promotions_rescue: 0,
         }

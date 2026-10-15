@@ -77,6 +77,9 @@ pub struct MetricsDaemon {
     /// FUSE generation latencies since the last Prefetch sample.
     fuse_latency_window: LatencyWindow,
 
+    /// FUSE requests abandoned at the timeout since the last Prefetch sample.
+    fuse_timeouts_in_window: usize,
+
     /// Probe for reading process memory.
     memory_probe: Arc<dyn MemoryProbe>,
 
@@ -116,6 +119,7 @@ impl MetricsDaemon {
             last_jobs_completed: 0,
             last_fuse_completed: 0,
             fuse_latency_window: LatencyWindow::default(),
+            fuse_timeouts_in_window: 0,
             memory_probe,
             memory_probe_failed: false,
         }
@@ -286,13 +290,13 @@ impl MetricsDaemon {
                 is_fuse,
             } => {
                 self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
+                // Every FUSE wait counts whatever its outcome; cache hits never
+                // emit JobCompleted.
+                if is_fuse {
+                    self.fuse_latency_window.record(duration_us);
+                }
                 if success {
                     self.state.jobs_completed += 1;
-                    // Failures are timeouts and errors, not generation
-                    // latency; cache hits never emit JobCompleted.
-                    if is_fuse {
-                        self.fuse_latency_window.record(duration_us);
-                    }
                 } else {
                     self.state.jobs_failed += 1;
                 }
@@ -300,9 +304,13 @@ impl MetricsDaemon {
             MetricEvent::JobCoalesced => {
                 self.state.jobs_coalesced += 1;
             }
-            MetricEvent::JobTimedOut => {
+            MetricEvent::JobTimedOut { duration_us } => {
                 self.state.jobs_active = self.state.jobs_active.saturating_sub(1);
                 self.state.jobs_timed_out += 1;
+                // The stall is the latency the no-harm measure exists to
+                // see; leaving it out would cap max at the timeout.
+                self.fuse_latency_window.record(duration_us);
+                self.fuse_timeouts_in_window += 1;
             }
 
             // Encode events
@@ -534,6 +542,8 @@ impl MetricsDaemon {
         // Close this sample's windows before borrowing state for the line.
         let latency = self.fuse_latency_window.take();
         self.state.fuse_latency = latency;
+        let timeouts = std::mem::take(&mut self.fuse_timeouts_in_window);
+        self.state.fuse_timeouts = timeouts;
         let now = Instant::now();
         let mut paused = std::mem::take(&mut self.state.prefetch_paused_accum);
         if let Some(since) = self.state.prefetch_paused_since {
@@ -589,9 +599,14 @@ impl MetricsDaemon {
             fuse_latency_p95_ms = latency.map_or(0, |s| ms(s.p95_us)),
             fuse_latency_max_ms = latency.map_or(0, |s| ms(s.max_us)),
             fuse_latency_count = latency.map_or(0, |s| s.count),
+            // Per sample, not cumulative: requests abandoned at the FUSE
+            // timeout. Their wait is inside the latency figures above.
+            fuse_timeouts = timeouts,
             demand_in_flight = state.demand_in_flight,
             // Seconds the prefetch lane stood aside for demand this sample.
             prefetch_paused_secs = paused.as_secs_f64(),
+            // Cumulative since process start, like `regions_deferred`:
+            // difference successive samples for a rate.
             skipped_cached = state.prefetch_skipped_cached,
             lane_load = state.prefetch_lane_load,
             lane_queued = state.prefetch_lane_queued,
@@ -917,7 +932,9 @@ mod tests {
         assert_eq!(daemon.state.jobs_coalesced, 1);
 
         daemon.process_event(MetricEvent::JobStarted);
-        daemon.process_event(MetricEvent::JobTimedOut);
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 10_000_000,
+        });
         assert_eq!(daemon.state.jobs_active, 0);
         assert_eq!(daemon.state.jobs_timed_out, 1);
     }
@@ -1609,9 +1626,9 @@ mod tests {
         for ms in 1..=100 {
             fuse_done(&mut daemon, ms, true, true);
         }
-        // Prefetch completions and failures stay out of the window.
+        // Prefetch completions stay out of the window, whatever the outcome.
         fuse_done(&mut daemon, 9_000, true, false);
-        fuse_done(&mut daemon, 9_000, false, true);
+        fuse_done(&mut daemon, 9_000, false, false);
 
         let events = capture_events(|| daemon.log_prefetch_sample());
         assert_eq!(sample_field(&events, "fuse_latency_p50_ms"), Some("50"));
@@ -1627,6 +1644,39 @@ mod tests {
         let events = capture_events(|| daemon.log_prefetch_sample());
         assert_eq!(sample_field(&events, "fuse_latency_count"), Some("0"));
         assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("0"));
+    }
+
+    #[test]
+    fn test_failed_fuse_job_enters_the_latency_window() {
+        let (mut daemon, _tx) = create_daemon();
+        fuse_done(&mut daemon, 10, true, true);
+        fuse_done(&mut daemon, 2_000, false, true);
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_latency_count"), Some("2"));
+        assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("2000"));
+    }
+
+    #[test]
+    fn test_timed_out_fuse_request_appears_in_max_and_timeouts_per_sample() {
+        let (mut daemon, _tx) = create_daemon();
+        fuse_done(&mut daemon, 40, true, true);
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 10_000_000,
+        });
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("10000"));
+        assert_eq!(sample_field(&events, "fuse_latency_count"), Some("2"));
+        assert_eq!(sample_field(&events, "fuse_timeouts"), Some("1"));
+        assert_eq!(daemon.state.fuse_timeouts, 1);
+
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(
+            sample_field(&events, "fuse_timeouts"),
+            Some("0"),
+            "a delta per sample, not cumulative"
+        );
     }
 
     #[test]

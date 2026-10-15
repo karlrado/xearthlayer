@@ -202,6 +202,7 @@ impl MetricsReporter for TuiReporter {
 
             // Lane metrics
             fuse_latency: state.fuse_latency,
+            fuse_timeouts: state.fuse_timeouts,
             demand_in_flight: state.demand_in_flight,
             prefetch_paused: state.prefetch_paused,
             prefetch_lane_load: state.prefetch_lane_load,

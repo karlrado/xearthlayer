@@ -334,10 +334,11 @@ impl MetricsClient {
         self.send(MetricEvent::JobCoalesced);
     }
 
-    /// Records a job timing out.
+    /// Records a FUSE job abandoned at the FUSE timeout, with how long it
+    /// waited.
     #[inline]
-    pub fn job_timed_out(&self) {
-        self.send(MetricEvent::JobTimedOut);
+    pub fn job_timed_out(&self, duration_us: u64) {
+        self.send(MetricEvent::JobTimedOut { duration_us });
     }
 
     // =========================================================================
@@ -639,7 +640,7 @@ mod tests {
         client.job_started();
         client.job_completed(true, 100_000, true);
         client.job_coalesced();
-        client.job_timed_out();
+        client.job_timed_out(1);
 
         assert!(matches!(
             rx.recv().await,
@@ -655,7 +656,10 @@ mod tests {
             })
         ));
         assert!(matches!(rx.recv().await, Some(MetricEvent::JobCoalesced)));
-        assert!(matches!(rx.recv().await, Some(MetricEvent::JobTimedOut)));
+        assert!(matches!(
+            rx.recv().await,
+            Some(MetricEvent::JobTimedOut { .. })
+        ));
     }
 
     #[tokio::test]

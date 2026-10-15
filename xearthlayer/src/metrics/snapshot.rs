@@ -143,13 +143,15 @@ pub struct TelemetrySnapshot {
     /// FUSE generation latency over the last completed 60 s sample, cache
     /// hits excluded. `None` until a sample closes with at least one job.
     pub fuse_latency: Option<LatencySummary>,
+    /// FUSE requests abandoned at the timeout in the last closed sample.
+    pub fuse_timeouts: usize,
     /// FUSE demand jobs in flight
     pub demand_in_flight: usize,
     /// True while the prefetch lane stands aside for demand
     pub prefetch_paused: bool,
     /// Prefetch lane pool utilisation, 0.0..=1.0
     pub prefetch_lane_load: f64,
-    /// Prefetch lane backlog (active jobs plus queued tasks)
+    /// Prefetch lane queue: active jobs, queued tasks and jobs held waiting for admission
     pub prefetch_lane_queued: usize,
 }
 
@@ -206,6 +208,7 @@ impl Default for TelemetrySnapshot {
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
             fuse_latency: None,
+            fuse_timeouts: 0,
             demand_in_flight: 0,
             prefetch_paused: false,
             prefetch_lane_load: 0.0,

@@ -486,10 +486,11 @@ where
         self.submitter.clone()
     }
 
-    /// Active jobs plus queued tasks, refreshed every executor loop. The
-    /// prefetch lane's backlog gauge reads this.
-    pub fn pending_work_count(&self) -> Arc<std::sync::atomic::AtomicU64> {
-        Arc::clone(&self.executor.pending_work_count)
+    /// Active jobs, queued tasks and jobs held waiting for admission,
+    /// refreshed every executor loop. The prefetch lane's queue gauge reads
+    /// this; the stall watchdog deliberately does not.
+    pub fn backlog_count(&self) -> Arc<std::sync::atomic::AtomicUsize> {
+        Arc::clone(&self.executor.backlog_count)
     }
 
     /// Returns a shared reference to the executor's resource pools.
@@ -949,6 +950,15 @@ where
                                 "DDS request cancelled"
                             );
                             handle.kill();
+
+                            // A cancelled FUSE request is a FUSE timeout. Its
+                            // wait feeds the latency window: a stall must not
+                            // vanish from the no-harm measure.
+                            if origin.is_fuse() {
+                                if let Some(ref client) = metrics_for_completion {
+                                    client.job_timed_out(start.elapsed().as_micros() as u64);
+                                }
+                            }
 
                             // Remove from coalescer so other waiters know job was cancelled
                             coalescer.cancel(tile);

@@ -182,8 +182,11 @@ pub enum MetricEvent {
     /// A job was coalesced (waited for existing work).
     JobCoalesced,
 
-    /// A job timed out.
-    JobTimedOut,
+    /// A FUSE job was abandoned at the FUSE timeout.
+    JobTimedOut {
+        /// How long the request waited before it was cancelled.
+        duration_us: u64,
+    },
 
     // =========================================================================
     // Encode Events
@@ -379,7 +382,7 @@ impl MetricEvent {
             Self::JobStarted => "job_started",
             Self::JobCompleted { .. } => "job_completed",
             Self::JobCoalesced => "job_coalesced",
-            Self::JobTimedOut => "job_timed_out",
+            Self::JobTimedOut { .. } => "job_timed_out",
             Self::EncodeStarted => "encode_started",
             Self::EncodeCompleted { .. } => "encode_completed",
             Self::AssemblyCompleted { .. } => "assembly_completed",
