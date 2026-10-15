@@ -424,8 +424,13 @@ impl MetricsDaemon {
                 }
                 self.state.prefetch_paused = paused;
             }
-            MetricEvent::PrefetchLaneLoad { load, queued } => {
+            MetricEvent::PrefetchLaneLoad {
+                load,
+                running,
+                queued,
+            } => {
                 self.state.prefetch_lane_load = load;
+                self.state.prefetch_lane_running = running;
                 self.state.prefetch_lane_queued = queued;
             }
             MetricEvent::PrefetchSkippedCached => {
@@ -609,6 +614,7 @@ impl MetricsDaemon {
             // difference successive samples for a rate.
             skipped_cached = state.prefetch_skipped_cached,
             lane_load = state.prefetch_lane_load,
+            lane_running = state.prefetch_lane_running,
             lane_queued = state.prefetch_lane_queued,
             "Prefetch sample"
         );
@@ -1686,6 +1692,7 @@ mod tests {
         daemon.process_event(MetricEvent::PrefetchSkippedCached);
         daemon.process_event(MetricEvent::PrefetchLaneLoad {
             load: 0.5,
+            running: 30,
             queued: 12,
         });
 
@@ -1693,6 +1700,7 @@ mod tests {
         assert_eq!(sample_field(&events, "demand_in_flight"), Some("7"));
         assert_eq!(sample_field(&events, "skipped_cached"), Some("1"));
         assert_eq!(sample_field(&events, "lane_load"), Some("0.5"));
+        assert_eq!(sample_field(&events, "lane_running"), Some("30"));
         assert_eq!(sample_field(&events, "lane_queued"), Some("12"));
     }
 

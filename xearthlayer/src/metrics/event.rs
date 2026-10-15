@@ -336,8 +336,13 @@ pub enum MetricEvent {
     /// The prefetch lane paused or resumed behind demand.
     PrefetchPaused { paused: bool },
 
-    /// Prefetch lane load and backlog (gauge, sampled).
-    PrefetchLaneLoad { load: f64, queued: usize },
+    /// Prefetch lane load, jobs running and jobs waiting for admission
+    /// (gauge, sampled).
+    PrefetchLaneLoad {
+        load: f64,
+        running: usize,
+        queued: usize,
+    },
 
     /// Regions promoted from `InProgress` to `Prefetched` via the normal
     /// completion path (all tiles in the region confirmed present).

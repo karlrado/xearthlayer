@@ -206,6 +206,7 @@ impl MetricsReporter for TuiReporter {
             demand_in_flight: state.demand_in_flight,
             prefetch_paused: state.prefetch_paused,
             prefetch_lane_load: state.prefetch_lane_load,
+            prefetch_lane_running: state.prefetch_lane_running,
             prefetch_lane_queued: state.prefetch_lane_queued,
         }
     }
@@ -262,6 +263,7 @@ mod tests {
         state.demand_in_flight = 3;
         state.prefetch_paused = true;
         state.prefetch_lane_load = 0.25;
+        state.prefetch_lane_running = 9;
         state.prefetch_lane_queued = 11;
 
         let snapshot = TuiReporter::new().report(&state, &TimeSeriesHistory::default());
@@ -270,6 +272,7 @@ mod tests {
         assert_eq!(snapshot.demand_in_flight, 3);
         assert!(snapshot.prefetch_paused);
         assert_eq!(snapshot.prefetch_lane_load, 0.25);
+        assert_eq!(snapshot.prefetch_lane_running, 9);
         assert_eq!(snapshot.prefetch_lane_queued, 11);
     }
 

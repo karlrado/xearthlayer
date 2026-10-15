@@ -775,6 +775,7 @@ impl MountManager {
             demand_in_flight: 0,
             prefetch_paused: false,
             prefetch_lane_load: 0.0,
+            prefetch_lane_running: 0,
             prefetch_lane_queued: 0,
         };
 
@@ -857,6 +858,7 @@ impl MountManager {
             total.demand_in_flight += snapshot.demand_in_flight;
             total.prefetch_paused |= snapshot.prefetch_paused;
             total.prefetch_lane_load = total.prefetch_lane_load.max(snapshot.prefetch_lane_load);
+            total.prefetch_lane_running += snapshot.prefetch_lane_running;
             total.prefetch_lane_queued += snapshot.prefetch_lane_queued;
 
             // Use the highest peak from any service

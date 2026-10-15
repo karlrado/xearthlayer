@@ -133,11 +133,11 @@ pub struct XEarthLayerRuntime {
 /// How often the prefetch lane's load and backlog are sampled for metrics.
 const LANE_LOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Publishes the prefetch lane's load and backlog until shutdown. A gauge
+/// Publishes the prefetch lane's load and job counts until shutdown. A gauge
 /// polled on a timer rather than an event per change: the sample line only
-/// needs the latest value. The queue figure is the lane's jobs, running and
-/// held waiting for admission, which is where its work sits while demand has
-/// it paused.
+/// needs the latest value. The queue figure is the jobs held waiting for
+/// admission, which is where the lane's work sits while demand has it
+/// paused.
 async fn report_lane_load(
     client: MetricsClient,
     lane: Arc<LocalPrefetchLane>,
@@ -151,7 +151,8 @@ async fn report_lane_load(
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => client.prefetch_lane_load(
                 lane.load(),
-                counts.running() + counts.waiting(),
+                counts.running(),
+                counts.waiting(),
             ),
         }
     }

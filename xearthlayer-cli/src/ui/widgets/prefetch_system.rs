@@ -19,7 +19,7 @@ use xearthlayer::prefetch::{DetailedPrefetchStats, FlightPhase, PrefetchState};
 const LABEL_COLOR: Color = Color::DarkGray;
 
 /// How full the prefetch lane is: jobs running against its group size, plus
-/// the backlog (jobs queued or held by the gate).
+/// the jobs waiting for admission (a full group or the demand pause).
 #[derive(Debug, Clone, Copy)]
 pub struct LaneView {
     pub running: usize,

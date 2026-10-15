@@ -205,19 +205,14 @@ fn render_prefetch_system(
     // The pause and the lane's occupancy are published by the metrics side;
     // the coordinator cannot see either.
     let lane_busy = prefetch.state_inputs.lane_busy
-        || telemetry.prefetch_lane_load > 0.0
+        || telemetry.prefetch_lane_running > 0
         || telemetry.prefetch_lane_queued > 0;
     let state = resolve_state(StateInputs {
         demand_paused: telemetry.prefetch_paused,
         lane_busy,
         ..prefetch.state_inputs
     });
-    let lane = LaneView {
-        // An estimate: lane load is the busiest pool's utilisation, not a job count.
-        running: (telemetry.prefetch_lane_load * lane_config.group as f64).round() as usize,
-        group: lane_config.group,
-        queued: telemetry.prefetch_lane_queued,
-    };
+    let lane = lane_view(telemetry, lane_config.group);
 
     frame.render_widget(
         PrefetchSystemWidget::new(
@@ -231,6 +226,14 @@ fn render_prefetch_system(
         .with_timeouts(telemetry.fuse_timeouts),
         inner,
     );
+}
+
+fn lane_view(telemetry: &TelemetrySnapshot, group: usize) -> LaneView {
+    LaneView {
+        running: telemetry.prefetch_lane_running,
+        group,
+        queued: telemetry.prefetch_lane_queued,
+    }
 }
 
 /// Render the quit confirmation overlay banner.
@@ -432,4 +435,21 @@ pub fn render_header(
         .alignment(ratatui::layout::Alignment::Right);
 
     frame.render_widget(uptime_text, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lane_view_shows_the_lanes_job_counts() {
+        let telemetry = TelemetrySnapshot {
+            prefetch_lane_load: 1.0,
+            prefetch_lane_running: 28,
+            prefetch_lane_queued: 1_904,
+            ..TelemetrySnapshot::default()
+        };
+        let lane = lane_view(&telemetry, 70);
+        assert_eq!((lane.running, lane.group, lane.queued), (28, 70, 1_904));
+    }
 }

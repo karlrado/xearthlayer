@@ -480,10 +480,14 @@ impl MetricsClient {
         self.send(MetricEvent::PrefetchPaused { paused });
     }
 
-    /// Record the prefetch lane's load and backlog.
+    /// Record the prefetch lane's load, jobs running and jobs waiting.
     #[inline]
-    pub fn prefetch_lane_load(&self, load: f64, queued: usize) {
-        self.send(MetricEvent::PrefetchLaneLoad { load, queued });
+    pub fn prefetch_lane_load(&self, load: f64, running: usize, queued: usize) {
+        self.send(MetricEvent::PrefetchLaneLoad {
+            load,
+            running,
+            queued,
+        });
     }
 }
 

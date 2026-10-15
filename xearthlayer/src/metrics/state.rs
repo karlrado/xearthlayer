@@ -335,8 +335,9 @@ pub struct AggregatedState {
     /// Prefetch lane queue saturation, 0.0..=1.0: jobs waiting for admission
     /// against the group size (gauge, #296).
     pub prefetch_lane_load: f64,
-    /// Prefetch lane jobs, running and held waiting for admission (gauge,
-    /// #296).
+    /// Prefetch lane jobs admitted and not yet finished (gauge, #296).
+    pub prefetch_lane_running: usize,
+    /// Prefetch lane jobs held waiting for admission (gauge, #296).
     pub prefetch_lane_queued: usize,
     /// The last closed sample's FUSE latency; what the TUI shows.
     pub fuse_latency: Option<LatencySummary>,
@@ -428,6 +429,7 @@ impl AggregatedState {
             prefetch_paused_since: None,
             prefetch_paused_accum: Duration::ZERO,
             prefetch_lane_load: 0.0,
+            prefetch_lane_running: 0,
             prefetch_lane_queued: 0,
             fuse_latency: None,
             fuse_timeouts: 0,
