@@ -76,13 +76,20 @@ impl Inner {
         } else {
             count.saturating_sub(1)
         };
-        let was_outstanding = self.outstanding.send_replace(*count > 0);
+        let outstanding = *count > 0;
+        // Only the 0/1 edges notify: every notification wakes the prefetch
+        // executor, and a count moving between 2 and 3 changes nothing for it.
+        let edge = self.outstanding.send_if_modified(|current| {
+            let edge = *current != outstanding;
+            *current = outstanding;
+            edge
+        });
         // Emitted under the lock so events arrive in the order the count
         // changed.
         if let Some(metrics) = self.metrics.get() {
             metrics.demand_in_flight(*count);
-            if was_outstanding != (*count > 0) {
-                metrics.prefetch_paused(*count > 0);
+            if edge {
+                metrics.prefetch_paused(outstanding);
             }
         }
     }
@@ -122,6 +129,22 @@ mod tests {
         drop(b);
         assert!(!*rx.borrow());
         assert_eq!(tracker.in_flight(), 0);
+    }
+
+    /// The prefetch executor wakes on every change notification, so only the
+    /// 0/1 edges may notify, not every count change between them.
+    #[test]
+    fn subscribers_are_notified_only_on_the_pause_edges() {
+        let tracker = DemandTracker::new();
+        let mut rx = tracker.subscribe();
+        let a = tracker.begin();
+        assert!(rx.has_changed().unwrap(), "0 to 1 pauses");
+        rx.mark_unchanged();
+        let b = tracker.begin();
+        drop(b);
+        assert!(!rx.has_changed().unwrap(), "1 to 2 and back is no edge");
+        drop(a);
+        assert!(rx.has_changed().unwrap(), "1 to 0 resumes");
     }
 
     #[test]

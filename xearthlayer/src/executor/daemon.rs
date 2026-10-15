@@ -292,6 +292,13 @@ impl DaemonCoalescer {
         }
     }
 
+    /// Whether any request is waiting on the in-flight job for `tile`.
+    fn has_waiters(&self, tile: TileCoord) -> bool {
+        self.in_flight
+            .get(&tile)
+            .is_some_and(|tx| tx.receiver_count() > 0)
+    }
+
     /// Cancels a job, removing it from in-flight.
     fn cancel(&self, tile: TileCoord) {
         if let Some((_, _tx)) = self.in_flight.remove(&tile) {
@@ -879,10 +886,18 @@ where
 
                                         (d, false)
                                     }
+                                    // A job skipped by the prefetch lane's cache probe
+                                    // succeeds without output: its tile was cached while it
+                                    // waited, often on DDS disk only. With nobody to answer,
+                                    // reading the tile back would cost a whole-tile read for
+                                    // nothing. A waiter that joins after this check is told
+                                    // the job succeeded, which is true.
+                                    None if request.response_tx.is_none()
+                                        && !coalescer.has_waiters(tile) =>
+                                    {
+                                        (Bytes::new(), true)
+                                    }
                                     None => {
-                                        // A job skipped by the prefetch lane's cache probe
-                                        // succeeds without output: its tile was cached while it
-                                        // waited, often on DDS disk only.
                                         let cached = match memory_cache
                                             .get(tile.row, tile.col, tile.zoom)
                                             .await
@@ -1347,12 +1362,22 @@ mod tests {
     }
 
     /// DDS disk cache holding at most one tile, written by the job itself.
+    /// Counts reads, because a whole-tile read nobody wanted is the cost.
+    #[derive(Default)]
     struct OneTileDdsDisk {
         tile: Mutex<Option<(TileCoord, Bytes)>>,
+        gets: AtomicUsize,
+    }
+
+    impl OneTileDdsDisk {
+        fn holds_a_tile(&self) -> bool {
+            self.tile.lock().unwrap().is_some()
+        }
     }
 
     impl crate::executor::DdsDiskCache for OneTileDdsDisk {
         async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Bytes> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
             let held = self.tile.lock().unwrap().clone();
             held.filter(|(t, _)| (t.row, t.col, t.zoom) == (row, col, zoom))
                 .map(|(_, data)| data)
@@ -1363,7 +1388,8 @@ mod tests {
         }
 
         async fn contains(&self, row: u32, col: u32, zoom: u8) -> bool {
-            self.get(row, col, zoom).await.is_some()
+            let held = self.tile.lock().unwrap().clone();
+            held.is_some_and(|(t, _)| (t.row, t.col, t.zoom) == (row, col, zoom))
         }
     }
 
@@ -1445,9 +1471,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_probe_skipped_job_is_served_from_dds_disk_as_a_cache_hit() {
-        let disk = Arc::new(OneTileDdsDisk {
-            tile: Mutex::new(None),
-        });
+        let disk = Arc::new(OneTileDdsDisk::default());
         let (daemon, tx) = ExecutorDaemon::new(
             ExecutorDaemonConfig::default(),
             Arc::new(SkippedByProbeFactory {
@@ -1513,6 +1537,43 @@ mod tests {
         assert!(
             latency >= QUEUED,
             "latency {latency:?} must include the {QUEUED:?} the request sat queued"
+        );
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// With no response channel and no coalesced waiter, nobody wants the
+    /// skipped job's tile, so reading it back from disk is pure cost.
+    #[tokio::test]
+    async fn test_probe_skipped_job_without_listeners_reads_nothing_back() {
+        let disk = Arc::new(OneTileDdsDisk::default());
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            Arc::new(SkippedByProbeFactory {
+                disk: Arc::clone(&disk),
+            }),
+            Arc::new(MockMemoryCache::new()),
+            Arc::clone(&disk),
+        );
+        let counts = daemon.job_counts();
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        tx.send(JobRequest::prefetch(test_tile())).await.unwrap();
+        for _ in 0..200 {
+            if disk.holds_a_tile() && counts.running() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(disk.holds_a_tile(), "the job ran");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(
+            disk.gets.load(Ordering::SeqCst),
+            1,
+            "only the admission check reads the disk tier"
         );
 
         shutdown.cancel();
