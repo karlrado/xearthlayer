@@ -319,6 +319,9 @@ pub struct AggregatedState {
     /// deferral ladder rather than how often prefetch's state was simply
     /// wrong.
     pub prefetch_deferrals_cleared: u64,
+    /// Prefetch tile jobs that found their tile cached at admission and
+    /// skipped the download and encode, cumulative (counter, #296).
+    pub prefetch_skipped_cached: u64,
     /// Total regions promoted via the normal completion path (counter).
     pub prefetch_promotions_normal: u64,
     /// Total regions promoted via the rescue path (counter).
@@ -399,6 +402,7 @@ impl AggregatedState {
             prefetch_regions_demoted: 0,
             prefetch_regions_deferred: 0,
             prefetch_deferrals_cleared: 0,
+            prefetch_skipped_cached: 0,
             prefetch_promotions_normal: 0,
             prefetch_promotions_rescue: 0,
         }

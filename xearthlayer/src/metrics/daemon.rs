@@ -390,6 +390,9 @@ impl MetricsDaemon {
             MetricEvent::PrefetchDeferralCleared => {
                 self.state.prefetch_deferrals_cleared += 1;
             }
+            MetricEvent::PrefetchSkippedCached => {
+                self.state.prefetch_skipped_cached += 1;
+            }
             MetricEvent::PrefetchRegionsPromotedNormal { count } => {
                 self.state.prefetch_promotions_normal += count as u64;
             }
@@ -1525,6 +1528,19 @@ mod tests {
         assert_eq!(daemon.state.prefetch_promotions_normal, 0);
         assert_eq!(daemon.state.prefetch_promotions_rescue, 0);
         assert_eq!(daemon.state.prefetch_deferrals_cleared, 0);
+    }
+
+    #[test]
+    fn test_prefetch_skipped_cached_event_increments_the_counter_only() {
+        let (mut daemon, _tx) = create_daemon();
+
+        daemon.process_event(MetricEvent::PrefetchSkippedCached);
+        daemon.process_event(MetricEvent::PrefetchSkippedCached);
+
+        assert_eq!(daemon.state.prefetch_skipped_cached, 2);
+        assert_eq!(daemon.state.prefetch_deferrals_cleared, 0);
+        assert_eq!(daemon.state.prefetch_regions_deferred, 0);
+        assert_eq!(daemon.state.prefetch_promotions_normal, 0);
     }
 
     #[test]

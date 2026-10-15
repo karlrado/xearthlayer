@@ -320,6 +320,10 @@ pub enum MetricEvent {
     /// for whether the 20/30/40/60s deferral ladder is well-tuned (#226).
     PrefetchDeferralCleared,
 
+    /// A prefetch tile job found its tile already cached at admission and
+    /// skipped the download and encode (#296).
+    PrefetchSkippedCached,
+
     /// Regions promoted from `InProgress` to `Prefetched` via the normal
     /// completion path (all tiles in the region confirmed present).
     ///
@@ -380,6 +384,7 @@ impl MetricEvent {
             Self::PrefetchRegionDemoted => "prefetch_region_demoted",
             Self::PrefetchRegionDeferred => "prefetch_region_deferred",
             Self::PrefetchDeferralCleared => "prefetch_deferral_cleared",
+            Self::PrefetchSkippedCached => "prefetch_skipped_cached",
             Self::PrefetchRegionsPromotedNormal { .. } => "prefetch_regions_promoted_normal",
             Self::PrefetchRegionPromotedRescue => "prefetch_region_promoted_rescue",
         }

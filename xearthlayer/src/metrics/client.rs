@@ -457,6 +457,13 @@ impl MetricsClient {
     pub fn prefetch_deferral_cleared(&self) {
         self.send(MetricEvent::PrefetchDeferralCleared);
     }
+
+    /// Record that a prefetch tile job skipped its work because the tile was
+    /// already cached at admission.
+    #[inline]
+    pub fn prefetch_skipped_cached(&self) {
+        self.send(MetricEvent::PrefetchSkippedCached);
+    }
 }
 
 impl std::fmt::Debug for MetricsClient {
