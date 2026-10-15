@@ -472,6 +472,112 @@ async fn test_fail_fast_job_releases_its_concurrency_permit() {
 }
 
 // =============================================================================
+// Admission gate
+//
+// While the gate reads true no queued job is admitted; a job already admitted
+// runs every one of its tasks; clearing the gate admits again. The prefetch
+// lane uses this to stand aside while FUSE demand is outstanding (#296).
+// =============================================================================
+
+fn start_gated_executor(
+    paused: bool,
+) -> (
+    xearthlayer::executor::JobSubmitter,
+    tokio::sync::watch::Sender<bool>,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(paused);
+    let config = ExecutorConfig::default().with_admission_gate(gate_rx);
+    let (executor, submitter) = JobExecutor::new(config);
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let handle = tokio::spawn(async move { executor.run(shutdown_clone).await });
+    (submitter, gate_tx, shutdown, handle)
+}
+
+#[tokio::test]
+async fn test_paused_gate_admits_nothing_until_cleared() {
+    let (submitter, gate, shutdown, executor_handle) = start_gated_executor(true);
+
+    let mut handle = submitter.submit(EmptyJob {
+        id: "gated".to_string(),
+    });
+    let admitted = tokio::time::timeout(Duration::from_millis(200), handle.wait()).await;
+    assert!(
+        admitted.is_err(),
+        "a job must not run while the gate is paused"
+    );
+
+    gate.send_replace(false);
+    let finished = tokio::time::timeout(Duration::from_secs(2), handle.wait()).await;
+    assert!(
+        finished.is_ok(),
+        "clearing the gate must admit the queued job"
+    );
+    assert_eq!(handle.status(), JobStatus::Succeeded);
+
+    shutdown.cancel();
+    let _ = executor_handle.await;
+}
+
+#[tokio::test]
+async fn test_pausing_lets_an_admitted_job_finish_every_task() {
+    let (submitter, gate, shutdown, executor_handle) = start_gated_executor(false);
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    let mut handle = submitter.submit(TestJobWithCounter {
+        id: "admitted".to_string(),
+        counter: counter.clone(),
+        task_count: 3,
+        delay_ms: 100,
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.send_replace(true);
+
+    let finished = tokio::time::timeout(Duration::from_secs(3), handle.wait()).await;
+    assert!(
+        finished.is_ok(),
+        "an admitted job must not be parked by a pause"
+    );
+    assert_eq!(handle.status(), JobStatus::Succeeded);
+    assert_eq!(counter.load(Ordering::SeqCst), 3, "every task must run");
+
+    shutdown.cancel();
+    let _ = executor_handle.await;
+}
+
+#[tokio::test]
+async fn test_paused_gate_holds_grouped_jobs_too() {
+    let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
+    let config = ExecutorConfig {
+        job_concurrency_limits: JobConcurrencyLimits::empty().with_group(SINGLE_PERMIT_GROUP, 1),
+        ..ExecutorConfig::default()
+    }
+    .with_admission_gate(gate_rx);
+    let (executor, submitter) = JobExecutor::new(config);
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let executor_handle = tokio::spawn(async move { executor.run(shutdown_clone).await });
+
+    let mut handle = submitter.submit(InGroup(EmptyJob {
+        id: "grouped".to_string(),
+    }));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), handle.wait())
+            .await
+            .is_err()
+    );
+    gate_tx.send_replace(false);
+    assert!(tokio::time::timeout(Duration::from_secs(2), handle.wait())
+        .await
+        .is_ok());
+
+    shutdown.cancel();
+    let _ = executor_handle.await;
+}
+
+// =============================================================================
 // Test Job Implementations
 // =============================================================================
 

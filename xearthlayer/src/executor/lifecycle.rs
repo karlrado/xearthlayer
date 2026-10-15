@@ -20,6 +20,14 @@ use tokio::sync::{mpsc, watch, OwnedSemaphorePermit};
 use tracing::{debug, error, warn};
 
 impl JobExecutor {
+    /// Whether the admission gate currently holds new jobs back.
+    pub(crate) fn admission_paused(&self) -> bool {
+        self.config
+            .admission_gate
+            .as_ref()
+            .is_some_and(|gate| *gate.borrow())
+    }
+
     /// Handles a newly submitted job.
     ///
     /// Acquires a concurrency permit if needed, or queues the job for later.
@@ -40,6 +48,18 @@ impl JobExecutor {
             name: name.clone(),
             priority,
         });
+
+        // A paused gate holds every job, grouped or not, in the waiting heap;
+        // start_waiting_jobs admits it once the gate clears.
+        if self.admission_paused() {
+            let seq = self.waiting_sequence;
+            self.waiting_sequence += 1;
+            self.waiting_for_permit.push(WaitingJob {
+                submitted,
+                sequence: seq,
+            });
+            return;
+        }
 
         // Try to acquire concurrency permit (non-blocking to avoid deadlock)
         let concurrency_permit = if let Some(group) = submitted.job.concurrency_group() {
@@ -353,6 +373,10 @@ impl JobExecutor {
     /// 1. ON_DEMAND jobs are tried before PREFETCH (priority ordering)
     /// 2. A full group doesn't block jobs in OTHER groups (skip-and-continue)
     pub(crate) async fn start_waiting_jobs(&mut self) {
+        if self.admission_paused() {
+            return;
+        }
+
         let mut blocked = Vec::new();
 
         while let Some(waiting) = self.waiting_for_permit.pop() {

@@ -175,6 +175,11 @@ impl JobExecutor {
                 _ = self.work_notify.notified() => {
                     self.dispatch_tasks().await;
                 }
+
+                Ok(()) = gate_changed(&mut self.config.admission_gate) => {
+                    // The loop tail runs complete_finished_jobs, which calls
+                    // start_waiting_jobs: a resume is admitted there.
+                }
             }
 
             self.process_signals().await;
@@ -228,6 +233,16 @@ impl std::fmt::Debug for JobExecutor {
             .field("loop_count", &self.loop_count)
             .field("waiting_for_permit", &self.waiting_for_permit.len())
             .finish_non_exhaustive()
+    }
+}
+
+/// Resolves when the admission gate changes; never resolves without a gate.
+async fn gate_changed(
+    gate: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), tokio::sync::watch::error::RecvError> {
+    match gate {
+        Some(rx) => rx.changed().await,
+        None => std::future::pending().await,
     }
 }
 
