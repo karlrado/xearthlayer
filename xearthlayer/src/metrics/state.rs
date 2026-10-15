@@ -332,10 +332,11 @@ pub struct AggregatedState {
     pub prefetch_paused_since: Option<Instant>,
     /// Pause time closed since the last sample.
     pub prefetch_paused_accum: Duration,
-    /// Prefetch lane pool utilisation, 0.0..=1.0 (gauge, #296).
+    /// Prefetch lane queue saturation, 0.0..=1.0: jobs waiting for admission
+    /// against the group size (gauge, #296).
     pub prefetch_lane_load: f64,
-    /// Prefetch lane queue: active jobs, queued tasks and jobs held waiting
-    /// for admission (gauge, #296).
+    /// Prefetch lane jobs, running and held waiting for admission (gauge,
+    /// #296).
     pub prefetch_lane_queued: usize,
     /// The last closed sample's FUSE latency; what the TUI shows.
     pub fuse_latency: Option<LatencySummary>,

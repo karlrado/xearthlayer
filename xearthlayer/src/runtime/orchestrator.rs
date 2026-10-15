@@ -54,8 +54,8 @@ use tracing::info;
 
 use crate::executor::{
     ChannelDdsClient, DaemonMemoryCache, DdsClient, DdsDiskCache, DemandTracker, ExecutorConfig,
-    ExecutorDaemon, ExecutorDaemonConfig, JobConcurrencyLimits, LaneSizing, MultiplexTelemetrySink,
-    TelemetrySink, TracingTelemetrySink, TILE_GENERATION_GROUP,
+    ExecutorDaemon, ExecutorDaemonConfig, JobConcurrencyLimits, JobCounts, LaneSizing,
+    MultiplexTelemetrySink, TelemetrySink, TracingTelemetrySink, TILE_GENERATION_GROUP,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
@@ -114,9 +114,11 @@ pub struct XEarthLayerRuntime {
     /// Memory pinned by open virtual DDS handles (#246).
     pinned_budget: Arc<PinnedTileBudget>,
 
-    /// The demand lane's pools; lets tests check lane isolation.
+    /// Each lane's pools; lets tests check lane isolation.
     #[cfg(test)]
     demand_pools: Arc<crate::executor::ResourcePools>,
+    #[cfg(test)]
+    prefetch_pools: Arc<crate::executor::ResourcePools>,
 
     /// Handles to the demand and prefetch daemon tasks.
     daemon_handles: Vec<JoinHandle<()>>,
@@ -133,13 +135,13 @@ const LANE_LOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1
 
 /// Publishes the prefetch lane's load and backlog until shutdown. A gauge
 /// polled on a timer rather than an event per change: the sample line only
-/// needs the latest value. The queue figure is the executor's backlog: active
-/// jobs, queued tasks and jobs held waiting for admission, which is where the
-/// prefetch lane's work sits while demand has it paused.
+/// needs the latest value. The queue figure is the lane's jobs, running and
+/// held waiting for admission, which is where its work sits while demand has
+/// it paused.
 async fn report_lane_load(
     client: MetricsClient,
     lane: Arc<LocalPrefetchLane>,
-    backlog: Arc<std::sync::atomic::AtomicUsize>,
+    counts: JobCounts,
     shutdown: CancellationToken,
 ) {
     use crate::runtime::PrefetchLane;
@@ -149,7 +151,7 @@ async fn report_lane_load(
             _ = shutdown.cancelled() => break,
             _ = tick.tick() => client.prefetch_lane_load(
                 lane.load(),
-                backlog.load(std::sync::atomic::Ordering::Relaxed),
+                counts.running() + counts.waiting(),
             ),
         }
     }
@@ -276,7 +278,9 @@ impl XEarthLayerRuntime {
             telemetry,
             metrics_client.clone(),
         );
-        let prefetch_backlog = prefetch_daemon.backlog_count();
+        let prefetch_counts = prefetch_daemon.job_counts();
+        #[cfg(test)]
+        let prefetch_pools = prefetch_daemon.resource_pools();
 
         // Created here, before the filesystem exists, because the client is
         // what carries it to the mount (#246).
@@ -288,7 +292,8 @@ impl XEarthLayerRuntime {
         );
         let prefetch_lane = Arc::new(LocalPrefetchLane::new(
             prefetch_tx,
-            prefetch_daemon.resource_pools(),
+            prefetch_counts.clone(),
+            sizing.prefetch_tile_generation,
             prefetch_daemon.job_submitter(),
         ));
 
@@ -307,7 +312,7 @@ impl XEarthLayerRuntime {
             daemon_handles.push(handle.spawn(report_lane_load(
                 client,
                 Arc::clone(&prefetch_lane),
-                prefetch_backlog,
+                prefetch_counts,
                 shutdown_token.clone(),
             )));
         }
@@ -321,6 +326,8 @@ impl XEarthLayerRuntime {
             pinned_budget,
             #[cfg(test)]
             demand_pools,
+            #[cfg(test)]
+            prefetch_pools,
             daemon_handles,
             shutdown_token,
             tile_progress_tracker,
@@ -624,7 +631,7 @@ mod tests {
         let runtime = build_test_runtime();
         let lane = runtime.prefetch_lane();
         let demand_pools = Arc::clone(&runtime.demand_pools);
-        let prefetch_pools = Arc::clone(lane.resource_pools());
+        let prefetch_pools = Arc::clone(&runtime.prefetch_pools);
         assert!(
             !Arc::ptr_eq(&demand_pools, &prefetch_pools),
             "the lanes must not share resource pools"

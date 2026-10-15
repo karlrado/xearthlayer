@@ -149,9 +149,9 @@ pub struct TelemetrySnapshot {
     pub demand_in_flight: usize,
     /// True while the prefetch lane stands aside for demand
     pub prefetch_paused: bool,
-    /// Prefetch lane pool utilisation, 0.0..=1.0
+    /// Prefetch lane queue saturation, 0.0..=1.0: jobs waiting for admission against the group size
     pub prefetch_lane_load: f64,
-    /// Prefetch lane queue: active jobs, queued tasks and jobs held waiting for admission
+    /// Prefetch lane jobs, running and held waiting for admission
     pub prefetch_lane_queued: usize,
 }
 

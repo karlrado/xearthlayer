@@ -77,10 +77,10 @@ pub(crate) fn execute_plan(
     .entered();
 
     // Backpressure is the higher of two independent pressures, because neither
-    // sees the other's load. `executor_load` measures our own pipeline: tile
-    // generation, downloads, encoding. `fuse_pressure` measures X-Plane's demand
-    // on the mount, which at a boundary crossing is mostly reads served from
-    // cache and so invisible to the pools. Submitting at full rate into that
+    // sees the other's load. `executor_load` measures our own pipeline: how
+    // much work waits on the prefetch lane for admission. `fuse_pressure`
+    // measures X-Plane's demand on the mount, which at a boundary crossing is
+    // mostly reads served from cache and so invisible to the lanes. Submitting at full rate into that
     // collision is what set the memory ceiling in #227; see #246.
     let executor_load = lane.load();
     let load = executor_load.max(fuse_pressure);

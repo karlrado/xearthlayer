@@ -6,11 +6,10 @@
 //! outcome, never the tile's bytes. Pausing is not part of the trait: a lane
 //! is built with the demand state and stands aside on its own.
 
-use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::coord::TileCoord;
-use crate::executor::{JobSubmitter, ResourcePools};
+use crate::executor::{JobCounts, JobSubmitter};
 use crate::runtime::{DdsResponse, JobRequest};
 
 /// A destination for prefetch work.
@@ -19,7 +18,9 @@ pub trait PrefetchLane: Send + Sync {
     fn submit(&self, tile: TileCoord) -> Result<(), LaneError>;
     /// As `submit`, with a receipt that resolves to the outcome.
     fn submit_with_receipt(&self, tile: TileCoord) -> Result<LaneReceipt, LaneError>;
-    /// 0.0..=1.0, read by coordinator back-pressure.
+    /// How saturated the lane's queue is, 0.0..=1.0: work waiting to start
+    /// against what the lane runs at once, so 1.0 means a full round is
+    /// queued behind the running one. Read by coordinator back-pressure.
     fn load(&self) -> f64;
 }
 
@@ -60,27 +61,26 @@ impl LaneReceipt {
 /// A lane backed by this process's executor daemon.
 pub struct LocalPrefetchLane {
     tx: mpsc::Sender<JobRequest>,
-    pools: Arc<ResourcePools>,
+    counts: JobCounts,
+    group: usize,
     job_submitter: JobSubmitter,
 }
 
 impl LocalPrefetchLane {
+    /// `group` is the lane executor's tile-generation group size: how many
+    /// jobs it admits at once.
     pub fn new(
         tx: mpsc::Sender<JobRequest>,
-        pools: Arc<ResourcePools>,
+        counts: JobCounts,
+        group: usize,
         job_submitter: JobSubmitter,
     ) -> Self {
         Self {
             tx,
-            pools,
+            counts,
+            group: group.max(1),
             job_submitter,
         }
-    }
-
-    /// The executor pools this lane runs on; lets tests check lane isolation.
-    #[cfg(test)]
-    pub(crate) fn resource_pools(&self) -> &Arc<ResourcePools> {
-        &self.pools
     }
 
     /// Local-only: cache GC housekeeping runs on this lane's executor. When
@@ -121,8 +121,11 @@ impl PrefetchLane for LocalPrefetchLane {
         Ok(LaneReceipt::from_outcome_channel(outcome_rx))
     }
 
+    /// Jobs waiting for admission against the group size. Not the pools'
+    /// utilisation: a small lane's pools read full whenever it is
+    /// productively busy, which deferred most prefetch cycles.
     fn load(&self) -> f64 {
-        self.pools.max_utilization()
+        (self.counts.waiting() as f64 / self.group as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -142,12 +145,14 @@ mod tests {
         }
     }
 
+    const GROUP: usize = 10;
+
+    fn lane_counting(tx: mpsc::Sender<JobRequest>, counts: JobCounts) -> LocalPrefetchLane {
+        LocalPrefetchLane::new(tx, counts, GROUP, JobExecutor::new(Default::default()).1)
+    }
+
     fn lane_with(tx: mpsc::Sender<JobRequest>) -> LocalPrefetchLane {
-        LocalPrefetchLane::new(
-            tx,
-            Arc::new(ResourcePools::with_defaults()),
-            JobExecutor::new(Default::default()).1,
-        )
+        lane_counting(tx, JobCounts::default())
     }
 
     #[tokio::test]
@@ -213,5 +218,28 @@ mod tests {
     async fn idle_lane_reports_no_load() {
         let (tx, _rx) = mpsc::channel(1);
         assert_eq!(lane_with(tx).load(), 0.0);
+    }
+
+    /// A lane busy with work it has admitted is doing its job, not
+    /// saturated: reading that as load deferred most prefetch cycles.
+    #[tokio::test]
+    async fn lane_with_only_running_jobs_reports_no_load() {
+        let (tx, _rx) = mpsc::channel(1);
+        let counts = JobCounts::default();
+        counts.store(GROUP, 0);
+        assert_eq!(lane_counting(tx, counts).load(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn load_is_jobs_waiting_against_the_group() {
+        let (tx, _rx) = mpsc::channel(1);
+        let counts = JobCounts::default();
+        let lane = lane_counting(tx, counts.clone());
+        counts.store(GROUP, GROUP / 2);
+        assert_eq!(lane.load(), 0.5);
+        counts.store(GROUP, GROUP);
+        assert_eq!(lane.load(), 1.0, "a group's worth waiting is saturated");
+        counts.store(GROUP, 3 * GROUP);
+        assert_eq!(lane.load(), 1.0, "clamped");
     }
 }

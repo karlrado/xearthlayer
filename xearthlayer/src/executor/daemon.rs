@@ -486,11 +486,11 @@ where
         self.submitter.clone()
     }
 
-    /// Active jobs, queued tasks and jobs held waiting for admission,
-    /// refreshed every executor loop. The prefetch lane's queue gauge reads
-    /// this; the stall watchdog deliberately does not.
-    pub fn backlog_count(&self) -> Arc<std::sync::atomic::AtomicUsize> {
-        Arc::clone(&self.executor.backlog_count)
+    /// Jobs running and jobs held waiting for admission, refreshed every
+    /// executor loop. The prefetch lane's load and gauges read these; the
+    /// stall watchdog deliberately does not.
+    pub fn job_counts(&self) -> super::JobCounts {
+        self.executor.job_counts.clone()
     }
 
     /// Returns a shared reference to the executor's resource pools.

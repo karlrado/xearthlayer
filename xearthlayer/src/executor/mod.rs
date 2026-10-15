@@ -180,7 +180,7 @@ pub use config::{
     ExecutorConfig, DEFAULT_JOB_CHANNEL_CAPACITY, DEFAULT_MAX_CONCURRENT_TASKS,
     DEFAULT_SIGNAL_CHANNEL_CAPACITY,
 };
-pub use core::JobExecutor;
+pub use core::{JobCounts, JobExecutor};
 pub use submitter::{JobSubmitter, SubmitError};
 
 // Client (for daemon architecture)

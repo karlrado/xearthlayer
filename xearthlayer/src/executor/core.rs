@@ -79,11 +79,11 @@ pub struct JobExecutor {
     /// Count of pending work (active jobs + queued tasks).
     pub(crate) pending_work_count: Arc<AtomicU64>,
 
-    /// Everything not finished: [`Self::pending_work_count`] plus jobs held in
-    /// `waiting_for_permit`. Kept apart because the stall watchdog must not
-    /// read a long admission pause as a stall, while a lane's backlog gauge
-    /// must count exactly those held jobs.
-    pub(crate) backlog_count: Arc<AtomicUsize>,
+    /// Jobs admitted and jobs held in `waiting_for_permit`. Kept apart from
+    /// [`Self::pending_work_count`] because the stall watchdog must not read
+    /// a long admission pause as a stall, while a lane's gauges must count
+    /// exactly those held jobs.
+    pub(crate) job_counts: JobCounts,
 
     /// Loop iteration counter for periodic yield.
     pub(crate) loop_count: u64,
@@ -140,7 +140,7 @@ impl JobExecutor {
             metrics_client,
             last_activity_ms: Arc::new(AtomicU64::new(now_ms)),
             pending_work_count: Arc::new(AtomicU64::new(0)),
-            backlog_count: Arc::new(AtomicUsize::new(0)),
+            job_counts: JobCounts::default(),
             loop_count: 0,
             waiting_for_permit: BinaryHeap::new(),
             waiting_sequence: 0,
@@ -230,10 +230,36 @@ impl JobExecutor {
         let queued_tasks = self.task_queue.lock().await.len();
         let total = (active_jobs + queued_tasks) as u64;
         self.pending_work_count.store(total, Ordering::Relaxed);
-        self.backlog_count.store(
-            total as usize + self.waiting_for_permit.len(),
-            Ordering::Relaxed,
-        );
+        self.job_counts
+            .store(active_jobs, self.waiting_for_permit.len());
+    }
+}
+
+/// How many jobs an executor is running and how many it is holding back,
+/// refreshed every executor loop. Jobs, not tasks: an admitted job whose
+/// next task waits for a pool permit is running, because a lane busy with
+/// work it has admitted is productive, not saturated.
+#[derive(Clone, Debug, Default)]
+pub struct JobCounts {
+    running: Arc<AtomicUsize>,
+    waiting: Arc<AtomicUsize>,
+}
+
+impl JobCounts {
+    /// Jobs admitted and not yet finished.
+    pub fn running(&self) -> usize {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    /// Jobs held before admission, by a full concurrency group or a paused
+    /// admission gate.
+    pub fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn store(&self, running: usize, waiting: usize) {
+        self.running.store(running, Ordering::Relaxed);
+        self.waiting.store(waiting, Ordering::Relaxed);
     }
 }
 
@@ -295,11 +321,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn backlog_counts_jobs_held_by_the_gate_but_the_watchdog_figure_does_not() {
+    async fn job_counts_see_jobs_held_by_the_gate_but_the_watchdog_figure_does_not() {
         let (gate_tx, gate_rx) = tokio::sync::watch::channel(true);
         let config = ExecutorConfig::default().with_admission_gate(gate_rx);
         let (executor, submitter) = JobExecutor::new(config);
-        let backlog = Arc::clone(&executor.backlog_count);
+        let counts = executor.job_counts.clone();
         let pending = Arc::clone(&executor.pending_work_count);
         let shutdown = CancellationToken::new();
         let run = tokio::spawn(executor.run(shutdown.clone()));
@@ -308,7 +334,8 @@ mod tests {
         let _b = submitter.submit(HeldJob);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        assert_eq!(backlog.load(Ordering::Relaxed), 2, "held jobs are backlog");
+        assert_eq!(counts.waiting(), 2, "held jobs are waiting");
+        assert_eq!(counts.running(), 0, "held jobs are not running");
         assert_eq!(
             pending.load(Ordering::Relaxed),
             0,
@@ -317,7 +344,73 @@ mod tests {
 
         gate_tx.send_replace(false);
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        assert_eq!(backlog.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.waiting(), 0);
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// A job whose one task holds its permit until released.
+    struct RunningJob(Arc<Notify>);
+
+    struct RunningTask(Arc<Notify>);
+
+    impl crate::executor::Task for RunningTask {
+        fn name(&self) -> &str {
+            "RunningTask"
+        }
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut crate::executor::TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                self.0.notified().await;
+                crate::executor::TaskResult::Success
+            })
+        }
+    }
+
+    impl crate::executor::Job for RunningJob {
+        fn id(&self) -> crate::executor::JobId {
+            crate::executor::JobId::new("running")
+        }
+        fn name(&self) -> &str {
+            "RunningJob"
+        }
+        fn error_policy(&self) -> crate::executor::ErrorPolicy {
+            crate::executor::ErrorPolicy::FailFast
+        }
+        fn priority(&self) -> crate::executor::Priority {
+            crate::executor::Priority::PREFETCH
+        }
+        fn create_tasks(&self) -> Vec<Box<dyn crate::executor::Task>> {
+            vec![Box::new(RunningTask(Arc::clone(&self.0)))]
+        }
+        fn on_complete(&self, _result: &crate::executor::JobResult) -> crate::executor::JobStatus {
+            crate::executor::JobStatus::Succeeded
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_jobs_count_as_running_until_they_finish() {
+        let (executor, submitter) = JobExecutor::new(ExecutorConfig::default());
+        let counts = executor.job_counts.clone();
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(executor.run(shutdown.clone()));
+
+        let release = Arc::new(Notify::new());
+        let _job = submitter.submit(RunningJob(Arc::clone(&release)));
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!((counts.running(), counts.waiting()), (1, 0));
+
+        release.notify_one();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(counts.running(), 0);
 
         shutdown.cancel();
         let _ = run.await;
