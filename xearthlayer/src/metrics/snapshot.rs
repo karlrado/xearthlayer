@@ -3,9 +3,9 @@
 //! Provides an immutable view of metrics for display and reporting.
 
 use std::fmt;
+use std::time::Duration;
 
 use super::latency::LatencySummary;
-use std::time::Duration;
 
 /// A point-in-time snapshot of pipeline metrics.
 ///

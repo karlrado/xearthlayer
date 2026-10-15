@@ -36,7 +36,7 @@
 //! // Create runtime with dependencies
 //! let runtime = XEarthLayerRuntime::new(
 //!     demand_factory, prefetch_factory, memory_cache, dds_disk_cache,
-//!     config, sizing, handle,
+//!     config, handle,
 //! );
 //!
 //! // Get client for producers
@@ -52,6 +52,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
+use crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE;
 use crate::executor::{
     ChannelDdsClient, DaemonMemoryCache, DdsClient, DdsDiskCache, DemandTracker, ExecutorConfig,
     ExecutorDaemon, ExecutorDaemonConfig, JobConcurrencyLimits, JobCounts, LaneSizing,
@@ -65,16 +66,34 @@ use crate::runtime::{
 };
 
 /// Configuration for the XEarthLayer runtime.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     /// Configuration for the executor daemon.
     pub daemon_config: ExecutorDaemonConfig,
+    /// Pool capacities of both lanes.
+    pub sizing: LaneSizing,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self::new(ExecutorDaemonConfig::default())
+    }
 }
 
 impl RuntimeConfig {
-    /// Create a new runtime configuration with custom settings.
+    /// Create a new runtime configuration with custom settings and lanes
+    /// sized at the default `prefetch.capacity_share`.
     pub fn new(daemon_config: ExecutorDaemonConfig) -> Self {
-        Self { daemon_config }
+        Self {
+            daemon_config,
+            sizing: LaneSizing::from_configured_share(DEFAULT_PREFETCH_CAPACITY_SHARE),
+        }
+    }
+
+    /// Set the pool capacities of both lanes.
+    pub fn with_sizing(mut self, sizing: LaneSizing) -> Self {
+        self.sizing = sizing;
+        self
     }
 
     /// Set the channel capacity for job requests.
@@ -120,8 +139,9 @@ pub struct XEarthLayerRuntime {
     #[cfg(test)]
     prefetch_pools: Arc<crate::executor::ResourcePools>,
 
-    /// Handles to the demand and prefetch daemon tasks.
-    daemon_handles: Vec<JoinHandle<()>>,
+    /// The demand and prefetch daemon tasks, and the lane-load reporter when
+    /// metrics are on, each named for the shutdown log.
+    daemon_handles: Vec<(&'static str, JoinHandle<()>)>,
 
     /// Shutdown token for graceful termination.
     shutdown_token: CancellationToken,
@@ -170,17 +190,14 @@ impl XEarthLayerRuntime {
     ///   semaphore and the admission cache probe
     /// * `memory_cache` - Memory cache shared by both lanes
     /// * `dds_disk_cache` - DDS disk cache shared by both lanes
-    /// * `config` - Runtime configuration
-    /// * `sizing` - Pool capacities of both lanes
+    /// * `config` - Runtime configuration, including both lanes' sizing
     /// * `handle` - Handle to the Tokio runtime for spawning tasks
-    #[allow(clippy::too_many_arguments)]
     pub fn new<F, M, DD>(
         demand_factory: Arc<F>,
         prefetch_factory: Arc<F>,
         memory_cache: Arc<M>,
         dds_disk_cache: Arc<DD>,
         config: RuntimeConfig,
-        sizing: LaneSizing,
         handle: tokio::runtime::Handle,
     ) -> Self
     where
@@ -195,7 +212,6 @@ impl XEarthLayerRuntime {
             memory_cache,
             dds_disk_cache,
             config,
-            sizing,
             handle,
             None,
         )
@@ -205,14 +221,12 @@ impl XEarthLayerRuntime {
     ///
     /// As [`Self::new`]; when metrics are provided, per-chunk and job events
     /// from both lanes flow to the metrics daemon.
-    #[allow(clippy::too_many_arguments)]
     pub fn with_metrics_client<F, M, DD>(
         demand_factory: Arc<F>,
         prefetch_factory: Arc<F>,
         memory_cache: Arc<M>,
         dds_disk_cache: Arc<DD>,
         config: RuntimeConfig,
-        sizing: LaneSizing,
         handle: tokio::runtime::Handle,
         metrics_client: Option<MetricsClient>,
     ) -> Self
@@ -221,6 +235,10 @@ impl XEarthLayerRuntime {
         M: DaemonMemoryCache + 'static,
         DD: DdsDiskCache + 'static,
     {
+        let RuntimeConfig {
+            daemon_config,
+            sizing,
+        } = config;
         info!(
             demand_cpu = sizing.demand.cpu,
             prefetch_cpu = sizing.prefetch.cpu,
@@ -244,13 +262,13 @@ impl XEarthLayerRuntime {
             None => DemandTracker::new(),
         };
 
-        let mut demand_daemon_config = config.daemon_config.clone();
+        let mut demand_daemon_config = daemon_config.clone();
         demand_daemon_config.executor.resource_pools = sizing.demand.clone();
 
         // The prefetch lane must register the tile-generation group itself:
-        // GC and prefetch jobs declare it, and a job in an unregistered group
-        // is held forever.
-        let mut prefetch_daemon_config = config.daemon_config;
+        // prefetch jobs declare it, and a job in an unregistered group is
+        // held forever. GC jobs declare no group.
+        let mut prefetch_daemon_config = daemon_config;
         prefetch_daemon_config.executor = ExecutorConfig {
             resource_pools: sizing.prefetch.clone(),
             job_concurrency_limits: JobConcurrencyLimits::empty()
@@ -306,16 +324,25 @@ impl XEarthLayerRuntime {
         let demand_shutdown = shutdown_token.clone();
         let prefetch_shutdown = shutdown_token.clone();
         let mut daemon_handles = vec![
-            handle.spawn(async move { demand_daemon.run(demand_shutdown).await }),
-            handle.spawn(async move { prefetch_daemon.run(prefetch_shutdown).await }),
+            (
+                "Demand executor daemon",
+                handle.spawn(async move { demand_daemon.run(demand_shutdown).await }),
+            ),
+            (
+                "Prefetch executor daemon",
+                handle.spawn(async move { prefetch_daemon.run(prefetch_shutdown).await }),
+            ),
         ];
         if let Some(client) = metrics_client {
-            daemon_handles.push(handle.spawn(report_lane_load(
-                client,
-                Arc::clone(&prefetch_lane),
-                prefetch_counts,
-                shutdown_token.clone(),
-            )));
+            daemon_handles.push((
+                "Prefetch lane load reporter",
+                handle.spawn(report_lane_load(
+                    client,
+                    Arc::clone(&prefetch_lane),
+                    prefetch_counts,
+                    shutdown_token.clone(),
+                )),
+            ));
         }
 
         info!("XEarthLayer runtime started");
@@ -434,10 +461,10 @@ impl XEarthLayerRuntime {
         // Signal shutdown to the daemons
         self.shutdown_token.cancel();
 
-        for handle in self.daemon_handles.drain(..) {
+        for (name, handle) in self.daemon_handles.drain(..) {
             match handle.await {
-                Ok(()) => info!("Executor daemon shut down cleanly"),
-                Err(e) => tracing::error!("Executor daemon task panicked: {}", e),
+                Ok(()) => info!("{name} shut down cleanly"),
+                Err(e) => tracing::error!("{name} task failed: {e}"),
             }
         }
 
@@ -578,8 +605,8 @@ mod tests {
             Arc::new(MockJobFactory::with_delay(JOB_DELAY)),
             Arc::new(MockMemoryCache),
             Arc::new(NullDdsDiskCache),
-            RuntimeConfig::default(),
-            LaneSizing::derive(ResourcePoolConfig::default(), 0.35),
+            RuntimeConfig::default()
+                .with_sizing(LaneSizing::derive(ResourcePoolConfig::default(), 0.35)),
             tokio::runtime::Handle::current(),
         )
     }
@@ -716,7 +743,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_is_not_running_once_the_prefetch_lane_stops() {
         let runtime = build_test_runtime();
-        runtime.daemon_handles[1].abort();
+        runtime.daemon_handles[1].1.abort();
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(runtime.dds_client().is_connected(), "demand lane still up");
         assert!(!runtime.is_running());

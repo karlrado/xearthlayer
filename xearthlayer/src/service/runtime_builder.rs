@@ -223,8 +223,7 @@ impl RuntimeBuilder {
             Arc::new(prefetch_factory),
             cache_adapter,
             null_dds_disk,
-            self.config,
-            sizing,
+            self.config.with_sizing(sizing),
             runtime_handle,
             self.metrics_client,
         )
@@ -279,8 +278,7 @@ impl RuntimeBuilder {
             Arc::new(prefetch_factory),
             cache_adapter,
             null_dds_disk,
-            self.config,
-            sizing,
+            self.config.with_sizing(sizing),
             runtime_handle,
             self.metrics_client,
         )
@@ -415,8 +413,7 @@ impl RuntimeBuilder {
             Arc::new(prefetch_factory),
             memory_bridge,
             dds_disk_for_daemon,
-            self.config,
-            sizing,
+            self.config.with_sizing(sizing),
             runtime_handle,
             self.metrics_client,
         )

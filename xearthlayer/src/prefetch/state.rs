@@ -50,7 +50,8 @@ impl std::fmt::Display for GpsStatus {
 /// that holds wins, so a disabled prefetcher never reports "ramping".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PrefetchState {
-    /// Prefetch is switched off (`prefetch.mode = disabled` or `--no-prefetch`).
+    /// Prefetch is switched off (`prefetch.enabled = false` or
+    /// `prefetch.mode = disabled`).
     Disabled,
     /// The prefetch lane is stood down because FUSE demand is in flight.
     PausedForDemand,
