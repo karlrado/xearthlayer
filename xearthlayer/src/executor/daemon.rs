@@ -348,6 +348,17 @@ where
     demand: Option<DemandTracker>,
 }
 
+/// The shared dependencies `run` hands to every request, built once.
+struct RequestContext<'a, F, M, DD> {
+    submitter: &'a ExecutorSubmitter,
+    factory: &'a Arc<F>,
+    memory_cache: &'a Arc<M>,
+    dds_disk_cache: &'a Arc<DD>,
+    coalescer: &'a Arc<DaemonCoalescer>,
+    metrics_client: &'a Option<MetricsClient>,
+    demand: &'a Option<DemandTracker>,
+}
+
 impl<F, M, DD> ExecutorDaemon<F, M, DD>
 where
     F: DdsJobFactory,
@@ -508,6 +519,16 @@ where
         // Create shared coalescer for daemon-level request deduplication
         let coalescer = Arc::new(DaemonCoalescer::new());
 
+        let ctx = RequestContext {
+            submitter: &submitter,
+            factory: &factory,
+            memory_cache: &memory_cache,
+            dds_disk_cache: &dds_disk_cache,
+            coalescer: &coalescer,
+            metrics_client: &metrics_client,
+            demand: &demand,
+        };
+
         // Spawn the executor in a separate task
         let executor_shutdown = shutdown.clone();
         let executor_handle = tokio::spawn(async move {
@@ -531,16 +552,7 @@ where
 
                 // Receive new job requests
                 Some(request) = request_rx.recv() => {
-                    Self::handle_request(
-                        request,
-                        &submitter,
-                        &factory,
-                        &memory_cache,
-                        &dds_disk_cache,
-                        &coalescer,
-                        &metrics_client,
-                        &demand,
-                    ).await;
+                    Self::handle_request(request, &ctx).await;
                 }
             }
         }
@@ -564,19 +576,16 @@ where
             .map(|handle| (handle, guard))
     }
 
-    // Eight parameters: each is a distinct shared dependency of the request
-    // path, passed rather than bundled to keep `run` destructuring explicit.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_request(
-        request: JobRequest,
-        submitter: &ExecutorSubmitter,
-        factory: &Arc<F>,
-        memory_cache: &Arc<M>,
-        dds_disk_cache: &Arc<DD>,
-        coalescer: &Arc<DaemonCoalescer>,
-        metrics_client: &Option<MetricsClient>,
-        demand: &Option<DemandTracker>,
-    ) {
+    async fn handle_request(request: JobRequest, ctx: &RequestContext<'_, F, M, DD>) {
+        let RequestContext {
+            submitter,
+            factory,
+            memory_cache,
+            dds_disk_cache,
+            coalescer,
+            metrics_client,
+            demand,
+        } = *ctx;
         let start = Instant::now();
         let tile = request.tile;
         let priority = request.priority;
@@ -1243,7 +1252,12 @@ mod tests {
         let token = CancellationToken::new();
         let (request, _rx) = JobRequest::fuse(test_tile(), token.clone());
         tx.send(request).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        for _ in 0..200 {
+            if tracker.in_flight() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
         assert_eq!(
             tracker.in_flight(),
             1,
