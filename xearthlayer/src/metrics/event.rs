@@ -174,6 +174,9 @@ pub enum MetricEvent {
         success: bool,
         /// Total job duration in microseconds.
         duration_us: u64,
+        /// True if the job served a FUSE request (the no-harm latency
+        /// window counts only these).
+        is_fuse: bool,
     },
 
     /// A job was coalesced (waited for existing work).
@@ -324,6 +327,15 @@ pub enum MetricEvent {
     /// skipped the download and encode (#296).
     PrefetchSkippedCached,
 
+    /// FUSE demand jobs in flight changed (gauge).
+    DemandInFlight { count: usize },
+
+    /// The prefetch lane paused or resumed behind demand.
+    PrefetchPaused { paused: bool },
+
+    /// Prefetch lane load and backlog (gauge, sampled).
+    PrefetchLaneLoad { load: f64, queued: usize },
+
     /// Regions promoted from `InProgress` to `Prefetched` via the normal
     /// completion path (all tiles in the region confirmed present).
     ///
@@ -385,6 +397,9 @@ impl MetricEvent {
             Self::PrefetchRegionDeferred => "prefetch_region_deferred",
             Self::PrefetchDeferralCleared => "prefetch_deferral_cleared",
             Self::PrefetchSkippedCached => "prefetch_skipped_cached",
+            Self::DemandInFlight { .. } => "demand_in_flight",
+            Self::PrefetchPaused { .. } => "prefetch_paused",
+            Self::PrefetchLaneLoad { .. } => "prefetch_lane_load",
             Self::PrefetchRegionsPromotedNormal { .. } => "prefetch_regions_promoted_normal",
             Self::PrefetchRegionPromotedRescue => "prefetch_region_promoted_rescue",
         }

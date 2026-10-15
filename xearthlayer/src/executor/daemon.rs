@@ -486,6 +486,12 @@ where
         self.submitter.clone()
     }
 
+    /// Active jobs plus queued tasks, refreshed every executor loop. The
+    /// prefetch lane's backlog gauge reads this.
+    pub fn pending_work_count(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.executor.pending_work_count)
+    }
+
     /// Returns a shared reference to the executor's resource pools.
     ///
     /// Used by the circuit breaker to monitor pool utilization and trip
@@ -839,7 +845,7 @@ where
                             // Track job completion
                             let success = status == JobStatus::Succeeded;
                             if let Some(ref client) = metrics_for_completion {
-                                client.job_completed(success, duration.as_micros() as u64);
+                                client.job_completed(success, duration.as_micros() as u64, origin.is_fuse());
                                 if origin.is_fuse() {
                                     client.fuse_tile_served();
                                 }

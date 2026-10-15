@@ -3,6 +3,8 @@
 //! Provides an immutable view of metrics for display and reporting.
 
 use std::fmt;
+
+use super::latency::LatencySummary;
 use std::time::Duration;
 
 /// A point-in-time snapshot of pipeline metrics.
@@ -136,6 +138,19 @@ pub struct TelemetrySnapshot {
     pub total_assembly_time_ms: u64,
     /// Total encode time
     pub total_encode_time_ms: u64,
+
+    // === Lane metrics (#296) ===
+    /// FUSE generation latency over the last completed 60 s sample, cache
+    /// hits excluded. `None` until a sample closes with at least one job.
+    pub fuse_latency: Option<LatencySummary>,
+    /// FUSE demand jobs in flight
+    pub demand_in_flight: usize,
+    /// True while the prefetch lane stands aside for demand
+    pub prefetch_paused: bool,
+    /// Prefetch lane pool utilisation, 0.0..=1.0
+    pub prefetch_lane_load: f64,
+    /// Prefetch lane backlog (active jobs plus queued tasks)
+    pub prefetch_lane_queued: usize,
 }
 
 impl Default for TelemetrySnapshot {
@@ -190,6 +205,11 @@ impl Default for TelemetrySnapshot {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
+            fuse_latency: None,
+            demand_in_flight: 0,
+            prefetch_paused: false,
+            prefetch_lane_load: 0.0,
+            prefetch_lane_queued: 0,
         }
     }
 }
@@ -441,6 +461,7 @@ mod tests {
             total_download_time_ms: 120_000,
             total_assembly_time_ms: 15_000,
             total_encode_time_ms: 45_000,
+            ..Default::default()
         }
     }
 

@@ -128,6 +128,32 @@ pub struct XEarthLayerRuntime {
     tile_progress_tracker: SharedTileProgressTracker,
 }
 
+/// How often the prefetch lane's load and backlog are sampled for metrics.
+const LANE_LOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Publishes the prefetch lane's load and backlog until shutdown. A gauge
+/// polled on a timer rather than an event per change: the sample line only
+/// needs the latest value. The backlog is the executor's pending work count
+/// (active jobs plus queued tasks), the same figure its stall watchdog uses.
+async fn report_lane_load(
+    client: MetricsClient,
+    lane: Arc<LocalPrefetchLane>,
+    backlog: Arc<std::sync::atomic::AtomicU64>,
+    shutdown: CancellationToken,
+) {
+    use crate::runtime::PrefetchLane;
+    let mut tick = tokio::time::interval(LANE_LOAD_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tick.tick() => client.prefetch_lane_load(
+                lane.load(),
+                backlog.load(std::sync::atomic::Ordering::Relaxed) as usize,
+            ),
+        }
+    }
+}
+
 impl XEarthLayerRuntime {
     /// Create a new runtime with the given dependencies.
     ///
@@ -209,7 +235,10 @@ impl XEarthLayerRuntime {
             tile_progress_sink as Arc<dyn TelemetrySink>,
         ]));
 
-        let demand = DemandTracker::new();
+        let demand = match &metrics_client {
+            Some(client) => DemandTracker::new().with_metrics(client.clone()),
+            None => DemandTracker::new(),
+        };
 
         let mut demand_daemon_config = config.daemon_config.clone();
         demand_daemon_config.executor.resource_pools = sizing.demand.clone();
@@ -244,8 +273,9 @@ impl XEarthLayerRuntime {
             memory_cache,
             dds_disk_cache,
             telemetry,
-            metrics_client,
+            metrics_client.clone(),
         );
+        let prefetch_backlog = prefetch_daemon.pending_work_count();
 
         // Created here, before the filesystem exists, because the client is
         // what carries it to the mount (#246).
@@ -268,10 +298,18 @@ impl XEarthLayerRuntime {
         // the calling thread to be in a runtime context.
         let demand_shutdown = shutdown_token.clone();
         let prefetch_shutdown = shutdown_token.clone();
-        let daemon_handles = vec![
+        let mut daemon_handles = vec![
             handle.spawn(async move { demand_daemon.run(demand_shutdown).await }),
             handle.spawn(async move { prefetch_daemon.run(prefetch_shutdown).await }),
         ];
+        if let Some(client) = metrics_client {
+            daemon_handles.push(handle.spawn(report_lane_load(
+                client,
+                Arc::clone(&prefetch_lane),
+                prefetch_backlog,
+                shutdown_token.clone(),
+            )));
+        }
 
         info!("XEarthLayer runtime started");
 

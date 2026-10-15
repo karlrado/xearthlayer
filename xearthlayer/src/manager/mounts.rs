@@ -770,6 +770,11 @@ impl MountManager {
             total_download_time_ms: 0,
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
+            fuse_latency: None,
+            demand_in_flight: 0,
+            prefetch_paused: false,
+            prefetch_lane_load: 0.0,
+            prefetch_lane_queued: 0,
         };
 
         // Collect all services: per-region + patches + consolidated
@@ -842,6 +847,15 @@ impl MountManager {
             total.total_download_time_ms += snapshot.total_download_time_ms;
             total.total_assembly_time_ms += snapshot.total_assembly_time_ms;
             total.total_encode_time_ms += snapshot.total_encode_time_ms;
+
+            // Lane gauges: each service runs its own lanes, and only the
+            // consolidated service has real values. Latency is not summable,
+            // so take the first sample present rather than a blend.
+            total.fuse_latency = total.fuse_latency.or(snapshot.fuse_latency);
+            total.demand_in_flight += snapshot.demand_in_flight;
+            total.prefetch_paused |= snapshot.prefetch_paused;
+            total.prefetch_lane_load = total.prefetch_lane_load.max(snapshot.prefetch_lane_load);
+            total.prefetch_lane_queued += snapshot.prefetch_lane_queued;
 
             // Use the highest peak from any service
             if snapshot.peak_bytes_per_second > total.peak_bytes_per_second {

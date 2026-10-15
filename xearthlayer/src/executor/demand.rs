@@ -8,8 +8,10 @@
 //! state, never an event stream, so a remote lane converges after a lost
 //! message (#296).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::watch;
+
+use crate::metrics::MetricsClient;
 
 #[derive(Clone)]
 pub struct DemandTracker {
@@ -19,6 +21,7 @@ pub struct DemandTracker {
 struct Inner {
     count: Mutex<usize>,
     outstanding: watch::Sender<bool>,
+    metrics: OnceLock<MetricsClient>,
 }
 
 impl DemandTracker {
@@ -28,8 +31,16 @@ impl DemandTracker {
             inner: Arc::new(Inner {
                 count: Mutex::new(0),
                 outstanding,
+                metrics: OnceLock::new(),
             }),
         }
+    }
+
+    /// Reports the in-flight count and pause state to the metrics daemon.
+    /// Call before any guard is taken.
+    pub fn with_metrics(self, client: MetricsClient) -> Self {
+        let _ = self.inner.metrics.set(client);
+        self
     }
 
     /// Latest-value view: `true` while any demand job is in flight.
@@ -65,7 +76,15 @@ impl Inner {
         } else {
             count.saturating_sub(1)
         };
-        self.outstanding.send_replace(*count > 0);
+        let was_outstanding = self.outstanding.send_replace(*count > 0);
+        // Emitted under the lock so events arrive in the order the count
+        // changed.
+        if let Some(metrics) = self.metrics.get() {
+            metrics.demand_in_flight(*count);
+            if was_outstanding != (*count > 0) {
+                metrics.prefetch_paused(*count > 0);
+            }
+        }
     }
 }
 
@@ -103,6 +122,38 @@ mod tests {
         drop(b);
         assert!(!*rx.borrow());
         assert_eq!(tracker.in_flight(), 0);
+    }
+
+    #[test]
+    fn metrics_see_the_count_and_each_pause_transition() {
+        use crate::metrics::MetricEvent;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let tracker = DemandTracker::new().with_metrics(MetricsClient::new(tx));
+        let a = tracker.begin();
+        let b = tracker.begin();
+        drop(a);
+        drop(b);
+
+        let mut events = Vec::new();
+        while let Ok(e) = rx.try_recv() {
+            events.push(e);
+        }
+        let counts: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                MetricEvent::DemandInFlight { count } => Some(*count),
+                _ => None,
+            })
+            .collect();
+        let pauses: Vec<bool> = events
+            .iter()
+            .filter_map(|e| match e {
+                MetricEvent::PrefetchPaused { paused } => Some(*paused),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(counts, [1, 2, 1, 0]);
+        assert_eq!(pauses, [true, false], "only the edges, not every change");
     }
 
     #[test]

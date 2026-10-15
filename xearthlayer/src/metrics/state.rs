@@ -10,7 +10,9 @@
 //! - `TimeSeriesHistory`: Ring buffers for rate sampling (sparklines)
 //! - `RingBuffer<T>`: Fixed-size circular buffer for time-series data
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use super::latency::LatencySummary;
 
 // =============================================================================
 // Ring Buffer
@@ -322,6 +324,20 @@ pub struct AggregatedState {
     /// Prefetch tile jobs that found their tile cached at admission and
     /// skipped the download and encode, cumulative (counter, #296).
     pub prefetch_skipped_cached: u64,
+    /// FUSE demand jobs in flight (gauge, #296).
+    pub demand_in_flight: usize,
+    /// True while the prefetch lane stands aside for demand (gauge, #296).
+    pub prefetch_paused: bool,
+    /// When the current pause began, for accumulating `prefetch_paused_secs`.
+    pub prefetch_paused_since: Option<Instant>,
+    /// Pause time closed since the last sample.
+    pub prefetch_paused_accum: Duration,
+    /// Prefetch lane pool utilisation, 0.0..=1.0 (gauge, #296).
+    pub prefetch_lane_load: f64,
+    /// Prefetch lane backlog: active jobs plus queued tasks (gauge, #296).
+    pub prefetch_lane_queued: usize,
+    /// The last closed sample's FUSE latency; what the TUI shows.
+    pub fuse_latency: Option<LatencySummary>,
     /// Total regions promoted via the normal completion path (counter).
     pub prefetch_promotions_normal: u64,
     /// Total regions promoted via the rescue path (counter).
@@ -403,6 +419,13 @@ impl AggregatedState {
             prefetch_regions_deferred: 0,
             prefetch_deferrals_cleared: 0,
             prefetch_skipped_cached: 0,
+            demand_in_flight: 0,
+            prefetch_paused: false,
+            prefetch_paused_since: None,
+            prefetch_paused_accum: Duration::ZERO,
+            prefetch_lane_load: 0.0,
+            prefetch_lane_queued: 0,
+            fuse_latency: None,
             prefetch_promotions_normal: 0,
             prefetch_promotions_rescue: 0,
         }
