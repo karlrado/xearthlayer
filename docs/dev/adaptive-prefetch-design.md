@@ -4,7 +4,7 @@
 
 **Project**: XEarthLayer
 **Date**: January 2026, revised October 2026
-**Version**: 2.3
+**Version**: 2.4
 **Status**: Implemented (sliding box since PR #102)
 
 ---
@@ -15,6 +15,7 @@
 2. [Goals and Non-Goals](#goals-and-non-goals)
 3. [Background Research](#background-research)
 4. [System Architecture](#system-architecture)
+   - [Demand and prefetch lanes](#demand-and-prefetch-lanes)
 5. [Three-Window Model](#three-window-model)
 6. [SceneryWindow](#scenerywindow)
 7. [BoundaryStrategy](#boundarystrategy)
@@ -120,7 +121,7 @@ The findings are X-Plane's measured behaviour and still hold. The **Design Impac
 │  │ • Picks the box shape by flight phase (PhaseDetector)               │  │
 │  │ • Plans new regions, or drains pending tiles first                  │  │
 │  │ • Filters plans (memory, patch, package, DDS disk)                  │  │
-│  │ • Submits via DdsClient under backpressure + transition throttle    │  │
+│  │ • Submits via PrefetchLane under backpressure + transition throttle │  │
 │  │ • Runs region maintenance every cycle                               │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │         │                    │                      │                     │
@@ -144,9 +145,9 @@ The findings are X-Plane's measured behaviour and still hold. The **Design Impac
          │
          ▼
 ┌─────────────────────┐     ┌─────────────────────┐     ┌──────────────────┐
-│      DdsClient      │────▶│    JobExecutor       │────▶│   CacheLayer     │
-│  (submit prefetch   │     │  (generate tiles)    │     │  (memory + disk) │
-│   jobs)             │     │                      │     │                  │
+│    PrefetchLane     │────▶│  JobExecutor (the    │────▶│   CacheLayer     │
+│  (submit prefetch   │     │  prefetch lane)      │     │  (memory + disk) │
+│   tiles)            │     │                      │     │                  │
 └─────────────────────┘     └──────────────────────┘     └──────────────────┘
 ```
 
@@ -190,6 +191,112 @@ xearthlayer/src/prefetch/
 | `BoundaryMonitor`, `BoundaryCrossing` | `boundary_monitor.rs` | Fired too late at DSF boundaries (#86); replaced by `PrefetchBox` in PR #102 |
 | `GroundStrategy` | `ground_strategy.rs` | Ring-based ground prefetch; the ground phase now uses the box, unbiased (#172) |
 | `PerformanceCalibrator`, `RollingCalibrator`, `ThroughputObserver` | `calibration/` | Never wired: nothing fed them samples and nothing read the result (#277) |
+
+### Demand and prefetch lanes
+
+Prefetch used to share every contention point with FUSE: the request channel,
+the daemon coalescer, the job channel, the `tile_generation` group, the resource
+pools and the HTTP semaphore. At a boundary crossing or a turn, prefetch
+legitimately queues thousands of tiles, and X-Plane ended up waiting behind them
+until the generation timeout (#296). Prefetch and FUSE now run in separate lanes.
+
+**The no-harm contract.** A FUSE request is never slower because prefetch exists
+than it would be with prefetch disabled. It is measured as FUSE demand-generation
+latency (p95 and max) and timeout count, prefetch on against prefetch off.
+
+**Two lanes.**
+
+- The **demand lane** is always local: an `ExecutorDaemon` and `JobExecutor` with
+  their own coalescer, request channel, job channel, pools, `tile_generation`
+  group and HTTP semaphore. FUSE reaches it through `DdsClient::request_dds`,
+  which is demand only.
+- The **prefetch lane** sits behind the `PrefetchLane` trait. `LocalPrefetchLane`
+  is a second `ExecutorDaemon` and `JobExecutor` with their own everything. The
+  adaptive coordinator and prewarm are its consumers.
+
+Lanes are handed to consumers at construction rather than routed by
+`RequestOrigin` at run time, so FUSE cannot land in the prefetch lane by type.
+`RequestOrigin` remains for metrics. The two lanes share the memory cache, the DDS
+disk cache and the chunk disk cache by `Arc`; writes are idempotent. Coalescing is
+per lane. The coordinator, the region state machine and the demand lane stay on
+the primary in every mode.
+
+**Admission pause.** `DemandTracker` (`executor/demand.rs`) counts demand jobs in
+flight, a job being a FUSE cache miss that has a generation running. The count is
+held by an RAII `DemandGuard` released on every exit (success, failure, the FUSE
+timeout cancelling the job, a failed submit). It publishes a `watch<bool>`: paused
+while any demand job is in flight, resumed when the count returns to zero. Cache
+hits never pause. The prefetch lane's executor is built with that receiver as its
+admission gate: while paused it admits no queued job, jobs already admitted run all
+their tasks, and admission retries on resume. See the job executor design for the
+gate itself.
+
+**Always claim.** FUSE always starts its own job in the demand lane. There is no
+cross-lane coalescing or cancellation, so the only duplicate work is a prefetch
+job already running when FUSE asks for the same tile.
+
+**Cache probe.** Every prefetch-lane tile job starts with `CachedTileProbeTask`
+(`tasks/cached_tile_probe.rs`). It checks the memory and DDS disk caches and, on a
+hit, records that fact so `DownloadChunksTask` and `BuildAndCacheDdsTask` return at
+once. This turns tiles that demand generated during a pause into no-ops. Hits are
+counted as `skipped_cached`.
+
+**Sizing.** Demand keeps the full derived capacity, and the prefetch lane is added
+on top, scaled by `prefetch.capacity_share` (default 0.35, range 0.05 to 0.50).
+`LaneSizing` (`executor/lane_sizing.rs`) derives it from the demand lane's
+`ResourcePoolConfig::default()`; each figure is rounded up and never below one:
+
+| Resource | Demand lane | Prefetch lane | Prefetch formula |
+|----------|-------------|---------------|------------------|
+| CPU pool | 40 | 14 | `ceil(demand cpu x share)` |
+| Network pool | 60 | 21 | `ceil(demand network x share)` |
+| Disk I/O pool | 64 | 23 | `ceil(demand disk_io x share)` |
+| `tile_generation` group | 512 | 70 | `2 x (prefetch cpu + prefetch network)` |
+| HTTP semaphore | 1,024 | 359 | `ceil(1,024 x share)` |
+
+The figures are for a 32 core machine at the default share. The tokio blocking pool
+covers both lanes: `LaneSizing::blocking_threads_required()` is demand cpu +
+demand disk_io + prefetch cpu + prefetch disk_io + `BLOCKING_POOL_HEADROOM`
+(173 on the reference machine). Admitted prefetch jobs finish after a pause, so
+transient overlap with demand can reach 135% of the old permit totals at the
+default share (150% at the 0.50 ceiling). Under #227 the glibc arena settles at the
+worst peak, so the memory floor should be checked on a flight after changing the
+share.
+
+**The `PrefetchLane` contract.** The lane is written to be met over a network, so
+prefetch can later run on another machine:
+
+```rust
+pub trait PrefetchLane: Send + Sync {
+    fn submit(&self, tile: TileCoord) -> Result<(), LaneError>;
+    fn submit_with_receipt(&self, tile: TileCoord) -> Result<LaneReceipt, LaneError>;
+    fn load(&self) -> f64;
+}
+```
+
+`submit` is fire-and-forget. `submit_with_receipt` is for prewarm, which needs
+per-tile progress: the `LaneReceipt` resolves to a `LaneOutcome` (`Generated`,
+`AlreadyCached`, `Failed`, `Dropped`) and never carries tile bytes. `load()` is
+0.0 to 1.0 and feeds coordinator backpressure. `LaneError` is `Full` (retry later)
+or `Closed`. The result of a submission is a complete tile appearing in the
+primary's DDS disk cache, which is how the coordinator already learns of completion
+(`promote_completed_regions`). Pause is not a trait method: the lane is built with
+the demand state and stands aside on its own.
+
+"A tile appears in the cache" carries four obligations that `LocalPrefetchLane`
+meets by writing through `CacheLayer`, and a remote lane would have to meet too:
+
+1. **Completeness:** only tiles with all 256 chunks persist (#180).
+2. **Integrity:** the write is atomic and never visible half-written (`write_atomic`).
+3. **Identical encoding:** format and provider match the primary's configuration.
+4. **Survival:** disk GC may evict a prefetched tile before it is used.
+
+Cache GC housekeeping jobs run on the local prefetch lane through
+`LocalPrefetchLane::job_submitter()`, a local-only method outside the trait, so
+they pause with prefetch. Offloading would have to move GC back to a local executor
+because it maintains the primary's caches.
+
+---
 
 ---
 
@@ -469,8 +576,30 @@ each maintenance cycle rather than accumulated:
 INFO Prefetch sample uptime_s=... regions_in_progress=... regions_prefetched=...
      regions_nocoverage=... regions_deferred_active=... promotions_normal=...
      promotions_rescue=... state_diverged=... regions_demoted=...
-     regions_deferred=... fuse_generations=...
+     regions_deferred=... fuse_generations=... fuse_latency_p50_ms=...
+     fuse_latency_p95_ms=... fuse_latency_max_ms=... fuse_latency_count=...
+     fuse_timeouts=... demand_in_flight=... prefetch_paused_secs=...
+     skipped_cached=... lane_load=... lane_queued=...
 ```
+
+The lane fields (#296) are the no-harm instrument:
+- `fuse_latency_p50_ms`, `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
+  `fuse_latency_count` describe FUSE demand-generation latency over this sample
+  only. Cache hits are excluded. Zeros mean no generation completed in the window.
+- `fuse_timeouts` is per sample: requests abandoned at the FUSE timeout. Their wait
+  is inside the latency figures.
+- `demand_in_flight` is a gauge of demand jobs running now.
+- `prefetch_paused_secs` is how long the prefetch lane stood aside for demand
+  during this sample.
+- `skipped_cached` is cumulative since process start: tiles the cache probe found
+  already cached when their prefetch job was admitted.
+- `lane_load` is the prefetch lane's pool utilisation, 0.0 to 1.0. `lane_queued` is
+  its backlog: active jobs, queued tasks and jobs held waiting for admission, which
+  is where work sits while demand has the lane paused.
+
+To compare prefetch on and off, run the same route with `prefetch.enabled = true`
+and `false` and compare `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
+`fuse_timeouts` across the samples.
 
 **Two of these fields differ only by suffix and are easy to misread against
 each other — read this before reading a flight log:**
@@ -660,13 +789,16 @@ submitted.
   pending; above 0.5 half the plan is submitted and the rest kept as pending
 - **Transition throttle:** after takeoff, the submitted fraction ramps from 25%
   to 100% over 30 s; the overflow is kept as pending
-- **Request channel:** tiles are submitted until the daemon's request channel
-  (1,000 requests) is full; the remainder is kept as pending. Prefetch never
-  waits for space, and pending tiles are never dropped
+- **Lane capacity:** tiles are submitted until the lane returns
+  `LaneError::Full` (its request channel, 1,000 requests, is full); the remainder
+  is kept as pending. Prefetch never waits for space, and pending tiles are never
+  dropped
+- **Admission pause:** while FUSE is waiting on generation the lane admits no new
+  job, so submitted tiles queue in the lane until demand clears
 - **Deduplication:** `PrefetchedRegion` state in the GeoIndex keeps a region
   from being planned twice. Tiles already queued for generation are not
   filtered by prefetch; if one is submitted again, the daemon coalescer joins
-  it to the job in flight
+  it to the job in flight (coalescing is within the prefetch lane only)
 
 #### Design Decisions
 
@@ -858,9 +990,13 @@ The `GeoIndex` stores spatial state via type-keyed layers:
 | `RetainedRegion` (new) | DSF region | `()` | SceneryWindow (each cycle) |
 | `PrefetchedRegion` (new) | DSF region | `RegionState` | BoundaryStrategy (on submit/complete/eviction) |
 
-### DdsClient Integration
+### PrefetchLane Integration
 
-Prefetch jobs are submitted through the existing `DdsClient` trait with `Priority::Prefetch`. The priority queue ensures ON_DEMAND requests (FUSE) always jump ahead.
+The coordinator and prewarm submit tiles through `PrefetchLane` (see
+[Demand and prefetch lanes](#demand-and-prefetch-lanes)), never through
+`DdsClient`, which is the FUSE demand path. The earlier `DdsClient::prefetch`,
+`prefetch_with_cancellation`, `sender`, `executor_load` and `fuse_pressure` methods
+were removed. Isolation, not priority, now keeps FUSE ahead of prefetch.
 
 ### Backpressure
 
@@ -871,10 +1007,11 @@ compares it against the same thresholds:
 - Load > 50%: submit reduced batch (50%)
 - Load < 50%: full submission
 
-**`executor_load()`** is resource-pool utilisation: our own pipeline, meaning
-downloads, encoding and disk writes.
+**`PrefetchLane::load()`** is the prefetch lane's resource-pool utilisation: its own
+pipeline, meaning downloads, encoding and disk writes. The deferral log still
+names this figure `executor_load`.
 
-**`fuse_pressure()`** is demand on the mount: memory pinned by open virtual DDS
+**`PinnedTileBudget`'s pressure** is demand on the mount: memory pinned by open virtual DDS
 handles, as a fraction of the ceiling that bounds it. Added in
 [#246](https://github.com/samsoir/xearthlayer/issues/246).
 
@@ -890,7 +1027,7 @@ full rate into it was making that peak larger than it needed to be.
 Two earlier mechanisms do not cover this. `SimState::should_prefetch()` gates on
 `async_scenery_load_in_progress`, which reports X-Plane's own DSF loader rather
 than demand on us, and was never true during the flight that motivated the
-change. `executor_load()` misses cache-served reads as described above.
+change. Lane load misses cache-served reads as described above.
 
 Open handles rather than a read rate, deliberately. `open` and `release` reach
 the filesystem on every platform; reads do not. macOS serves virtual DDS through
@@ -963,6 +1100,9 @@ stale_region_timeout = 120     ; seconds before an InProgress region is re-evalu
 ; Prefetch box
 box_extent = 7.0               ; degrees per axis: ground extent, and cruise maximum
 box_max_bias = 0.8             ; forward fraction on the primary axis
+
+; Prefetch lane capacity as a fraction of the capacity FUSE demand gets
+capacity_share = 0.35          ; 0.05 to 0.50
 
 cycle_interval_ms = 2000       ; INERT: parsed but never read, see below
 ```
@@ -1140,3 +1280,4 @@ plans are being cut by the request channel.
 | 2.1 | March 2026 | **Window dimension and loading depth correction.** Empirical map-based measurement at EDDF/YPAD/WSSS revealed window is ~3° lat × ~3°/cos(lat) lon, not 9×9°. FUSE burst analysis (65 classified events with telemetry) confirmed asymmetric loading depth: ROW loads 3 deep (73%), COL loads 2 deep (64%), both 3-4 wide. Trigger distance ~1° from window edge. Updated defaults: `default_window_rows` 9→3, `default_window_cols` 9→auto, `trigger_distance` 3.0→1.0, `load_depth` 3→0 (auto: 3 rows, 2 cols). See whitepaper v1.2 for methodology. |
 | 2.2 | October 2026 | Removed throughput calibration and the `auto` mode (#277). Mode is configuration only; see [Strategy Mode](#strategy-mode). |
 | 2.3 | October 2026 | **Brought into line with the code.** The document still described the v2.0 boundary monitors, deleted in PR #102. Removed the monitor sections; rewrote the overview, goals, component diagram, module structure, per-cycle operation, throttling, retention, edge cases, configuration and testing strategy for the sliding box. Corrected the box extent to 3.5° to 7.0° (default `box_extent` 7.0). Recorded that world rebuild detection is not implemented, that `SceneryWindow` is dead code, and that `cycle_interval_ms` is inert. Documented that a region is marked once none of its tiles is outstanding, across drains (#296). |
+| 2.4 | October 2026 | **Demand and prefetch lanes (#296).** Prefetch moved out of the shared pipeline into its own lane behind the `PrefetchLane` trait, paused while FUSE waits on generation. Added the Demand and prefetch lanes section (no-harm contract, admission pause, always claim, cache probe, sizing, the lane contract), replaced the `DdsClient` integration and backpressure inputs, and added the lane and FUSE latency fields to the Prefetch sample. Added `prefetch.capacity_share`. |

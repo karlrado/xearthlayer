@@ -272,6 +272,8 @@ A prefetch box moves with the aircraft, biased in the direction of travel. Every
 
 Prefetch yields when XEarthLayer is busy or X-Plane is reading heavily, and pauses while X-Plane is loading scenery, in replay, or when telemetry stops.
 
+**Prefetch never delays X-Plane.** Prefetch runs in its own lane, with its own download, CPU and disk pools, so it does not compete with the tiles X-Plane asks for. While X-Plane is waiting on a tile to be generated, the prefetch lane admits no new work; work already admitted finishes, and queued work resumes when X-Plane's requests are served. The lane is added on top of the capacity FUSE demand gets, scaled by `capacity_share`. It no longer competes with X-Plane's requests, but it does compete with the simulator itself for CPU, so lower `capacity_share` if prefetch costs frame rate.
+
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `enabled` | bool | `true` | Enable/disable predictive tile prefetching |
@@ -316,6 +318,9 @@ takeoff_timeout_secs = 90                    ; Max seconds before timeout releas
 landing_hysteresis_secs = 15                 ; Sustained GS < 40kt for landing detection
 ramp_duration_secs = 30                      ; Linear ramp duration after hold release
 ramp_start_fraction = 0.25                   ; Starting prefetch fraction (25%)
+
+; Capacity of the prefetch lane as a fraction of the capacity FUSE demand gets
+; capacity_share = 0.35                      ; 0.05-0.50
 
 ; Prefetch box
 ; box_extent = 7.0                           ; Degrees per axis (ground box, cruise maximum)
@@ -509,6 +514,9 @@ mode = opportunistic           ; aggressive, opportunistic, disabled
 ; landing_hysteresis_secs = 15               ; sustained GS < 40kt for landing
 ; ramp_duration_secs = 30                    ; linear ramp duration after release
 ; ramp_start_fraction = 0.25                 ; starting prefetch fraction
+
+; Capacity of the prefetch lane as a fraction of the capacity FUSE demand gets
+capacity_share = 0.35                        ; 0.05-0.50
 
 ; Prefetch box
 ; box_extent = 7.0                           ; degrees per axis (ground box, cruise maximum)
