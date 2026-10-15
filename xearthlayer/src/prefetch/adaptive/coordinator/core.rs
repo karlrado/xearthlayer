@@ -186,7 +186,7 @@ pub struct AdaptivePrefetchCoordinator {
 
     /// Tiles that could not be submitted due to channel backpressure.
     ///
-    /// When [`execute()`] encounters `ChannelFull`, remaining tiles are stored
+    /// When [`execute()`] encounters a full lane, remaining tiles are stored
     /// here and drained on subsequent [`process_telemetry()`] cycles before
     /// generating any new boundary plan. This prevents the "fire-and-forget"
     /// bug where large boundary plans are partially submitted and the remainder
@@ -1849,7 +1849,7 @@ mod tests {
         let plan = test_plan(10);
         let submitted = coord.execute(&plan);
 
-        assert_eq!(submitted, 3, "Should stop at first ChannelFull error");
+        assert_eq!(submitted, 3, "Should stop at first full-lane error");
         assert_eq!(client.submitted_count(), 3);
     }
 
@@ -3205,7 +3205,7 @@ mod tests {
         // Aircraft at lat=52.5 → near edge of window.
         let state = AircraftState::new(52.5, 10.0, 0.0, 200.0, 35000.0, false);
 
-        // First cycle: boundary plan generated, only 5 submitted (ChannelFull)
+        // First cycle: boundary plan generated, only 5 submitted (lane full)
         let result = coord.process_telemetry(&state).await;
         let first_submitted = result.unwrap_or(0);
         assert!(
@@ -3214,7 +3214,7 @@ mod tests {
         );
         assert!(
             first_submitted <= 5,
-            "First cycle should be capped at 5 by ChannelFull"
+            "First cycle should be capped at 5 by a full lane"
         );
 
         // KEY ASSERTION: pending tiles should be non-empty (if plan had more than 5)

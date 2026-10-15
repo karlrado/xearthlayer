@@ -609,6 +609,21 @@ mod tests {
         runtime.shutdown().await;
     }
 
+    /// The mount pins against the budget on the DDS client and the prefetch
+    /// coordinator reads the one on the runtime. If these ever diverge, both
+    /// halves still compile and report plausible numbers, and only the FUSE
+    /// back-pressure silently stops working (#246).
+    #[tokio::test]
+    async fn the_mount_and_the_coordinator_share_one_pinned_budget() {
+        let runtime = build_test_runtime();
+        let from_client = runtime
+            .dds_client()
+            .pinned_budget()
+            .expect("the demand client carries the budget");
+        assert!(Arc::ptr_eq(&runtime.pinned_budget(), &from_client));
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn demand_in_flight_pauses_prefetch_admission() {
         let runtime = build_test_runtime();

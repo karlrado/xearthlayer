@@ -57,7 +57,7 @@ impl ExecutionResult {
 /// - Load > [`BACKPRESSURE_DEFER_THRESHOLD`]: skips this cycle (deferred)
 /// - Load > [`BACKPRESSURE_REDUCE_THRESHOLD`]: submits reduced fraction
 /// - Applies transition throttle (takeoff ramp-up)
-/// - Stops immediately on `ChannelFull` error
+/// - Stops immediately on a full lane
 ///
 /// # Returns
 ///
