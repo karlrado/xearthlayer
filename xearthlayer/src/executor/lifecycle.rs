@@ -231,14 +231,20 @@ impl JobExecutor {
     }
 
     /// Finds all jobs that are ready to complete.
+    ///
+    /// A job is ready either when its work has run out, or when it already
+    /// ended early (Kill, Stop, or a FailFast failure) and nothing of it is
+    /// still running. The early case cannot wait for `has_pending_work()` to
+    /// clear: tasks still queued or pending for such a job are discarded at
+    /// dispatch without being counted down, so it never would. Until the job
+    /// completes it keeps its concurrency group permit (#296).
     async fn find_completed_jobs(&self) -> Vec<JobId> {
         let jobs = self.active_jobs.lock().await;
         jobs.iter()
             .filter(|(_, job)| {
-                let is_complete = (!job.has_pending_work() && job.all_children_complete())
-                    || job.status == JobStatus::Stopped
-                    || job.status == JobStatus::Cancelled;
-                is_complete && !job.status.is_terminal()
+                let work_done = !job.has_pending_work() && job.all_children_complete();
+                let ended_early = job.status.is_terminal() && job.tasks_in_flight == 0;
+                work_done || ended_early
             })
             .map(|(id, _)| id.clone())
             .collect()

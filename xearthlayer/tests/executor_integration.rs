@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use xearthlayer::executor::{
-    ErrorPolicy, ExecutorConfig, Job, JobExecutor, JobId, JobResult, JobStatus, Priority,
-    ResourceType, Task, TaskContext, TaskError, TaskResult,
+    ErrorPolicy, ExecutorConfig, Job, JobConcurrencyLimits, JobExecutor, JobId, JobResult,
+    JobStatus, Priority, ResourceType, Task, TaskContext, TaskError, TaskResult,
 };
 
 // =============================================================================
@@ -369,8 +369,144 @@ async fn test_executor_graceful_shutdown() {
 }
 
 // =============================================================================
+// Concurrency permit release on early termination
+//
+// A job that ends early (Kill, Stop, or a FailFast failure) must give its
+// concurrency group permit back, or every early end shrinks the group for the
+// rest of the session. A group of one makes a leak observable: the second job
+// can only start once the first has released the permit. See #296.
+// =============================================================================
+
+const SINGLE_PERMIT_GROUP: &str = "single-permit";
+
+/// Starts an executor whose only concurrency group admits one job at a time.
+fn start_executor_with_single_permit_group() -> (
+    xearthlayer::executor::JobSubmitter,
+    CancellationToken,
+    tokio::task::JoinHandle<()>,
+) {
+    let config = ExecutorConfig {
+        job_concurrency_limits: JobConcurrencyLimits::empty().with_group(SINGLE_PERMIT_GROUP, 1),
+        ..ExecutorConfig::default()
+    };
+    let (executor, submitter) = JobExecutor::new(config);
+    let shutdown = CancellationToken::new();
+    let shutdown_clone = shutdown.clone();
+    let executor_handle = tokio::spawn(async move {
+        executor.run(shutdown_clone).await;
+    });
+    (submitter, shutdown, executor_handle)
+}
+
+/// Submits a job to the single-permit group and asserts that it runs, which it
+/// can only do if the group's permit has been released.
+async fn assert_group_admits_another_job(submitter: &xearthlayer::executor::JobSubmitter) {
+    let mut follower = submitter.submit(InGroup(EmptyJob {
+        id: "follower".to_string(),
+    }));
+
+    let finished = tokio::time::timeout(Duration::from_secs(2), follower.wait()).await;
+
+    assert!(
+        finished.is_ok(),
+        "the follower never started: the first job kept the group permit"
+    );
+    assert_eq!(follower.status(), JobStatus::Succeeded);
+}
+
+#[tokio::test]
+async fn test_killed_job_releases_its_concurrency_permit() {
+    let (submitter, shutdown, executor_handle) = start_executor_with_single_permit_group();
+
+    let handle = submitter.submit(InGroup(TestJobWithCounter {
+        id: "killed".to_string(),
+        counter: Arc::new(AtomicUsize::new(0)),
+        task_count: 5,
+        delay_ms: 200,
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.kill();
+
+    assert_group_admits_another_job(&submitter).await;
+
+    shutdown.cancel();
+    let _ = executor_handle.await;
+}
+
+#[tokio::test]
+async fn test_stopped_job_releases_its_concurrency_permit() {
+    let (submitter, shutdown, executor_handle) = start_executor_with_single_permit_group();
+
+    let handle = submitter.submit(InGroup(TestJobWithCounter {
+        id: "stopped".to_string(),
+        counter: Arc::new(AtomicUsize::new(0)),
+        task_count: 5,
+        delay_ms: 200,
+    }));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    handle.stop();
+
+    assert_group_admits_another_job(&submitter).await;
+
+    shutdown.cancel();
+    let _ = executor_handle.await;
+}
+
+#[tokio::test]
+async fn test_fail_fast_job_releases_its_concurrency_permit() {
+    let (submitter, shutdown, executor_handle) = start_executor_with_single_permit_group();
+
+    let mut handle = submitter.submit(InGroup(FailingJobAfterN {
+        id: "fail-fast".to_string(),
+        counter: Arc::new(AtomicUsize::new(0)),
+        fail_after: 1,
+        total_tasks: 5,
+    }));
+    let _ = tokio::time::timeout(Duration::from_secs(2), handle.wait()).await;
+    assert_eq!(handle.status(), JobStatus::Failed);
+
+    assert_group_admits_another_job(&submitter).await;
+
+    shutdown.cancel();
+    let _ = executor_handle.await;
+}
+
+// =============================================================================
 // Test Job Implementations
 // =============================================================================
+
+/// Places any job in [`SINGLE_PERMIT_GROUP`], delegating everything else.
+struct InGroup<J: Job>(J);
+
+impl<J: Job> Job for InGroup<J> {
+    fn id(&self) -> JobId {
+        self.0.id()
+    }
+
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn error_policy(&self) -> ErrorPolicy {
+        self.0.error_policy()
+    }
+
+    fn priority(&self) -> Priority {
+        self.0.priority()
+    }
+
+    fn concurrency_group(&self) -> Option<&str> {
+        Some(SINGLE_PERMIT_GROUP)
+    }
+
+    fn create_tasks(&self) -> Vec<Box<dyn Task>> {
+        self.0.create_tasks()
+    }
+
+    fn on_complete(&self, result: &JobResult) -> JobStatus {
+        self.0.on_complete(result)
+    }
+}
 
 /// Job that creates tasks which increment a shared counter.
 struct TestJobWithCounter {
