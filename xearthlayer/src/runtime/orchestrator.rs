@@ -403,9 +403,9 @@ impl XEarthLayerRuntime {
 
     /// Check if the runtime is still running.
     ///
-    /// Returns `false` if the daemon has been shut down or crashed.
+    /// Returns `false` if either lane's daemon has been shut down or crashed.
     pub fn is_running(&self) -> bool {
-        self.dds_client.is_connected()
+        self.dds_client.is_connected() && self.prefetch_lane.is_connected()
     }
 
     /// Get the shutdown token for external coordination.
@@ -709,6 +709,18 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), runtime.shutdown())
             .await
             .expect("Shutdown should complete within 5 seconds");
+    }
+
+    /// FUSE alone working is not a running runtime: prefetch and cache GC
+    /// both go through the prefetch lane.
+    #[tokio::test]
+    async fn runtime_is_not_running_once_the_prefetch_lane_stops() {
+        let runtime = build_test_runtime();
+        runtime.daemon_handles[1].abort();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(runtime.dds_client().is_connected(), "demand lane still up");
+        assert!(!runtime.is_running());
+        runtime.shutdown().await;
     }
 
     #[tokio::test]

@@ -89,6 +89,11 @@ impl LocalPrefetchLane {
         self.job_submitter.clone()
     }
 
+    /// Whether the lane's daemon is still taking requests.
+    pub fn is_connected(&self) -> bool {
+        !self.tx.is_closed()
+    }
+
     fn send(&self, request: JobRequest) -> Result<(), LaneError> {
         self.tx.try_send(request).map_err(|e| match e {
             mpsc::error::TrySendError::Full(_) => LaneError::Full,
@@ -178,6 +183,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let lane = lane_with(tx);
         drop(rx);
+        assert!(!lane.is_connected());
         assert!(matches!(lane.submit(tile()), Err(LaneError::Closed)));
     }
 
