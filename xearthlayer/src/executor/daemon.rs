@@ -819,6 +819,7 @@ where
                 }
 
                 let memory_cache = Arc::clone(memory_cache);
+                let dds_disk_cache = Arc::clone(dds_disk_cache);
                 let coalescer = Arc::clone(coalescer);
                 let cancellation = request.cancellation.clone();
                 let metrics_for_completion = metrics_client.clone();
@@ -845,7 +846,7 @@ where
                             }
 
                             // Get DDS data directly from job result (avoids cache race conditions)
-                            let data = if success {
+                            let (data, served_from_cache) = if success {
                                 match job_result.output_data {
                                     Some(d) => {
                                         debug!(
@@ -867,20 +868,37 @@ where
                                             crate::debug_map::activity::TileCacheResult::Generated,
                                         );
 
-                                        d
+                                        (d, false)
                                     }
                                     None => {
-                                        // Job succeeded but no output data - should not happen
-                                        // but fall back to cache read for safety
-                                        warn!(
-                                            tile_row = tile.row,
-                                            tile_col = tile.col,
-                                            tile_zoom = tile.zoom,
-                                            dsf_tile = %dsf_tile_for_log,
-                                            duration_ms = duration.as_millis(),
-                                            "Job succeeded but output_data was None - falling back to cache"
-                                        );
-                                        memory_cache.get(tile.row, tile.col, tile.zoom).await.unwrap_or_default()
+                                        // A job skipped by the prefetch lane's cache probe
+                                        // succeeds without output: its tile was cached while it
+                                        // waited, often on DDS disk only.
+                                        let cached = match memory_cache
+                                            .get(tile.row, tile.col, tile.zoom)
+                                            .await
+                                        {
+                                            Some(d) => Some(d),
+                                            None => {
+                                                dds_disk_cache
+                                                    .get(tile.row, tile.col, tile.zoom)
+                                                    .await
+                                            }
+                                        };
+                                        match cached {
+                                            Some(d) => (d, true),
+                                            None => {
+                                                warn!(
+                                                    tile_row = tile.row,
+                                                    tile_col = tile.col,
+                                                    tile_zoom = tile.zoom,
+                                                    dsf_tile = %dsf_tile_for_log,
+                                                    duration_ms = duration.as_millis(),
+                                                    "Job succeeded with no output and the tile is in no cache"
+                                                );
+                                                (Bytes::new(), false)
+                                            }
+                                        }
                                     }
                                 }
                             } else {
@@ -892,7 +910,7 @@ where
                                     latency_ms = duration.as_millis(),
                                     "Job failed - returning empty data"
                                 );
-                                Bytes::new()
+                                (Bytes::new(), false)
                             };
 
                             // Broadcast result to coalesced waiters
@@ -904,7 +922,11 @@ where
                             coalescer.complete(tile, coalesced_result);
 
                             // Create response with job_succeeded flag set correctly
-                            let response = DdsResponse::new(data, false, duration, success);
+                            let response = if served_from_cache {
+                                DdsResponse::cache_hit(data, duration)
+                            } else {
+                                DdsResponse::new(data, false, duration, success)
+                            };
 
                             // Send response if requested
                             if let Some(tx) = request.response_tx {
@@ -1304,6 +1326,134 @@ mod tests {
         let result = TestDaemon::submit_tracked(&submitter, mock_job(), &Some(tracker.clone()));
         assert!(result.is_err());
         assert_eq!(tracker.in_flight(), 0);
+    }
+
+    /// DDS disk cache holding at most one tile, written by the job itself.
+    struct OneTileDdsDisk {
+        tile: Mutex<Option<(TileCoord, Bytes)>>,
+    }
+
+    impl crate::executor::DdsDiskCache for OneTileDdsDisk {
+        async fn get(&self, row: u32, col: u32, zoom: u8) -> Option<Bytes> {
+            let held = self.tile.lock().unwrap().clone();
+            held.filter(|(t, _)| (t.row, t.col, t.zoom) == (row, col, zoom))
+                .map(|(_, data)| data)
+        }
+
+        async fn put(&self, row: u32, col: u32, zoom: u8, data: Bytes) {
+            *self.tile.lock().unwrap() = Some((TileCoord { row, col, zoom }, data));
+        }
+
+        async fn contains(&self, row: u32, col: u32, zoom: u8) -> bool {
+            self.get(row, col, zoom).await.is_some()
+        }
+    }
+
+    /// Stands in for a probe-skipped job: while it waited, another lane put
+    /// its tile in the DDS disk cache, so it succeeds with no output.
+    struct SkippedByProbeTask {
+        disk: Arc<OneTileDdsDisk>,
+        tile: TileCoord,
+    }
+
+    impl Task for SkippedByProbeTask {
+        fn name(&self) -> &str {
+            "CachedTileProbe"
+        }
+
+        fn resource_type(&self) -> crate::executor::ResourceType {
+            crate::executor::ResourceType::CPU
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut TaskContext,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = crate::executor::TaskResult> + Send + 'a>,
+        > {
+            Box::pin(async move {
+                use crate::executor::DdsDiskCache;
+                let t = self.tile;
+                self.disk
+                    .put(t.row, t.col, t.zoom, Bytes::from_static(b"ON-DISK"))
+                    .await;
+                crate::executor::TaskResult::Success
+            })
+        }
+    }
+
+    struct SkippedByProbeJob {
+        disk: Arc<OneTileDdsDisk>,
+        tile: TileCoord,
+    }
+
+    impl Job for SkippedByProbeJob {
+        fn id(&self) -> JobId {
+            JobId::new("skipped-by-probe")
+        }
+
+        fn name(&self) -> &str {
+            "SkippedByProbe"
+        }
+
+        fn priority(&self) -> Priority {
+            Priority::PREFETCH
+        }
+
+        fn create_tasks(&self) -> Vec<Box<dyn Task>> {
+            vec![Box::new(SkippedByProbeTask {
+                disk: Arc::clone(&self.disk),
+                tile: self.tile,
+            })]
+        }
+
+        fn on_complete(&self, _result: &JobResult) -> JobStatus {
+            JobStatus::Succeeded
+        }
+    }
+
+    struct SkippedByProbeFactory {
+        disk: Arc<OneTileDdsDisk>,
+    }
+
+    impl DdsJobFactory for SkippedByProbeFactory {
+        fn create_job(&self, tile: TileCoord, _priority: Priority) -> Box<dyn Job> {
+            Box::new(SkippedByProbeJob {
+                disk: Arc::clone(&self.disk),
+                tile,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_probe_skipped_job_is_served_from_dds_disk_as_a_cache_hit() {
+        let disk = Arc::new(OneTileDdsDisk {
+            tile: Mutex::new(None),
+        });
+        let (daemon, tx) = ExecutorDaemon::new(
+            ExecutorDaemonConfig::default(),
+            Arc::new(SkippedByProbeFactory {
+                disk: Arc::clone(&disk),
+            }),
+            Arc::new(MockMemoryCache::new()),
+            disk,
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let (request, rx) = JobRequest::prewarm(test_tile());
+        tx.send(request).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), rx)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(response.data, Bytes::from_static(b"ON-DISK"));
+        assert!(response.cache_hit, "a skipped job reports AlreadyCached");
+        assert!(response.is_success());
+
+        shutdown.cancel();
+        let _ = run.await;
     }
 
     #[test]

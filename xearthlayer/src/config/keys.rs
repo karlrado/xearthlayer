@@ -598,7 +598,10 @@ impl ConfigKey {
             ConfigKey::PrefetchStaleRegionTimeout => Box::new(IntegerRangeSpec::new(30, 600)),
             ConfigKey::PrefetchBoxExtent => Box::new(FloatRangeSpec::new(7.0, 15.0)),
             ConfigKey::PrefetchBoxMaxBias => Box::new(FloatRangeSpec::new(0.5, 0.9)),
-            ConfigKey::PrefetchCapacityShare => Box::new(FloatRangeSpec::new(0.05, 0.50)),
+            ConfigKey::PrefetchCapacityShare => Box::new(FloatRangeSpec::new(
+                crate::executor::MIN_PREFETCH_CAPACITY_SHARE,
+                crate::executor::MAX_PREFETCH_CAPACITY_SHARE,
+            )),
             // Prewarm settings
             ConfigKey::PrewarmGridRows => Box::new(PositiveIntegerSpec),
             ConfigKey::PrewarmGridCols => Box::new(PositiveIntegerSpec),

@@ -45,6 +45,8 @@ pub struct ExecutorConfig {
     /// Optional admission gate. While it reads `true`, the executor admits no
     /// queued job; jobs already admitted run all their tasks. `None` (the
     /// default) means always open. The prefetch lane is gated by demand (#296).
+    /// The gate's sender must outlive the executor: once it drops, the gate
+    /// keeps its last value, so a gate dropped while paused never reopens.
     pub admission_gate: Option<tokio::sync::watch::Receiver<bool>>,
 }
 

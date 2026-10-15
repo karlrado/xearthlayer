@@ -192,7 +192,9 @@ pub use daemon::{
     DaemonMemoryCache, ExecutorDaemon, ExecutorDaemonConfig, DEFAULT_REQUEST_CHANNEL_CAPACITY,
 };
 pub use demand::{DemandGuard, DemandTracker};
-pub use lane_sizing::LaneSizing;
+pub use lane_sizing::{
+    clamp_capacity_share, LaneSizing, MAX_PREFETCH_CAPACITY_SHARE, MIN_PREFETCH_CAPACITY_SHARE,
+};
 
 // Cache adapter (decoupled from pipeline module)
 pub use cache_adapter::ExecutorCacheAdapter;

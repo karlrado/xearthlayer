@@ -5,8 +5,40 @@
 //! scaled by `prefetch.capacity_share`. The pool formulas themselves stay in
 //! `ResourcePoolConfig::default()` and are not configurable.
 
+use std::sync::Once;
+
 use super::download_config::DEFAULT_MAX_CONCURRENT_HTTP;
 use super::resource_pool::{ResourcePoolConfig, BLOCKING_POOL_HEADROOM};
+use crate::config::DEFAULT_PREFETCH_CAPACITY_SHARE;
+
+/// Smallest accepted `prefetch.capacity_share`.
+pub const MIN_PREFETCH_CAPACITY_SHARE: f64 = 0.05;
+/// Largest accepted `prefetch.capacity_share`.
+pub const MAX_PREFETCH_CAPACITY_SHARE: f64 = 0.50;
+
+/// Brings a configured share into range. The INI parser does not range-check
+/// it, and an out-of-range share would size a lane nobody intended.
+pub fn clamp_capacity_share(share: f64) -> f64 {
+    let clamped = if share.is_nan() {
+        DEFAULT_PREFETCH_CAPACITY_SHARE
+    } else {
+        share.clamp(MIN_PREFETCH_CAPACITY_SHARE, MAX_PREFETCH_CAPACITY_SHARE)
+    };
+    if clamped != share {
+        // Both the pools and the blocking cap derive from the share, so the
+        // same clamp runs twice per start; one warning is enough.
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            tracing::warn!(
+                configured = share,
+                used = clamped,
+                "prefetch.capacity_share is outside {MIN_PREFETCH_CAPACITY_SHARE} to \
+                 {MAX_PREFETCH_CAPACITY_SHARE}; clamping"
+            );
+        });
+    }
+    clamped
+}
 
 /// Capacity of both lanes, derived from the demand lane's pools.
 #[derive(Clone, Debug)]
@@ -35,6 +67,13 @@ impl LaneSizing {
             prefetch,
             demand,
         }
+    }
+
+    /// Sizes both lanes from the default pools and a configured share. The
+    /// runtime builder and the blocking-pool cap both come through here, so
+    /// the pools and the threads that serve them cannot disagree.
+    pub fn from_configured_share(share: f64) -> Self {
+        Self::derive(ResourcePoolConfig::default(), clamp_capacity_share(share))
     }
 
     /// Both lanes dispatch CPU and disk work through `spawn_blocking`, so the
@@ -82,6 +121,32 @@ mod tests {
                 sizing.demand.disk_io
             ),
             (40, 60, 64)
+        );
+    }
+
+    #[test]
+    fn configured_share_is_clamped_to_its_range() {
+        assert_eq!(clamp_capacity_share(0.35), 0.35);
+        assert_eq!(clamp_capacity_share(0.0), MIN_PREFETCH_CAPACITY_SHARE);
+        assert_eq!(clamp_capacity_share(2.0), MAX_PREFETCH_CAPACITY_SHARE);
+        assert_eq!(
+            clamp_capacity_share(f64::NAN),
+            DEFAULT_PREFETCH_CAPACITY_SHARE
+        );
+    }
+
+    #[test]
+    fn configured_sizing_uses_the_clamped_share() {
+        let configured = LaneSizing::from_configured_share(5.0);
+        let clamped =
+            LaneSizing::derive(ResourcePoolConfig::default(), MAX_PREFETCH_CAPACITY_SHARE);
+        assert_eq!(
+            configured.blocking_threads_required(),
+            clamped.blocking_threads_required()
+        );
+        assert_eq!(
+            configured.prefetch_http_permits,
+            clamped.prefetch_http_permits
         );
     }
 

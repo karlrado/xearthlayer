@@ -11,16 +11,22 @@
 //! │                      XEarthLayerRuntime                         │
 //! │                                                                  │
 //! │  ┌───────────────┐                    ┌──────────────────────┐  │
-//! │  │ DdsClient     │──────────────────► │  ExecutorDaemon      │  │
-//! │  │ (for FUSE,    │    JobRequest      │  (background task)   │  │
-//! │  │  Prefetch)    │    channel         │                      │  │
+//! │  │ DdsClient     │──────────────────► │  demand daemon       │  │
+//! │  │ (FUSE)        │    JobRequest      │  (counts in flight)  │  │
+//! │  └───────────────┘                    └──────────┬───────────┘  │
+//! │                                        DemandTracker (pause)    │
+//! │  ┌───────────────┐                    ┌──────────▼───────────┐  │
+//! │  │ PrefetchLane  │──────────────────► │  prefetch daemon     │  │
+//! │  │ (prefetch,GC) │    JobRequest      │  (gated, smaller)    │  │
 //! │  └───────────────┘                    └──────────────────────┘  │
 //! │                                                                  │
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
-//! Request coalescing is handled by the FUSE layer before requests reach
-//! the runtime. The daemon receives already-deduplicated requests.
+//! The two daemons share the caches but nothing else: each has its own
+//! resource pools, HTTP semaphore and coalescer, so prefetch can never hold
+//! a permit a FUSE request is waiting for. The prefetch lane admits no new
+//! job while any demand job is in flight (#296).
 //!
 //! # Usage
 //!
@@ -28,7 +34,10 @@
 //! use xearthlayer::runtime::XEarthLayerRuntime;
 //!
 //! // Create runtime with dependencies
-//! let runtime = XEarthLayerRuntime::new(factory, memory_cache, config);
+//! let runtime = XEarthLayerRuntime::new(
+//!     demand_factory, prefetch_factory, memory_cache, dds_disk_cache,
+//!     config, sizing, handle,
+//! );
 //!
 //! // Get client for producers
 //! let client = runtime.dds_client();
@@ -44,13 +53,16 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::executor::{
-    ChannelDdsClient, DaemonMemoryCache, DdsClient, DdsDiskCache, ExecutorDaemon,
-    ExecutorDaemonConfig, JobSubmitter, MultiplexTelemetrySink, ResourcePools, TelemetrySink,
-    TracingTelemetrySink,
+    ChannelDdsClient, DaemonMemoryCache, DdsClient, DdsDiskCache, DemandTracker, ExecutorConfig,
+    ExecutorDaemon, ExecutorDaemonConfig, JobConcurrencyLimits, LaneSizing, MultiplexTelemetrySink,
+    TelemetrySink, TracingTelemetrySink, TILE_GENERATION_GROUP,
 };
 use crate::jobs::DdsJobFactory;
 use crate::metrics::MetricsClient;
-use crate::runtime::{SharedTileProgressTracker, TileProgressSink, TileProgressTracker};
+use crate::pinned_budget::PinnedTileBudget;
+use crate::runtime::{
+    LocalPrefetchLane, SharedTileProgressTracker, TileProgressSink, TileProgressTracker,
+};
 
 /// Configuration for the XEarthLayer runtime.
 #[derive(Debug, Clone, Default)]
@@ -74,63 +86,67 @@ impl RuntimeConfig {
 
 /// The main XEarthLayer runtime.
 ///
-/// This struct orchestrates the daemon architecture, owning the job channel
+/// This struct orchestrates the daemon architecture, owning the job channels
 /// and managing daemon lifecycles. It provides:
 ///
-/// - A `DdsClient` for producers (FUSE, Prefetch) to submit tile requests
-/// - Background execution of the `ExecutorDaemon`
+/// - A `DdsClient` for FUSE to submit tile requests to the demand lane
+/// - A `PrefetchLane` for prefetch work and cache GC
+/// - Background execution of both `ExecutorDaemon`s
 /// - Graceful shutdown coordination
 ///
 /// # Lifecycle
 ///
-/// 1. **Creation**: `new()` creates the channel and spawns the daemon task
-/// 2. **Operation**: Producers use `dds_client()` to submit requests
-/// 3. **Shutdown**: `shutdown()` cancels the daemon and waits for completion
+/// 1. **Creation**: `new()` creates the channels and spawns both daemon tasks
+/// 2. **Operation**: Producers use `dds_client()` or `prefetch_lane()`
+/// 3. **Shutdown**: `shutdown()` cancels the daemons and waits for completion
 pub struct XEarthLayerRuntime {
-    /// DDS client for producers to submit requests.
+    /// DDS client for the demand lane.
     dds_client: Arc<ChannelDdsClient>,
 
-    /// Job submitter for generic job submission (e.g., GC jobs).
-    job_submitter: JobSubmitter,
+    /// The prefetch lane, which also carries cache GC jobs.
+    prefetch_lane: Arc<LocalPrefetchLane>,
 
-    /// Handle to the daemon background task.
-    daemon_handle: Option<JoinHandle<()>>,
+    /// Demand jobs in flight. Held here because the prefetch lane's
+    /// admission gate is a receiver of this tracker's sender: dropping the
+    /// last tracker while it reads paused would leave prefetch paused forever.
+    demand: DemandTracker,
+
+    /// Memory pinned by open virtual DDS handles (#246).
+    pinned_budget: Arc<PinnedTileBudget>,
+
+    /// Handles to the demand and prefetch daemon tasks.
+    daemon_handles: Vec<JoinHandle<()>>,
 
     /// Shutdown token for graceful termination.
     shutdown_token: CancellationToken,
 
     /// Tile progress tracker for TUI display.
     tile_progress_tracker: SharedTileProgressTracker,
-
-    /// Executor resource pools for utilization monitoring.
-    ///
-    /// Shared with the circuit breaker so it can trip on pool saturation,
-    /// not just FUSE request rate.
-    resource_pools: Arc<ResourcePools>,
 }
 
 impl XEarthLayerRuntime {
     /// Create a new runtime with the given dependencies.
     ///
-    /// This starts the executor daemon in a background task immediately.
-    /// Request coalescing is handled by the FUSE layer, not the daemon.
+    /// This starts both executor daemons in background tasks immediately.
     ///
     /// # Arguments
     ///
-    /// * `factory` - Factory for creating DDS generation jobs
-    /// * `memory_cache` - Memory cache for fast-path lookups
+    /// * `demand_factory` - Factory for FUSE demand jobs
+    /// * `prefetch_factory` - Factory for prefetch jobs, with its own HTTP
+    ///   semaphore and the admission cache probe
+    /// * `memory_cache` - Memory cache shared by both lanes
+    /// * `dds_disk_cache` - DDS disk cache shared by both lanes
     /// * `config` - Runtime configuration
+    /// * `sizing` - Pool capacities of both lanes
     /// * `handle` - Handle to the Tokio runtime for spawning tasks
-    ///
-    /// # Type Parameters
-    ///
-    /// * `F` - DDS job factory type
-    /// * `M` - Memory cache type
+    #[allow(clippy::too_many_arguments)]
     pub fn new<F, M, DD>(
-        factory: Arc<F>,
+        demand_factory: Arc<F>,
+        prefetch_factory: Arc<F>,
         memory_cache: Arc<M>,
         dds_disk_cache: Arc<DD>,
         config: RuntimeConfig,
+        sizing: LaneSizing,
         handle: tokio::runtime::Handle,
     ) -> Self
     where
@@ -139,32 +155,30 @@ impl XEarthLayerRuntime {
         DD: DdsDiskCache + 'static,
     {
         // Default to tracing-only telemetry, no metrics
-        Self::with_metrics_client(factory, memory_cache, dds_disk_cache, config, handle, None)
+        Self::with_metrics_client(
+            demand_factory,
+            prefetch_factory,
+            memory_cache,
+            dds_disk_cache,
+            config,
+            sizing,
+            handle,
+            None,
+        )
     }
 
     /// Create a new runtime with the event-based metrics client.
     ///
-    /// This starts the executor daemon in a background task immediately.
-    /// When metrics are provided, per-chunk and job events flow to the
-    /// metrics daemon for real-time dashboard updates.
-    ///
-    /// # Arguments
-    ///
-    /// * `factory` - Factory for creating DDS generation jobs
-    /// * `memory_cache` - Memory cache for fast-path lookups
-    /// * `config` - Runtime configuration
-    /// * `handle` - Handle to the Tokio runtime for spawning tasks
-    /// * `metrics_client` - Optional metrics client for event emission
-    ///
-    /// # Type Parameters
-    ///
-    /// * `F` - DDS job factory type
-    /// * `M` - Memory cache type
+    /// As [`Self::new`]; when metrics are provided, per-chunk and job events
+    /// from both lanes flow to the metrics daemon.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_metrics_client<F, M, DD>(
-        factory: Arc<F>,
+        demand_factory: Arc<F>,
+        prefetch_factory: Arc<F>,
         memory_cache: Arc<M>,
         dds_disk_cache: Arc<DD>,
         config: RuntimeConfig,
+        sizing: LaneSizing,
         handle: tokio::runtime::Handle,
         metrics_client: Option<MetricsClient>,
     ) -> Self
@@ -173,7 +187,13 @@ impl XEarthLayerRuntime {
         M: DaemonMemoryCache + 'static,
         DD: DdsDiskCache + 'static,
     {
-        info!("Starting XEarthLayer runtime");
+        info!(
+            demand_cpu = sizing.demand.cpu,
+            prefetch_cpu = sizing.prefetch.cpu,
+            prefetch_tile_generation = sizing.prefetch_tile_generation,
+            prefetch_http_permits = sizing.prefetch_http_permits,
+            "Starting XEarthLayer runtime"
+        );
 
         // Create tile progress tracker for TUI display
         let tile_progress_tracker = TileProgressTracker::new();
@@ -185,10 +205,101 @@ impl XEarthLayerRuntime {
             tile_progress_sink as Arc<dyn TelemetrySink>,
         ]));
 
-        // Create the daemon with or without metrics
-        let (daemon, job_tx) = match metrics_client {
+        let demand = DemandTracker::new();
+
+        let mut demand_daemon_config = config.daemon_config.clone();
+        demand_daemon_config.executor.resource_pools = sizing.demand.clone();
+
+        // The prefetch lane must register the tile-generation group itself:
+        // GC and prefetch jobs declare it, and a job in an unregistered group
+        // is held forever.
+        let mut prefetch_daemon_config = config.daemon_config;
+        prefetch_daemon_config.executor = ExecutorConfig {
+            resource_pools: sizing.prefetch.clone(),
+            job_concurrency_limits: JobConcurrencyLimits::empty()
+                .with_group(TILE_GENERATION_GROUP, sizing.prefetch_tile_generation),
+            ..prefetch_daemon_config.executor
+        }
+        .with_admission_gate(demand.subscribe());
+
+        let (demand_daemon, demand_tx) = Self::build_daemon(
+            demand_daemon_config,
+            demand_factory,
+            Arc::clone(&memory_cache),
+            Arc::clone(&dds_disk_cache),
+            Arc::clone(&telemetry),
+            metrics_client.clone(),
+        );
+        // Only the demand daemon counts demand; the prefetch daemon counting
+        // its own jobs would pause itself.
+        let demand_daemon = demand_daemon.with_demand_tracker(demand.clone());
+
+        let (prefetch_daemon, prefetch_tx) = Self::build_daemon(
+            prefetch_daemon_config,
+            prefetch_factory,
+            memory_cache,
+            dds_disk_cache,
+            telemetry,
+            metrics_client,
+        );
+
+        // Created here, before the filesystem exists, because the client is
+        // what carries it to the mount (#246).
+        let pinned_budget = Arc::new(PinnedTileBudget::new());
+        let dds_client = Arc::new(
+            ChannelDdsClient::with_resource_pools(demand_tx, demand_daemon.resource_pools())
+                .with_pinned_budget(Arc::clone(&pinned_budget)),
+        );
+        let prefetch_lane = Arc::new(LocalPrefetchLane::new(
+            prefetch_tx,
+            prefetch_daemon.resource_pools(),
+            prefetch_daemon.job_submitter(),
+        ));
+
+        // Create shutdown token for coordinating shutdown
+        let shutdown_token = CancellationToken::new();
+
+        // Use handle.spawn() instead of tokio::spawn() so we don't require
+        // the calling thread to be in a runtime context.
+        let demand_shutdown = shutdown_token.clone();
+        let prefetch_shutdown = shutdown_token.clone();
+        let daemon_handles = vec![
+            handle.spawn(async move { demand_daemon.run(demand_shutdown).await }),
+            handle.spawn(async move { prefetch_daemon.run(prefetch_shutdown).await }),
+        ];
+
+        info!("XEarthLayer runtime started");
+
+        Self {
+            dds_client,
+            prefetch_lane,
+            demand,
+            pinned_budget,
+            daemon_handles,
+            shutdown_token,
+            tile_progress_tracker,
+        }
+    }
+
+    fn build_daemon<F, M, DD>(
+        config: ExecutorDaemonConfig,
+        factory: Arc<F>,
+        memory_cache: Arc<M>,
+        dds_disk_cache: Arc<DD>,
+        telemetry: Arc<dyn TelemetrySink>,
+        metrics_client: Option<MetricsClient>,
+    ) -> (
+        ExecutorDaemon<F, M, DD>,
+        tokio::sync::mpsc::Sender<crate::runtime::JobRequest>,
+    )
+    where
+        F: DdsJobFactory + 'static,
+        M: DaemonMemoryCache + 'static,
+        DD: DdsDiskCache + 'static,
+    {
+        match metrics_client {
             Some(client) => ExecutorDaemon::with_metrics_client(
-                config.daemon_config,
+                config,
                 factory,
                 memory_cache,
                 dds_disk_cache,
@@ -196,59 +307,19 @@ impl XEarthLayerRuntime {
                 client,
             ),
             None => ExecutorDaemon::with_telemetry(
-                config.daemon_config,
+                config,
                 factory,
                 memory_cache,
                 dds_disk_cache,
                 telemetry,
             ),
-        };
-
-        // Extract the job submitter and resource pools before spawning the daemon
-        // (daemon is moved into the spawned task)
-        let job_submitter = daemon.job_submitter();
-        let resource_pools = daemon.resource_pools();
-
-        // Create the DDS client with resource pool awareness for executor load
-        // reporting, and the pinned-tile budget it reports FUSE demand from.
-        // The budget is created here, before the filesystem exists, because the
-        // client is what carries it to the mount (#246).
-        let dds_client = Arc::new(
-            ChannelDdsClient::with_resource_pools(job_tx, Arc::clone(&resource_pools))
-                .with_pinned_budget(Arc::new(crate::pinned_budget::PinnedTileBudget::new())),
-        );
-
-        // Create shutdown token for coordinating shutdown
-        let shutdown_token = CancellationToken::new();
-
-        // Spawn the daemon as a background task with shutdown coordination
-        // Use handle.spawn() instead of tokio::spawn() so we don't require
-        // the calling thread to be in a runtime context.
-        let daemon_shutdown = shutdown_token.clone();
-        let daemon_handle = Some(handle.spawn(async move {
-            daemon.run(daemon_shutdown).await;
-        }));
-
-        info!("XEarthLayer runtime started");
-
-        Self {
-            dds_client,
-            job_submitter,
-            daemon_handle,
-            shutdown_token,
-            tile_progress_tracker,
-            resource_pools,
         }
     }
 
-    /// Get the DDS client for producers to submit tile requests.
+    /// Get the DDS client for the demand lane.
     ///
-    /// This client can be cloned and shared with FUSE handlers,
-    /// prefetchers, and other components that need to request tiles.
-    ///
-    /// # Returns
-    ///
-    /// An `Arc<dyn DdsClient>` that can be used to submit requests.
+    /// This client can be cloned and shared with FUSE handlers and other
+    /// components that need to request tiles.
     pub fn dds_client(&self) -> Arc<dyn DdsClient> {
         Arc::clone(&self.dds_client) as Arc<dyn DdsClient>
     }
@@ -261,25 +332,19 @@ impl XEarthLayerRuntime {
         Arc::clone(&self.dds_client)
     }
 
-    /// Get a job submitter for submitting arbitrary jobs to the executor.
-    ///
-    /// This is used by the GC scheduler to submit garbage collection jobs.
-    /// The submitter is cloneable and can be passed to background tasks.
-    ///
-    /// # Returns
-    ///
-    /// A clone of the internal `JobSubmitter` that can submit any `Job` to the executor.
-    pub fn job_submitter(&self) -> JobSubmitter {
-        self.job_submitter.clone()
+    /// The prefetch lane. Its job submitter also carries cache GC jobs.
+    pub fn prefetch_lane(&self) -> Arc<LocalPrefetchLane> {
+        Arc::clone(&self.prefetch_lane)
     }
 
-    /// Get a shared reference to the executor's resource pools.
-    ///
-    /// Used by the circuit breaker to monitor pool utilization and trip
-    /// when any pool is near saturation, preventing prefetch from starving
-    /// on-demand requests.
-    pub fn resource_pools(&self) -> Arc<ResourcePools> {
-        Arc::clone(&self.resource_pools)
+    /// Demand jobs in flight; the prefetch lane pauses while any are.
+    pub fn demand(&self) -> DemandTracker {
+        self.demand.clone()
+    }
+
+    /// The pinned-tile budget the FUSE mount accounts against (#246).
+    pub fn pinned_budget(&self) -> Arc<PinnedTileBudget> {
+        Arc::clone(&self.pinned_budget)
     }
 
     /// Check if the runtime is still running.
@@ -307,16 +372,15 @@ impl XEarthLayerRuntime {
 
     /// Shutdown the runtime gracefully.
     ///
-    /// This cancels the daemon and waits for it to complete any
+    /// This cancels both daemons and waits for them to complete any
     /// in-flight work before returning.
     pub async fn shutdown(mut self) {
         info!("Shutting down XEarthLayer runtime");
 
-        // Signal shutdown to the daemon
+        // Signal shutdown to the daemons
         self.shutdown_token.cancel();
 
-        // Wait for the daemon to finish
-        if let Some(handle) = self.daemon_handle.take() {
+        for handle in self.daemon_handles.drain(..) {
             match handle.await {
                 Ok(()) => info!("Executor daemon shut down cleanly"),
                 Err(e) => tracing::error!("Executor daemon task panicked: {}", e),
@@ -331,26 +395,45 @@ impl XEarthLayerRuntime {
 mod tests {
     use super::*;
     use crate::coord::TileCoord;
-    use crate::executor::{Job, JobId, NullDdsDiskCache, Priority, Task};
+    use crate::executor::{
+        Job, JobId, JobResult, JobStatus, NullDdsDiskCache, Priority, ResourcePoolConfig,
+        ResourceType, Task, TaskContext, TaskOutput, TaskResult,
+    };
+    use crate::runtime::{JobRequest, LaneOutcome, PrefetchLane};
     use bytes::Bytes;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
-    /// Mock job factory for testing.
-    struct MockJobFactory;
+    /// Mock job factory whose jobs take `delay` to produce a tile.
+    struct MockJobFactory {
+        delay: Duration,
+    }
 
-    impl DdsJobFactory for MockJobFactory {
-        fn create_job(&self, _tile: TileCoord, _priority: Priority) -> Box<dyn Job> {
-            // Return a minimal mock job
-            Box::new(MockJob)
+    impl MockJobFactory {
+        fn with_delay(delay: Duration) -> Self {
+            Self { delay }
         }
     }
 
-    /// Mock job for testing.
-    struct MockJob;
+    impl DdsJobFactory for MockJobFactory {
+        fn create_job(&self, tile: TileCoord, priority: Priority) -> Box<dyn Job> {
+            Box::new(MockJob {
+                id: JobId::new(format!("mock-{}_{}_ZL{}", tile.row, tile.col, tile.zoom)),
+                priority,
+                delay: self.delay,
+            })
+        }
+    }
+
+    /// Mock job: one CPU task that sleeps, then yields a tile.
+    struct MockJob {
+        id: JobId,
+        priority: Priority,
+        delay: Duration,
+    }
 
     impl Job for MockJob {
         fn id(&self) -> JobId {
-            JobId::new("mock-job")
+            self.id.clone()
         }
 
         fn name(&self) -> &str {
@@ -358,11 +441,47 @@ mod tests {
         }
 
         fn priority(&self) -> Priority {
-            Priority::PREFETCH
+            self.priority
         }
 
         fn create_tasks(&self) -> Vec<Box<dyn Task>> {
-            vec![]
+            vec![Box::new(MockTask { delay: self.delay })]
+        }
+
+        fn on_complete(&self, result: &JobResult) -> JobStatus {
+            if result.failed_tasks.is_empty() {
+                JobStatus::Succeeded
+            } else {
+                JobStatus::Failed
+            }
+        }
+    }
+
+    struct MockTask {
+        delay: Duration,
+    }
+
+    impl Task for MockTask {
+        fn name(&self) -> &str {
+            // The executor reads `dds_data` from the task of this name.
+            "BuildAndCacheDds"
+        }
+
+        fn resource_type(&self) -> ResourceType {
+            ResourceType::CPU
+        }
+
+        fn execute<'a>(
+            &'a self,
+            _ctx: &'a mut TaskContext,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = TaskResult> + Send + 'a>> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                let mut output = TaskOutput::new();
+                output.set("dds_data", Bytes::from_static(b"DDS"));
+                TaskResult::SuccessWithOutput(output)
+            })
         }
     }
 
@@ -392,21 +511,90 @@ mod tests {
         }
     }
 
+    const JOB_DELAY: Duration = Duration::from_millis(50);
+
+    fn build_test_runtime() -> XEarthLayerRuntime {
+        XEarthLayerRuntime::new(
+            Arc::new(MockJobFactory::with_delay(JOB_DELAY)),
+            Arc::new(MockJobFactory::with_delay(JOB_DELAY)),
+            Arc::new(MockMemoryCache),
+            Arc::new(NullDdsDiskCache),
+            RuntimeConfig::default(),
+            LaneSizing::derive(ResourcePoolConfig::default(), 0.35),
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    fn tile_at(i: u32) -> TileCoord {
+        TileCoord {
+            row: i,
+            col: i,
+            zoom: 12,
+        }
+    }
+
+    /// Queues `queued` distinct tiles on the prefetch lane, then times one
+    /// FUSE request on the demand lane to completion.
+    async fn time_one_fuse_request(runtime: XEarthLayerRuntime, queued: u32) -> Duration {
+        let lane = runtime.prefetch_lane();
+        for i in 0..queued {
+            lane.submit(tile_at(1000 + i))
+                .expect("prefetch lane accepts");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let start = Instant::now();
+        let response = runtime
+            .dds_client()
+            .request_dds(tile_at(1), CancellationToken::new())
+            .await
+            .expect("demand lane answers");
+        let elapsed = start.elapsed();
+        assert!(response.is_success());
+        runtime.shutdown().await;
+        elapsed
+    }
+
+    #[tokio::test]
+    async fn fuse_request_is_not_slowed_by_a_saturated_prefetch_lane() {
+        let idle = time_one_fuse_request(build_test_runtime(), 0).await;
+        let busy = time_one_fuse_request(build_test_runtime(), 200).await;
+        assert!(
+            busy <= idle + Duration::from_millis(40),
+            "demand took {busy:?} behind a full prefetch lane vs {idle:?} idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn demand_in_flight_pauses_prefetch_admission() {
+        let runtime = build_test_runtime();
+        let paused = runtime.demand().subscribe();
+        let (req, rx) = JobRequest::fuse(tile_at(1), CancellationToken::new());
+        runtime.dds_client().submit(req).unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(*paused.borrow(), "a FUSE job in flight must pause prefetch");
+        let _ = rx.await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!*paused.borrow());
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn prefetch_requests_never_count_as_demand() {
+        let runtime = build_test_runtime();
+        let receipt = runtime
+            .prefetch_lane()
+            .submit_with_receipt(tile_at(7))
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(runtime.demand().in_flight(), 0);
+        assert_eq!(receipt.outcome().await, LaneOutcome::Generated);
+        runtime.shutdown().await;
+    }
+
     #[tokio::test]
     async fn test_runtime_creation_and_shutdown() {
-        let factory = Arc::new(MockJobFactory);
-        let memory_cache = Arc::new(MockMemoryCache);
-        let config = RuntimeConfig::default();
-        let handle = tokio::runtime::Handle::current();
-
-        // Use new() which creates its own coalescer
-        let runtime = XEarthLayerRuntime::new(
-            factory,
-            memory_cache,
-            Arc::new(NullDdsDiskCache),
-            config,
-            handle,
-        );
+        let runtime = build_test_runtime();
 
         // Runtime should be running
         assert!(runtime.is_running());
@@ -420,29 +608,8 @@ mod tests {
     #[tokio::test]
     async fn test_runtime_multiple_instances() {
         // Test that multiple runtimes can be created and shut down independently
-        let handle = tokio::runtime::Handle::current();
-
-        let factory1 = Arc::new(MockJobFactory);
-        let memory_cache1 = Arc::new(MockMemoryCache);
-        let config1 = RuntimeConfig::default();
-        let runtime1 = XEarthLayerRuntime::new(
-            factory1,
-            memory_cache1,
-            Arc::new(NullDdsDiskCache),
-            config1,
-            handle.clone(),
-        );
-
-        let factory2 = Arc::new(MockJobFactory);
-        let memory_cache2 = Arc::new(MockMemoryCache);
-        let config2 = RuntimeConfig::default();
-        let runtime2 = XEarthLayerRuntime::new(
-            factory2,
-            memory_cache2,
-            Arc::new(NullDdsDiskCache),
-            config2,
-            handle,
-        );
+        let runtime1 = build_test_runtime();
+        let runtime2 = build_test_runtime();
 
         // Both should be running
         assert!(runtime1.is_running());
@@ -455,18 +622,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_dds_client_is_connected() {
-        let factory = Arc::new(MockJobFactory);
-        let memory_cache = Arc::new(MockMemoryCache);
-        let config = RuntimeConfig::default();
-        let handle = tokio::runtime::Handle::current();
-
-        let runtime = XEarthLayerRuntime::new(
-            factory,
-            memory_cache,
-            Arc::new(NullDdsDiskCache),
-            config,
-            handle,
-        );
+        let runtime = build_test_runtime();
 
         // Client should be connected initially
         let client = runtime.dds_client();
