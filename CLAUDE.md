@@ -129,8 +129,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `AdaptivePrefetchCoordinator` - Prefetch with flight phase detection
     - `GroundStrategy` - Ring-based prefetching for ground operations (GS < 40kt)
     - `PrefetchBox` - Heading-biased sliding box (speed-proportional extent, proportional 80/20 bias, cruise phase)
-    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to 6.5° at 450kt
-    - `SceneryWindow` - Window config and dimensions holder
+    - `ExtentCalculator` - Speed-proportional box extent: clamped linear ramp 3.5° at 40kt to `box_extent` (default 7.0°) at 450kt in cruise; the ground box is the full `box_extent`, unbiased
+    - `SceneryWindow` - Window config and dimensions holder; dead code, nothing outside its tests constructs it
     - `BoundaryStrategy` - Region lifecycle management (InProgress/Prefetched/NoCoverage/Deferred)
     - `PhaseDetector` - Ground/Cruise flight phase state machine; reset via `on_ground` from AircraftState on telemetry resume
     - `SimState` - Direct sim state detection via X-Plane Web API (paused, on_ground, scenery_loading, replay)

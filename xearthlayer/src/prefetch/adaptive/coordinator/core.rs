@@ -205,19 +205,19 @@ pub struct AdaptivePrefetchCoordinator {
     /// (#226).
     region_retry: std::collections::HashMap<DsfRegion, RegionRetryState>,
 
-    /// Mapping of planned tiles to their source DSF region for the current
-    /// in-flight plan. Populated by the cruise branch of [`update()`] and
-    /// consumed by [`execute()`] to compute per-region submission completeness.
+    /// The current plan's tiles that are still outstanding, mapped to their
+    /// source DSF region. Populated by [`update()`]; a tile leaves the map
+    /// when it is accepted by the executor or filtered out as already
+    /// cached, whichever call that happens in (see [`settle_plan_tiles()`]).
     ///
-    /// A region is marked `InProgress` only when every one of its planned
-    /// tiles is successfully submitted — regions whose tiles were deferred,
-    /// channel-rejected, or throttle-overflowed stay unmarked so they
-    /// naturally re-enter `new_regions_with_extent` on the next cycle.
-    /// This fixes the `#172` bug where regions were marked before
-    /// submission and then stuck `InProgress` despite tiles never being
-    /// generated.
-    ///
-    /// Cleared after each [`execute()`] call (per-plan transient state).
+    /// A region is marked `InProgress` only when it has no outstanding tile
+    /// left (#172: never before its tiles are submitted). The map outlives a
+    /// single [`execute()`] because a plan larger than the request channel is
+    /// cut, and its remainder is submitted by later `boundary_pending` drains.
+    /// Tiles deferred or rejected stay outstanding and are retried through
+    /// `pending_tiles`, so their region stays unmarked until they are
+    /// accepted (#296). Reset when [`update()`] builds the next plan, which it
+    /// only does once pending is empty.
     pub(super) current_plan_regions: std::collections::HashMap<TileCoord, DsfRegion>,
 
     /// Metrics client for prefetch telemetry (#176).
@@ -672,42 +672,12 @@ impl AdaptivePrefetchCoordinator {
             );
         }
 
-        // Mark regions as InProgress only if ALL of their planned tiles
-        // appear in `result.submitted_tiles` — the authoritative record
-        // of what the executor actually accepted. A planned tile that's
-        // neither submitted nor pending would be a logic bug (the
-        // pending cap was removed post-flight #172) — defence in depth
-        // is still correct here, the positive check stays right.
-        //
-        // See #172 Part 1 (the ordering fix) + Part 2 (positive check).
-        if !self.current_plan_regions.is_empty() && !result.deferred {
-            let submitted_set: std::collections::HashSet<TileCoord> =
-                result.submitted_tiles.iter().copied().collect();
-            let mut region_planned: std::collections::HashMap<DsfRegion, Vec<TileCoord>> =
-                std::collections::HashMap::new();
-            for (tile, region) in &self.current_plan_regions {
-                region_planned.entry(*region).or_default().push(*tile);
-            }
-
-            if let Some(ref geo_index) = self.geo_index {
-                let mut marked = 0usize;
-                for (region, planned_tiles) in &region_planned {
-                    let fully_submitted = planned_tiles.iter().all(|t| submitted_set.contains(t));
-                    if fully_submitted {
-                        self.boundary_strategy.mark_in_progress(region, geo_index);
-                        marked += 1;
-                    }
-                }
-                if marked > 0 {
-                    tracing::debug!(
-                        regions_marked = marked,
-                        regions_in_plan = region_planned.len(),
-                        "Prefetch: marked fully-submitted regions as InProgress"
-                    );
-                }
-            }
+        // `result.submitted_tiles` is the authoritative record of what the
+        // executor accepted (#172 Part 2), so only those tiles settle. A
+        // region whose last outstanding tile is among them is marked.
+        if !result.deferred {
+            self.settle_plan_tiles(result.submitted_tiles.iter().copied());
         }
-        self.current_plan_regions.clear();
 
         if result.deferred {
             self.total_deferred_cycles += 1;
@@ -749,11 +719,40 @@ impl AdaptivePrefetchCoordinator {
     /// regions keep being re-planned and filtered each cycle, as they were
     /// before this change.
     ///
-    /// Marked regions are dropped from `current_plan_regions` so
-    /// [`execute()`] only reasons about regions that had tiles to submit.
+    /// Filtered-out tiles settle here, but a region that also has tiles to
+    /// submit is not marked until those are accepted too: that is the job of
+    /// [`settle_plan_tiles()`], which both this and [`execute()`] go through.
     ///
     /// Returns the number of regions marked.
     fn mark_fully_filtered_regions(&mut self, surviving: &[TileCoord]) -> usize {
+        let surviving: HashSet<TileCoord> = surviving.iter().copied().collect();
+        let filtered_out: Vec<TileCoord> = self
+            .current_plan_regions
+            .keys()
+            .filter(|tile| !surviving.contains(tile))
+            .copied()
+            .collect();
+        self.settle_plan_tiles(filtered_out)
+    }
+
+    /// Settle plan tiles that need no further submission, and mark every
+    /// region left with no outstanding tile as `InProgress`.
+    ///
+    /// A tile is settled when the executor accepts it or when the filter
+    /// pipeline removes it as already cached. Either can happen in a later
+    /// call than the one that planned it: a plan cut by the request channel
+    /// is finished by `boundary_pending` drains, which re-filter what they
+    /// carry. Marking only the regions with nothing outstanding keeps the
+    /// #172 rule (never mark before every tile is submitted) while letting it
+    /// span calls, so a region split by the cut is not re-planned and its
+    /// still-queued tiles resubmitted (#296).
+    ///
+    /// Patch-owned regions are never marked, for the reasons given on
+    /// [`mark_fully_filtered_regions()`]; their tiles still settle, so they
+    /// leave the map and are re-planned and filtered each cycle as before.
+    ///
+    /// Returns the number of regions marked.
+    fn settle_plan_tiles(&mut self, settled: impl IntoIterator<Item = TileCoord>) -> usize {
         if self.current_plan_regions.is_empty() {
             return 0;
         }
@@ -761,34 +760,32 @@ impl AdaptivePrefetchCoordinator {
             return 0;
         };
 
-        let surviving_regions: HashSet<DsfRegion> = surviving
-            .iter()
-            .filter_map(|tile| self.current_plan_regions.get(tile).copied())
+        let touched: HashSet<DsfRegion> = settled
+            .into_iter()
+            .filter_map(|tile| self.current_plan_regions.remove(&tile))
             .collect();
-
-        let fully_filtered: HashSet<DsfRegion> = self
-            .current_plan_regions
-            .values()
-            .copied()
-            .filter(|region| !surviving_regions.contains(region))
-            .filter(|region| !geo_index.contains::<PatchCoverage>(region))
-            .collect();
-
-        if fully_filtered.is_empty() {
+        if touched.is_empty() {
             return 0;
         }
 
-        for region in &fully_filtered {
+        let outstanding: HashSet<DsfRegion> = self.current_plan_regions.values().copied().collect();
+        let complete: Vec<DsfRegion> = touched
+            .into_iter()
+            .filter(|region| !outstanding.contains(region))
+            .filter(|region| !geo_index.contains::<PatchCoverage>(region))
+            .collect();
+
+        for region in &complete {
             self.boundary_strategy.mark_in_progress(region, &geo_index);
         }
-        self.current_plan_regions
-            .retain(|_, region| !fully_filtered.contains(region));
-
-        tracing::debug!(
-            regions_marked = fully_filtered.len(),
-            "Prefetch: marked fully-filtered regions InProgress for disk-verified promotion"
-        );
-        fully_filtered.len()
+        if !complete.is_empty() {
+            tracing::debug!(
+                regions_marked = complete.len(),
+                regions_outstanding = outstanding.len(),
+                "Prefetch: marked regions with every tile settled as InProgress"
+            );
+        }
+        complete.len()
     }
 
     /// Get current status for UI/logging.
@@ -897,6 +894,9 @@ impl AdaptivePrefetchCoordinator {
         if !self.pending_tiles.is_empty() {
             let pending = std::mem::take(&mut self.pending_tiles);
             let pending_before_filter = pending.len();
+            // Kept to settle whatever the re-filter removes: a tile found
+            // cached here will never be submitted, but it is accounted for.
+            let pending_unfiltered = pending.clone();
 
             // Still need to update phase detector for correct state tracking
             self.phase_detector.update(state.ground_speed, msl_ft);
@@ -910,6 +910,13 @@ impl AdaptivePrefetchCoordinator {
             )
             .await;
             let filtered_total = filter_counts.total();
+
+            let surviving: HashSet<TileCoord> = filtered_pending.iter().copied().collect();
+            self.settle_plan_tiles(
+                pending_unfiltered
+                    .into_iter()
+                    .filter(|tile| !surviving.contains(tile)),
+            );
 
             tracing::debug!(
                 pending_before = pending_before_filter,
@@ -4042,6 +4049,123 @@ mod tests {
         assert!(
             count_in_progress_regions(&geo_index) > 0,
             "Regions with all tiles submitted must be marked InProgress",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Mark-after-submit across calls (#296)
+    //
+    // The #172 rule, that a region is marked only once every one of its tiles
+    // has been accepted, must hold over the whole life of a plan, not within a
+    // single `execute()` call. A plan larger than the request channel is cut,
+    // and the remainder is submitted by later `boundary_pending` drains; a
+    // planned tile that filters out as cached is never submitted at all.
+    // Either way the region's tiles are all accounted for, and leaving it
+    // unmarked re-plans it: every tile still queued in the executor passes the
+    // filter and is submitted again.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_region_split_by_channel_is_not_replanned_once_drained() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        // Far below a region's 16 tiles, so every region is split by the cut
+        // and only completes through the pending drain.
+        let client = Arc::new(CapLimitedDdsClient::new(5));
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_scenery_index(wide_scenery_index_at_50_10());
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+        coord.process_telemetry(&state).await;
+        assert!(
+            !coord.pending_tiles.is_empty(),
+            "Precondition: the plan must be cut by the channel"
+        );
+
+        // Drain the remainder, one channel's worth per cycle.
+        for _ in 0..10_000 {
+            if coord.pending_tiles.is_empty() {
+                break;
+            }
+            client.reset();
+            coord.process_telemetry(&state).await;
+        }
+        assert!(
+            coord.pending_tiles.is_empty(),
+            "Precondition: pending must drain"
+        );
+
+        client.reset();
+        coord.process_telemetry(&state).await;
+
+        assert_eq!(
+            client.submitted_count(),
+            0,
+            "Every tile of the box was submitted, so the same box must plan nothing; \
+             resubmitting means the regions were never marked",
+        );
+        assert!(count_in_progress_regions(&geo_index) > 0);
+    }
+
+    #[tokio::test]
+    async fn test_partially_cached_region_is_not_replanned_once_submitted() {
+        use crate::geo_index::GeoIndex;
+
+        let geo_index = Arc::new(GeoIndex::new());
+        let client = Arc::new(CapLimitedDdsClient::new(100_000));
+
+        // Every other tile is already on the DDS disk, so each region is part
+        // cached, part submitted: neither marking path covers it on its own.
+        let scenery_index = wide_scenery_index_at_50_10();
+        let cached = scenery_index
+            .all_tiles()
+            .into_iter()
+            .map(|tile| tile.to_tile_coord())
+            .filter(|tile| tile.row % 2 == 0);
+        let checker: Arc<dyn DdsDiskCacheChecker> = MockDiskChecker::with_tile_coords(cached);
+
+        let config = AdaptivePrefetchConfig {
+            mode: PrefetchMode::Aggressive,
+            ramp_duration: std::time::Duration::from_secs(0),
+            ..Default::default()
+        };
+        let mut coord = AdaptivePrefetchCoordinator::new(config)
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_dds_client(Arc::clone(&client) as Arc<dyn DdsClient>)
+            .with_dds_disk_checker(checker)
+            .with_scenery_index(scenery_index);
+
+        fast_forward_to_cruise(&mut coord);
+        assert_eq!(coord.phase_detector.current_phase(), FlightPhase::Cruise);
+
+        let state = AircraftState::new(50.0, 10.0, 0.0, 200.0, 35000.0, false);
+        let submitted = coord.process_telemetry(&state).await.unwrap_or(0);
+        assert!(submitted > 0, "Precondition: the uncached half must submit");
+        assert!(
+            coord.pending_tiles.is_empty(),
+            "Precondition: the whole plan fits the channel"
+        );
+
+        client.reset();
+        coord.process_telemetry(&state).await;
+
+        assert_eq!(
+            client.submitted_count(),
+            0,
+            "Each region's tiles were either cached or submitted, so the same box \
+             must plan nothing; resubmitting means the regions were never marked",
         );
     }
 

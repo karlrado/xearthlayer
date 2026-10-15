@@ -153,13 +153,16 @@ pub struct PrefetchSettings {
     pub enabled: bool,
     /// Adaptive prefetch mode: "aggressive", "opportunistic", or "disabled"
     ///
-    /// - "aggressive": Position-based triggers (fast connections)
-    /// - "opportunistic": Circuit breaker triggers (default)
+    /// - "aggressive": currently identical to "opportunistic"
+    /// - "opportunistic": prefetch on (default)
     /// - "disabled": Disable prefetch
     pub mode: String,
     /// Web API port for X-Plane SimState polling (default: 8086)
     pub web_api_port: u16,
     /// Interval between prefetch cycles in milliseconds. Default: 2000ms.
+    ///
+    /// Inert: carried into the orchestrator configuration but never read;
+    /// the runner paces cycles with `MIN_CYCLE_INTERVAL`.
     /// Higher values reduce prefetch aggressiveness.
     pub cycle_interval_ms: u64,
     // Transition ramp settings
