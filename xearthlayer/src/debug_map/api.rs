@@ -145,7 +145,7 @@ pub struct StatsInfo {
     pub memory_cache_hit_rate: f64,
     pub tiles_submitted: u64,
     pub deferred_cycles: u64,
-    pub prefetch_mode: String,
+    pub prefetch_state: String,
     pub active_strategy: String,
 }
 
@@ -361,7 +361,7 @@ fn collect_stats(state: &DebugMapState) -> StatsInfo {
         memory_cache_hit_rate: 0.0, // TODO: wire from TelemetrySnapshot when available
         tiles_submitted,
         deferred_cycles,
-        prefetch_mode: format!("{:?}", snapshot.prefetch_mode),
+        prefetch_state: snapshot.prefetch_state.label(),
         active_strategy,
     }
 }

@@ -4,10 +4,11 @@
 //! internal state to the [`SharedPrefetchStatus`] consumed by the dashboard.
 
 use crate::coord::TileCoord;
-use crate::prefetch::state::{DetailedPrefetchStats, SharedPrefetchStatus};
+use crate::prefetch::state::{
+    resolve_state, DetailedPrefetchStats, PrefetchState, SharedPrefetchStatus, StateInputs,
+};
 
 use super::super::calibration::StrategyMode;
-use super::super::phase_detector::FlightPhase;
 use super::super::strategy::PrefetchPlan;
 use super::status::CoordinatorStatus;
 
@@ -38,12 +39,10 @@ pub(crate) fn update_status_with_plan(
 ) {
     shared_status.update_inferred_position(position.0, position.1);
 
-    let prefetch_mode = phase_to_prefetch_mode(coordinator_status.phase);
-    shared_status.update_prefetch_mode(prefetch_mode);
+    shared_status.update_prefetch_state(coordinator_state(coordinator_status, submitted > 0));
+    shared_status.update_phase(coordinator_status.phase);
     shared_status.update_box_extent(coordinator_status.box_extent);
     shared_status.update_box_bounds(coordinator_status.box_bounds);
-
-    let circuit_state = None;
 
     let loading_tiles: Vec<(i32, i32)> = plan
         .tiles
@@ -60,15 +59,12 @@ pub(crate) fn update_status_with_plan(
         tiles_submitted_last_cycle: submitted as u64,
         tiles_submitted_total: stats.total_tiles_submitted,
         cache_hits: stats.total_cache_hits,
-        ttl_skipped: 0,
         active_zoom_levels: {
             let mut zooms: Vec<u8> = plan.tiles.iter().map(|t| t.zoom).collect();
             zooms.sort_unstable();
             zooms.dedup();
             zooms
         },
-        is_active: submitted > 0,
-        circuit_state,
         loading_tiles,
         deferred_cycles: stats.total_deferred_cycles,
     };
@@ -86,30 +82,17 @@ pub(crate) fn update_status_no_plan(
     coordinator_status: &CoordinatorStatus,
     stats: &CycleStats,
 ) {
-    let prefetch_mode = if !coordinator_status.enabled {
-        crate::prefetch::state::PrefetchMode::Idle
-    } else if coordinator_status.throttled {
-        crate::prefetch::state::PrefetchMode::CircuitOpen
-    } else if coordinator_status.mode == StrategyMode::Disabled {
-        crate::prefetch::state::PrefetchMode::Idle
-    } else {
-        phase_to_prefetch_mode(coordinator_status.phase)
-    };
-    shared_status.update_prefetch_mode(prefetch_mode);
+    shared_status.update_prefetch_state(coordinator_state(coordinator_status, false));
+    shared_status.update_phase(coordinator_status.phase);
     shared_status.update_box_extent(coordinator_status.box_extent);
     shared_status.update_box_bounds(coordinator_status.box_bounds);
-
-    let circuit_state = None;
 
     let detailed = DetailedPrefetchStats {
         cycles: stats.total_cycles,
         tiles_submitted_last_cycle: 0,
         tiles_submitted_total: stats.total_tiles_submitted,
         cache_hits: stats.total_cache_hits,
-        ttl_skipped: 0,
         active_zoom_levels: vec![],
-        is_active: false,
-        circuit_state,
         loading_tiles: vec![],
         deferred_cycles: stats.total_deferred_cycles,
     };
@@ -120,18 +103,24 @@ pub(crate) fn update_status_no_plan(
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn phase_to_prefetch_mode(phase: FlightPhase) -> crate::prefetch::state::PrefetchMode {
-    match phase {
-        FlightPhase::Ground => crate::prefetch::state::PrefetchMode::Radial,
-        FlightPhase::Transition => crate::prefetch::state::PrefetchMode::Idle,
-        FlightPhase::Cruise => crate::prefetch::state::PrefetchMode::TileBased,
-    }
+/// The coordinator's view of its state. The demand pause lives with the lane
+/// gate, so the dashboard folds that in from telemetry (`with_lane`).
+fn coordinator_state(status: &CoordinatorStatus, lane_busy: bool) -> PrefetchState {
+    resolve_state(StateInputs {
+        enabled: status.enabled && status.mode != StrategyMode::Disabled,
+        demand_paused: false,
+        phase: status.phase,
+        deferred_last_cycle: status.deferred_last_cycle,
+        throttle_fraction: status.throttle_fraction,
+        lane_busy,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::prefetch::adaptive::coordinator::test_support::test_calibration;
+    use crate::prefetch::adaptive::FlightPhase;
 
     fn test_stats(cycles: u64, submitted: u64, hits: u64, deferred: u64) -> CycleStats {
         CycleStats {
@@ -143,18 +132,24 @@ mod tests {
     }
 
     #[test]
-    fn test_phase_to_prefetch_mode() {
+    fn test_coordinator_state_reflects_deferral_and_ramp() {
+        let mut status = CoordinatorStatus {
+            phase: FlightPhase::Cruise,
+            ..Default::default()
+        };
+        assert_eq!(coordinator_state(&status, false), PrefetchState::Idle);
+        assert_eq!(coordinator_state(&status, true), PrefetchState::Active);
+
+        status.throttle_fraction = Some(0.25);
         assert_eq!(
-            phase_to_prefetch_mode(FlightPhase::Ground),
-            crate::prefetch::state::PrefetchMode::Radial
+            coordinator_state(&status, true),
+            PrefetchState::Ramping { percent: 25 }
         );
+
+        status.deferred_last_cycle = true;
         assert_eq!(
-            phase_to_prefetch_mode(FlightPhase::Transition),
-            crate::prefetch::state::PrefetchMode::Idle
-        );
-        assert_eq!(
-            phase_to_prefetch_mode(FlightPhase::Cruise),
-            crate::prefetch::state::PrefetchMode::TileBased
+            coordinator_state(&status, true),
+            PrefetchState::DeferredLoad
         );
     }
 
@@ -171,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status_no_plan_idle_when_disabled() {
+    fn test_update_status_no_plan_disabled_when_disabled() {
         let status = SharedPrefetchStatus::new();
         let mut coord_status = CoordinatorStatus::default();
         coord_status.enabled = false;
@@ -179,18 +174,15 @@ mod tests {
         update_status_no_plan(&status, &coord_status, &test_stats(0, 0, 0, 0));
 
         let snapshot = status.snapshot();
-        assert_eq!(
-            snapshot.prefetch_mode,
-            crate::prefetch::state::PrefetchMode::Idle
-        );
+        assert_eq!(snapshot.prefetch_state, PrefetchState::Disabled);
     }
 
     #[test]
-    fn test_update_status_no_plan_throttled() {
+    fn test_update_status_no_plan_carries_cycle_stats() {
         let status = SharedPrefetchStatus::new();
         let mut coord_status = CoordinatorStatus::default();
         coord_status.enabled = true;
-        coord_status.throttled = true;
+        coord_status.deferred_last_cycle = true;
 
         update_status_no_plan(&status, &coord_status, &test_stats(5, 100, 50, 2));
 
@@ -234,12 +226,8 @@ mod tests {
         );
 
         let snapshot = status.snapshot();
-        assert_eq!(
-            snapshot.prefetch_mode,
-            crate::prefetch::state::PrefetchMode::TileBased
-        );
+        assert_eq!(snapshot.prefetch_state, PrefetchState::Active);
         let detailed = snapshot.detailed_stats.unwrap();
-        assert!(detailed.is_active);
         assert_eq!(detailed.tiles_submitted_last_cycle, 2);
         assert_eq!(detailed.tiles_submitted_total, 200);
         assert!(!detailed.active_zoom_levels.is_empty());

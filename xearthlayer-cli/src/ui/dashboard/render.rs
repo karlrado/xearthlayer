@@ -37,11 +37,11 @@ use xearthlayer::runtime::{HealthSnapshot, RegionProgressEntry};
 use xearthlayer::update::UpdateInfo;
 
 use super::render_sections::inner_rect;
-use super::state::PrewarmProgress;
+use super::state::{PrefetchLaneConfig, PrewarmProgress};
 use super::utils::format_duration;
 use crate::ui::widgets::{
     AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, InputOutputWidget,
-    NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
+    LaneView, NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 use xearthlayer::aircraft_position::AircraftPositionStatus;
 
@@ -69,6 +69,7 @@ pub fn render_ui(
     prewarm_spinner: Option<char>,
     tile_progress_entries: &[RegionProgressEntry],
     update_info: Option<&UpdateInfo>,
+    prefetch_lane: PrefetchLaneConfig,
 ) {
     let size = frame.area();
 
@@ -76,7 +77,7 @@ pub fn render_ui(
     let mut constraints = vec![
         Constraint::Length(3), // Header
         Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
-        Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
+        Constraint::Length(5), // Prefetch System (3 content lines + border + padding)
         Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
         Constraint::Length(8), // Input/Output (2-column)
         Constraint::Length(6), // Caches
@@ -99,7 +100,7 @@ pub fn render_ui(
     render_aircraft_position(frame, chunks[1], aircraft_position_status);
 
     // 3. Prefetch System (with restored padding)
-    render_prefetch_system(frame, chunks[2], prefetch_snapshot);
+    render_prefetch_system(frame, chunks[2], prefetch_snapshot, snapshot, prefetch_lane);
 
     // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
     let scenery_block = Block::default()
@@ -183,7 +184,13 @@ fn render_aircraft_position(frame: &mut Frame, area: Rect, status: &AircraftPosi
 }
 
 /// Render the prefetch system panel (new in v0.3.0).
-fn render_prefetch_system(frame: &mut Frame, area: Rect, prefetch: &PrefetchStatusSnapshot) {
+fn render_prefetch_system(
+    frame: &mut Frame,
+    area: Rect,
+    prefetch: &PrefetchStatusSnapshot,
+    telemetry: &TelemetrySnapshot,
+    lane_config: PrefetchLaneConfig,
+) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -195,8 +202,28 @@ fn render_prefetch_system(frame: &mut Frame, area: Rect, prefetch: &PrefetchStat
     frame.render_widget(block, area);
     let inner = inner_rect(area, 1, 1);
 
+    // The pause and the lane's occupancy are published by the metrics side;
+    // the coordinator cannot see either.
+    let lane_busy = telemetry.prefetch_lane_load > 0.0 || telemetry.prefetch_lane_queued > 0;
+    let state = prefetch
+        .prefetch_state
+        .with_lane(telemetry.prefetch_paused, lane_busy);
+    let lane = LaneView {
+        running: (telemetry.prefetch_lane_load * lane_config.group as f64).round() as usize,
+        group: lane_config.group,
+        queued: telemetry.prefetch_lane_queued,
+    };
+
     frame.render_widget(
-        PrefetchSystemWidget::new(prefetch.prefetch_mode, prefetch.detailed_stats.as_ref()),
+        PrefetchSystemWidget::new(
+            &state,
+            prefetch.phase,
+            prefetch.detailed_stats.as_ref(),
+            lane,
+            telemetry.fuse_latency.as_ref(),
+            lane_config.generation_timeout,
+        )
+        .with_timeouts(telemetry.fuse_timeouts),
         inner,
     );
 }

@@ -476,6 +476,7 @@ impl AdaptivePrefetchCoordinator {
             self.transition_throttle
                 .on_phase_change(previous_phase, phase);
         }
+        self.refresh_throttle_status();
 
         // Determine if we should prefetch
         let should_prefetch = self.should_prefetch_now(mode);
@@ -694,6 +695,8 @@ impl AdaptivePrefetchCoordinator {
         if result.deferred {
             self.total_deferred_cycles += 1;
         }
+        self.status.deferred_last_cycle = result.deferred;
+        self.refresh_throttle_status();
         if !result.pending.is_empty() {
             self.pending_tiles = result.pending;
         }
@@ -886,6 +889,10 @@ impl AdaptivePrefetchCoordinator {
         let position = (state.latitude, state.longitude);
 
         let msl_ft = state.altitude;
+
+        // A deferral describes the cycle that made it; `execute` sets it again
+        // if this cycle defers too.
+        self.status.deferred_last_cycle = false;
 
         // Always update shared status with current position to show TUI we're receiving telemetry
         // This fixes the bug where prefetch status stayed "Idle" when no plan was generated
@@ -1320,6 +1327,14 @@ impl AdaptivePrefetchCoordinator {
         }
     }
 
+    /// Publish the takeoff throttle's throughput, `None` once it is idle.
+    fn refresh_throttle_status(&mut self) {
+        self.status.throttle_fraction = self
+            .transition_throttle
+            .is_active()
+            .then(|| self.transition_throttle.fraction());
+    }
+
     fn cycle_stats(&self) -> super::status_updater::CycleStats {
         super::status_updater::CycleStats {
             total_cycles: self.total_cycles,
@@ -1737,7 +1752,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_telemetry_updates_status_when_disabled() {
-        use crate::prefetch::state::PrefetchMode as StatePrefetchMode;
+        use crate::prefetch::state::PrefetchState;
 
         let config = AdaptivePrefetchConfig {
             enabled: false,
@@ -1753,9 +1768,9 @@ mod tests {
         let result = coord.process_telemetry(&state).await;
         assert!(result.is_none());
 
-        // Status should be updated to show Idle (since disabled)
+        // Status should be updated to show Disabled
         let snapshot = shared_status.snapshot();
-        assert_eq!(snapshot.prefetch_mode, StatePrefetchMode::Idle);
+        assert_eq!(snapshot.prefetch_state, PrefetchState::Disabled);
 
         // Position should be updated
         assert!(snapshot.aircraft.is_some());
