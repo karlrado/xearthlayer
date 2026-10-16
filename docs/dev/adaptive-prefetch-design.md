@@ -258,9 +258,19 @@ on top, scaled by `prefetch.capacity_share` (default 0.35, range 0.05 to 0.50).
 | Network pool | 60 | 21 | `ceil(demand network x share)` |
 | Disk I/O pool | 64 | 23 | `ceil(demand disk_io x share)` |
 | `tile_generation` group | 512 | 70 | `2 x (prefetch cpu + prefetch network)` |
-| HTTP semaphore | 1,024 | 359 | `ceil(1,024 x share)` |
+| HTTP semaphore | 1,024 | 1,024 | `DEFAULT_MAX_CONCURRENT_HTTP`, not scaled |
 
-The figures are for a 32 core machine at the default share. The tokio blocking pool
+The figures are for a 32 core machine at the default share. The share scales only
+the pools whose work competes with X-Plane for cores: encoding, and the TLS and
+JPEG decoding network tasks do. HTTP connections are not scaled. A connection
+waiting on the network costs the simulator nothing, and prefetch downloads are
+bound by connections in flight: on a 5 Gbit link, a prewarm with 359 permits
+(the share applied to 1,024) moved about 2,000 chunks/s at about 180 ms per
+chunk while CPU sat near 5% and the link near 4%, and raising the permits to
+512 raised the rate in proportion. Before the lanes, prefetch drew on the whole
+shared 1,024, so scaling them made prewarm slower than 0.4.x.
+
+The tokio blocking pool
 covers both lanes: `LaneSizing::blocking_threads_required()` is demand cpu +
 demand disk_io + prefetch cpu + prefetch disk_io + `BLOCKING_POOL_HEADROOM`
 (173 on the reference machine). Admitted prefetch jobs finish after a pause, so

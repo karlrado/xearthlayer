@@ -206,8 +206,8 @@ box_extent = {}
 box_max_bias = {}
 ; Share of the machine given to prefetch, as a fraction of the capacity FUSE
 ; demand gets (default: 0.35, range: 0.05-0.50). Prefetch never delays X-Plane's
-; own tile requests; this sets how much CPU and network it may use alongside the
-; simulator. Lower it if prefetch costs frame rate.
+; own tile requests; this sets how much CPU it may use alongside the simulator.
+; Download connections are not limited by it. Lower it if prefetch costs frame rate.
 capacity_share = {}
 
 [prewarm]

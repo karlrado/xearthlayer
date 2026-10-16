@@ -312,7 +312,8 @@ tuned concurrency limits. The figures below are the **demand lane's**. The prefe
 lane has its own pools, sized by `LaneSizing` (`executor/lane_sizing.rs`) as
 `ceil(demand x prefetch.capacity_share)` per pool (default 0.35, range 0.05 to 0.50,
 the only user-facing sizing setting), `tile_generation = 2 x (prefetch cpu + prefetch network)`
-and `ceil(1024 x share)` HTTP permits. The old shared-pool prefetch quota
+and its own unscaled 1024 HTTP permits (connections cost X-Plane no CPU, and prefetch
+downloads are bound by connections in flight). The old shared-pool prefetch quota
 (`max_prefetch_fraction`, `prefetch_in_flight`) was removed in #296:
 
 - **Network pool (download tasks)**: `clamp(ceil(cpu_capacity * 1.5), 8, 64)` — pipeline-balanced with CPU pool

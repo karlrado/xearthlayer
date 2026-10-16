@@ -1,9 +1,13 @@
 //! Sizes the demand and prefetch lanes (#296).
 //!
 //! Demand keeps the full derived capacity, so prefetch costs FUSE nothing it
-//! would have had with prefetch disabled. The prefetch lane is added on top,
-//! scaled by `prefetch.capacity_share`. The pool formulas themselves stay in
-//! `ResourcePoolConfig::default()` and are not configurable.
+//! would have had with prefetch disabled. The prefetch lane is added on top:
+//! its CPU, network and disk pools are scaled by `prefetch.capacity_share`,
+//! because that work competes with X-Plane for cores. Its HTTP connections
+//! are not scaled, because a connection waiting on the network costs the
+//! simulator nothing and prefetch throughput is bound by connections in
+//! flight. The pool formulas themselves stay in `ResourcePoolConfig::default()`
+//! and are not configurable.
 
 use std::sync::Once;
 
@@ -47,12 +51,18 @@ pub struct LaneSizing {
     pub prefetch: ResourcePoolConfig,
     /// Concurrent prefetch tile jobs allowed in flight.
     pub prefetch_tile_generation: usize,
-    /// Prefetch share of the HTTP connection semaphore.
+    /// The prefetch lane's own HTTP connection semaphore. Not scaled by the
+    /// share: a connection waiting on the network costs X-Plane no CPU, and
+    /// prefetch throughput is bound by connections in flight, so scaling it
+    /// down only slows downloads without protecting the simulator.
     pub prefetch_http_permits: usize,
 }
 
 impl LaneSizing {
-    /// Sizes the prefetch lane as `share` of `demand`, never below one permit.
+    /// Sizes the prefetch lane's CPU, network and disk pools as `share` of
+    /// `demand`, never below one permit. The share limits work that competes
+    /// with X-Plane for cores (encoding, and the TLS and JPEG decoding done
+    /// by network tasks); HTTP connections are sized separately.
     pub fn derive(demand: ResourcePoolConfig, share: f64) -> Self {
         let scale = |n: usize| ((n as f64 * share).ceil() as usize).max(1);
         let prefetch = ResourcePoolConfig::new(
@@ -62,7 +72,7 @@ impl LaneSizing {
         );
         let prefetch_tile_generation = 2 * (prefetch.cpu + prefetch.network);
         Self {
-            prefetch_http_permits: scale(DEFAULT_MAX_CONCURRENT_HTTP),
+            prefetch_http_permits: DEFAULT_MAX_CONCURRENT_HTTP,
             prefetch_tile_generation,
             prefetch,
             demand,
@@ -103,11 +113,31 @@ mod tests {
             (14, 21, 23)
         );
         assert_eq!(sizing.prefetch_tile_generation, 70);
-        assert_eq!(sizing.prefetch_http_permits, 359);
+        assert_eq!(sizing.prefetch_http_permits, DEFAULT_MAX_CONCURRENT_HTTP);
         assert_eq!(
             sizing.blocking_threads_required(),
             40 + 64 + 14 + 23 + BLOCKING_POOL_HEADROOM
         );
+    }
+
+    /// Prefetch downloads are bound by connections in flight, not by anything
+    /// that competes with X-Plane: on a 5 Gbit link a prewarm at share 0.35
+    /// held 359 permits busy at about 180 ms per chunk while CPU sat near 5%
+    /// and the link near 4%, and moved 2.7 times slower than when it had the
+    /// whole shared semaphore. The share sizes CPU-bound work only.
+    #[test]
+    fn http_permits_do_not_scale_with_the_share() {
+        for share in [
+            MIN_PREFETCH_CAPACITY_SHARE,
+            0.35,
+            MAX_PREFETCH_CAPACITY_SHARE,
+        ] {
+            let sizing = LaneSizing::derive(ResourcePoolConfig::new(60, 64, 40), share);
+            assert_eq!(
+                sizing.prefetch_http_permits, DEFAULT_MAX_CONCURRENT_HTTP,
+                "share {share} must not shrink the prefetch lane's connections"
+            );
+        }
     }
 
     #[test]
