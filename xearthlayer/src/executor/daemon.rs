@@ -112,6 +112,16 @@ pub struct ExecutorDaemonConfig {
 
     /// Request channel capacity.
     pub channel_capacity: usize,
+
+    /// Wait for room in the executor's job queue instead of shedding the job.
+    ///
+    /// The prefetch lane sets this: a shed prefetch job is lost without the
+    /// coordinator knowing, which counted its tile as submitted and never asked
+    /// for it again. Waiting holds the daemon instead, the request channel
+    /// fills, and the coordinator sees a full lane and keeps the tile pending.
+    /// The demand lane leaves it off, so a FUSE request on a saturated executor
+    /// is answered at once rather than waiting out its timeout.
+    pub wait_for_executor: bool,
 }
 
 impl Default for ExecutorDaemonConfig {
@@ -119,6 +129,7 @@ impl Default for ExecutorDaemonConfig {
         Self {
             executor: ExecutorConfig::default(),
             channel_capacity: DEFAULT_REQUEST_CHANNEL_CAPACITY,
+            wait_for_executor: false,
         }
     }
 }
@@ -353,6 +364,8 @@ where
 
     /// Counts submitted jobs as FUSE demand (demand lane only).
     demand: Option<DemandTracker>,
+    /// Wait for executor room instead of shedding (prefetch lane only).
+    wait_for_executor: bool,
 }
 
 /// The shared dependencies `run` hands to every request, built once.
@@ -364,6 +377,7 @@ struct RequestContext<'a, F, M, DD> {
     coalescer: &'a Arc<DaemonCoalescer>,
     metrics_client: &'a Option<MetricsClient>,
     demand: &'a Option<DemandTracker>,
+    wait_for_executor: bool,
 }
 
 impl<F, M, DD> ExecutorDaemon<F, M, DD>
@@ -426,6 +440,7 @@ where
             request_rx,
             metrics_client: None,
             demand: None,
+            wait_for_executor: config.wait_for_executor,
         };
 
         (daemon, request_tx)
@@ -469,6 +484,7 @@ where
             request_rx,
             metrics_client: Some(metrics_client),
             demand: None,
+            wait_for_executor: config.wait_for_executor,
         };
 
         (daemon, request_tx)
@@ -528,6 +544,7 @@ where
             mut request_rx,
             metrics_client,
             demand,
+            wait_for_executor,
         } = self;
 
         // Create shared coalescer for daemon-level request deduplication
@@ -541,6 +558,7 @@ where
             coalescer: &coalescer,
             metrics_client: &metrics_client,
             demand: &demand,
+            wait_for_executor,
         };
 
         // Spawn the executor in a separate task
@@ -578,16 +596,21 @@ where
 
     /// Submits `job`, holding a demand guard for as long as it is in flight.
     /// On error the guard is dropped here, which is how the shed and
-    /// failed-submit exits release their demand.
-    fn submit_tracked(
+    /// failed-submit exits release their demand. With `wait_for_executor`
+    /// the submit waits for queue room and never sheds.
+    async fn submit_tracked(
         submitter: &ExecutorSubmitter,
         job: Box<dyn Job>,
         demand: &Option<DemandTracker>,
+        wait_for_executor: bool,
     ) -> Result<(JobHandle, Option<DemandGuard>), SubmitError> {
         let guard = demand.as_ref().map(DemandTracker::begin);
-        submitter
-            .try_submit_boxed(job)
-            .map(|handle| (handle, guard))
+        let submitted = if wait_for_executor {
+            submitter.submit_boxed_waiting(job).await
+        } else {
+            submitter.try_submit_boxed(job)
+        };
+        submitted.map(|handle| (handle, guard))
     }
 
     async fn handle_request(request: JobRequest, ctx: &RequestContext<'_, F, M, DD>) {
@@ -599,6 +622,7 @@ where
             coalescer,
             metrics_client,
             demand,
+            wait_for_executor,
         } = *ctx;
         // The producer's clock, so every duration below counts the time the
         // request sat queued on the channel: X-Plane was already waiting.
@@ -828,10 +852,9 @@ where
         let job_id = job.id();
         debug!(job_id = %job_id, tile = ?tile, "Created DDS generation job");
 
-        let handle = {
-            let _span = tracing::trace_span!(target: "profiling", "job_submit").entered();
-            Self::submit_tracked(submitter, job, demand)
-        };
+        let handle = Self::submit_tracked(submitter, job, demand, wait_for_executor)
+            .instrument(tracing::trace_span!(target: "profiling", "job_submit"))
+            .await;
 
         match handle {
             Ok((mut handle, demand_guard)) => {
@@ -998,9 +1021,12 @@ where
             }
             Err(err) if err.is_back_pressure() => {
                 // Not a failure. The executor's queue is full, so this tile is
-                // shed and will be requested again if it is still wanted. This
-                // is the common case by a wide margin on a slow system, and
-                // reporting it as a possible shutdown told operators their
+                // shed: the requester gets an empty answer now and asks again
+                // if it still wants the tile. Only a daemon without
+                // `wait_for_executor` sheds, which is the demand lane; FUSE
+                // re-requests a tile it still needs. The prefetch lane waits
+                // instead, because nothing re-requested a shed prefetch tile.
+                // Reporting this as a possible shutdown told operators their
                 // executor had died while it was working normally (#272).
                 debug!(
                     tile = ?tile,
@@ -1341,8 +1367,8 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn test_shed_submit_releases_demand() {
+    #[tokio::test]
+    async fn test_shed_submit_releases_demand() {
         let config = ExecutorConfig {
             job_channel_capacity: 1,
             ..Default::default()
@@ -1350,8 +1376,10 @@ mod tests {
         let (executor, submitter) = JobExecutor::new(config);
         let tracker = DemandTracker::new();
         let demand = Some(tracker.clone());
-        let _first = TestDaemon::submit_tracked(&submitter, mock_job(), &demand).unwrap();
-        let shed = TestDaemon::submit_tracked(&submitter, mock_job(), &demand);
+        let _first = TestDaemon::submit_tracked(&submitter, mock_job(), &demand, false)
+            .await
+            .unwrap();
+        let shed = TestDaemon::submit_tracked(&submitter, mock_job(), &demand, false).await;
         assert!(shed
             .err()
             .expect("second submit is shed")
@@ -1360,14 +1388,64 @@ mod tests {
         drop(executor);
     }
 
-    #[test]
-    fn test_failed_submit_releases_demand() {
+    #[tokio::test]
+    async fn test_failed_submit_releases_demand() {
         let (executor, submitter) = JobExecutor::new(Default::default());
         drop(executor);
         let tracker = DemandTracker::new();
-        let result = TestDaemon::submit_tracked(&submitter, mock_job(), &Some(tracker.clone()));
+        let result =
+            TestDaemon::submit_tracked(&submitter, mock_job(), &Some(tracker.clone()), false).await;
         assert!(result.is_err());
         assert_eq!(tracker.in_flight(), 0);
+    }
+
+    /// The prefetch lane waits for room instead of shedding: a shed prefetch
+    /// job was lost without the coordinator knowing, so its tile was counted
+    /// as submitted and never requested again (2,871 sheds on one stressed
+    /// flight, 66 of them later timing out under FUSE). Waiting holds the
+    /// daemon, the lane's request channel fills, and the coordinator keeps
+    /// the tile pending.
+    #[tokio::test]
+    async fn test_waiting_submit_holds_a_job_until_the_executor_has_room() {
+        let config = ExecutorConfig {
+            job_channel_capacity: 1,
+            ..Default::default()
+        };
+        let (mut executor, submitter) = JobExecutor::new(config);
+        let _first = TestDaemon::submit_tracked(&submitter, mock_job(), &None, true)
+            .await
+            .unwrap();
+
+        let waiting_submitter = submitter.clone();
+        let second = tokio::spawn(async move {
+            TestDaemon::submit_tracked(&waiting_submitter, mock_job(), &None, true)
+                .await
+                .map(|_| ())
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !second.is_finished(),
+            "with the channel full, a waiting submit must hold, not shed"
+        );
+
+        executor
+            .job_receiver
+            .recv()
+            .await
+            .expect("first job queued");
+        let accepted = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("room freed, the waiting submit must complete")
+            .unwrap();
+        assert!(accepted.is_ok(), "the held job is accepted, not lost");
+    }
+
+    #[tokio::test]
+    async fn test_waiting_submit_fails_only_when_the_executor_is_gone() {
+        let (executor, submitter) = JobExecutor::new(Default::default());
+        drop(executor);
+        let result = TestDaemon::submit_tracked(&submitter, mock_job(), &None, true).await;
+        assert!(matches!(result, Err(err) if !err.is_back_pressure()));
     }
 
     /// DDS disk cache holding at most one tile, written by the job itself.

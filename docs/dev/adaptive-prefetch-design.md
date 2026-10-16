@@ -294,8 +294,13 @@ pub trait PrefetchLane: Send + Sync {
 per-tile progress: the `LaneReceipt` resolves to a `LaneOutcome` (`Generated`,
 `AlreadyCached`, `Failed`, `Dropped`) and never carries tile bytes. `load()` is
 0.0 to 1.0 and feeds coordinator backpressure: how saturated the lane's queue is,
-measured as jobs waiting for admission against the `tile_generation` group size. `LaneError` is `Full` (retry later)
-or `Closed`. The result of a submission is a complete tile appearing in the
+measured as jobs waiting for admission against the `tile_generation` group size.
+`LaneError` is `Full` (retry later) or `Closed`. A submission the lane accepts is
+never dropped afterwards: the local lane's daemon waits for room in its executor's
+queue instead of shedding, so a saturated executor backs up the request channel,
+`submit` returns `Full`, and the coordinator keeps the tile pending. Shedding there
+used to lose tiles the coordinator had already counted as submitted, and nothing
+asked for them again. The result of a submission is a complete tile appearing in the
 primary's DDS disk cache, which is how the coordinator already learns of completion
 (`promote_completed_regions`). Pause is not a trait method: the lane is built with
 the demand state and stands aside on its own.

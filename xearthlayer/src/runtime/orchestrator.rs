@@ -262,20 +262,8 @@ impl XEarthLayerRuntime {
             None => DemandTracker::new(),
         };
 
-        let mut demand_daemon_config = daemon_config.clone();
-        demand_daemon_config.executor.resource_pools = sizing.demand.clone();
-
-        // The prefetch lane must register the tile-generation group itself:
-        // prefetch jobs declare it, and a job in an unregistered group is
-        // held forever. GC jobs declare no group.
-        let mut prefetch_daemon_config = daemon_config;
-        prefetch_daemon_config.executor = ExecutorConfig {
-            resource_pools: sizing.prefetch.clone(),
-            job_concurrency_limits: JobConcurrencyLimits::empty()
-                .with_group(TILE_GENERATION_GROUP, sizing.prefetch_tile_generation),
-            ..prefetch_daemon_config.executor
-        }
-        .with_admission_gate(demand.subscribe());
+        let (demand_daemon_config, prefetch_daemon_config) =
+            Self::lane_daemon_configs(daemon_config, &sizing, demand.subscribe());
 
         let (demand_daemon, demand_tx) = Self::build_daemon(
             demand_daemon_config,
@@ -360,6 +348,33 @@ impl XEarthLayerRuntime {
             shutdown_token,
             tile_progress_tracker,
         }
+    }
+
+    /// Daemon configuration for each lane, from the shared base.
+    ///
+    /// The prefetch lane is gated by demand, sized by the share, registers its
+    /// own tile-generation group (prefetch jobs declare it, and a job in an
+    /// unregistered group is held forever; GC jobs declare no group), and
+    /// waits for executor room so it never sheds a job the coordinator counts
+    /// as submitted.
+    fn lane_daemon_configs(
+        daemon_config: ExecutorDaemonConfig,
+        sizing: &LaneSizing,
+        gate: tokio::sync::watch::Receiver<bool>,
+    ) -> (ExecutorDaemonConfig, ExecutorDaemonConfig) {
+        let mut demand = daemon_config.clone();
+        demand.executor.resource_pools = sizing.demand.clone();
+
+        let mut prefetch = daemon_config;
+        prefetch.executor = ExecutorConfig {
+            resource_pools: sizing.prefetch.clone(),
+            job_concurrency_limits: JobConcurrencyLimits::empty()
+                .with_group(TILE_GENERATION_GROUP, sizing.prefetch_tile_generation),
+            ..prefetch.executor
+        }
+        .with_admission_gate(gate);
+        prefetch.wait_for_executor = true;
+        (demand, prefetch)
     }
 
     fn build_daemon<F, M, DD>(
@@ -475,6 +490,24 @@ impl XEarthLayerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the prefetch lane waits for executor room. The demand lane keeps
+    /// shedding, so a FUSE request on a saturated executor gets its answer at
+    /// once instead of waiting out the generation timeout behind it.
+    #[test]
+    fn only_the_prefetch_lane_waits_for_executor_room() {
+        let sizing = LaneSizing::from_configured_share(0.35);
+        let (_gate_tx, gate) = tokio::sync::watch::channel(false);
+        let (demand, prefetch) =
+            XEarthLayerRuntime::lane_daemon_configs(ExecutorDaemonConfig::default(), &sizing, gate);
+        assert!(prefetch.wait_for_executor, "prefetch must never lose a job");
+        assert!(
+            !demand.wait_for_executor,
+            "demand keeps its existing behaviour"
+        );
+        assert!(prefetch.executor.admission_gate.is_some());
+        assert!(demand.executor.admission_gate.is_none());
+    }
     use crate::coord::TileCoord;
     use crate::executor::{
         Job, JobId, JobResult, JobStatus, NullDdsDiskCache, Priority, ResourcePoolConfig,
