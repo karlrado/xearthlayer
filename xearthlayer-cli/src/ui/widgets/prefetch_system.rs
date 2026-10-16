@@ -183,20 +183,21 @@ impl<'a> PrefetchSystemWidget<'a> {
         ];
         // The share keeps the neutral style so it never competes with the
         // amber or red of the latency figures.
-        let mut tail = String::new();
         if let Some(share) = share {
-            tail.push_str(&format!(" │ {share} cached"));
+            spans.push(Span::styled(format!(" │ {share} cached"), neutral));
         }
+        // Timeouts stay amber whatever the latency colour: each one handed
+        // X-Plane a placeholder, so the count must not read as routine.
         if self.timeouts > 0 {
             let noun = if self.timeouts == 1 {
                 "timeout"
             } else {
                 "timeouts"
             };
-            tail.push_str(&format!(" │ {} {noun}", self.timeouts));
-        }
-        if !tail.is_empty() {
-            spans.push(Span::styled(tail, neutral));
+            spans.push(Span::styled(
+                format!(" │ {} {noun}", self.timeouts),
+                Style::default().fg(Color::Yellow),
+            ));
         }
         Line::from(spans)
     }
@@ -404,6 +405,19 @@ mod tests {
             out.contains("97% cached │ 2 timeouts"),
             "timeouts stay last, got:\n{out}"
         );
+    }
+
+    #[test]
+    fn timeouts_are_amber_while_the_share_stays_neutral() {
+        let state = PrefetchState::Active;
+        let s = summary(180, 1_400, 3_900);
+        let (buf, out) = render(
+            widget(&state, Some(&s))
+                .with_cache_served(97, 3)
+                .with_timeouts(2),
+        );
+        assert_eq!(latency_fg(&buf, &out, "2 timeouts"), Color::Yellow);
+        assert_ne!(latency_fg(&buf, &out, "97% cached"), Color::Yellow);
     }
 
     #[test]
