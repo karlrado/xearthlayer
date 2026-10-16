@@ -771,7 +771,8 @@ impl MountManager {
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
             fuse_latency: None,
-            fuse_timeouts: 0,
+            fuse_session_latency: None,
+            fuse_session_timeouts: 0,
             demand_in_flight: 0,
             prefetch_paused: false,
             prefetch_lane_load: 0.0,
@@ -854,7 +855,9 @@ impl MountManager {
             // consolidated service has real values. Latency is not summable,
             // so take the first sample present rather than a blend.
             total.fuse_latency = total.fuse_latency.or(snapshot.fuse_latency);
-            total.fuse_timeouts += snapshot.fuse_timeouts;
+            total.fuse_session_latency =
+                total.fuse_session_latency.or(snapshot.fuse_session_latency);
+            total.fuse_session_timeouts += snapshot.fuse_session_timeouts;
             total.demand_in_flight += snapshot.demand_in_flight;
             total.prefetch_paused |= snapshot.prefetch_paused;
             total.prefetch_lane_load = total.prefetch_lane_load.max(snapshot.prefetch_lane_load);

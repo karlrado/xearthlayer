@@ -622,6 +622,16 @@ The lane fields (#296) are the no-harm instrument:
   admission, by a full group or by the demand pause, which is where work sits
   while demand has the lane paused.
 
+The TUI shows the same latency over the whole session instead of one sample, so
+the line is not blank at cruise, where most samples have no generations. The
+median, 95th percentile and maximum come from a fixed-size log-spaced histogram
+(about 5% relative width, 1 ms to 10 minutes, longer waits in the top bucket;
+the maximum and count are exact) fed by the same FUSE waits as the per-sample
+window, and the timeout count is the session total, shown when non-zero. The
+line's colour comes from the most recent sample that had generations, held
+across empty samples, so one early stall does not keep it red all flight. The
+log fields above are unchanged.
+
 To compare prefetch on and off, run the same route with `prefetch.enabled = true`
 and `false` and compare `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
 `fuse_timeouts` across the samples.

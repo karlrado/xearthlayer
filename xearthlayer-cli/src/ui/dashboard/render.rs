@@ -220,10 +220,11 @@ fn render_prefetch_system(
             prefetch.state_inputs.phase,
             prefetch.detailed_stats.as_ref(),
             lane,
-            telemetry.fuse_latency.as_ref(),
+            telemetry.fuse_session_latency.as_ref(),
             lane_config.generation_timeout,
         )
-        .with_timeouts(telemetry.fuse_timeouts),
+        .with_recent(telemetry.fuse_latency.as_ref())
+        .with_timeouts(telemetry.fuse_session_timeouts),
         inner,
     );
 }

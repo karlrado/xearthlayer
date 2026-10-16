@@ -14,7 +14,7 @@
 //! processing events. This ensures reporters never block event processing.
 
 use super::event::MetricEvent;
-use super::latency::LatencyWindow;
+use super::latency::{LatencyHistogram, LatencyWindow};
 use super::memory_probe::{MemoryProbe, ProcessMemoryProbe};
 use super::state::{AggregatedState, TimeSeriesHistory, DEFAULT_HISTORY_CAPACITY};
 use crate::cache::DiskTier;
@@ -80,6 +80,9 @@ pub struct MetricsDaemon {
     /// FUSE requests abandoned at the timeout since the last Prefetch sample.
     fuse_timeouts_in_window: usize,
 
+    /// Every FUSE generation latency since start, in fixed memory.
+    fuse_session_latency: LatencyHistogram,
+
     /// Probe for reading process memory.
     memory_probe: Arc<dyn MemoryProbe>,
 
@@ -120,6 +123,7 @@ impl MetricsDaemon {
             last_fuse_completed: 0,
             fuse_latency_window: LatencyWindow::default(),
             fuse_timeouts_in_window: 0,
+            fuse_session_latency: LatencyHistogram::default(),
             memory_probe,
             memory_probe_failed: false,
         }
@@ -294,6 +298,7 @@ impl MetricsDaemon {
                 // emit JobCompleted.
                 if is_fuse {
                     self.fuse_latency_window.record(duration_us);
+                    self.fuse_session_latency.record(duration_us);
                 }
                 if success {
                     self.state.jobs_completed += 1;
@@ -310,7 +315,9 @@ impl MetricsDaemon {
                 // The stall is the latency the no-harm measure exists to
                 // see; leaving it out would cap max at the timeout.
                 self.fuse_latency_window.record(duration_us);
+                self.fuse_session_latency.record(duration_us);
                 self.fuse_timeouts_in_window += 1;
+                self.state.fuse_session_timeouts += 1;
             }
 
             // Encode events
@@ -546,9 +553,11 @@ impl MetricsDaemon {
     fn log_prefetch_sample(&mut self) {
         // Close this sample's windows before borrowing state for the line.
         let latency = self.fuse_latency_window.take();
-        self.state.fuse_latency = latency;
+        // An empty sample must not blank the line's colour source.
+        if latency.is_some() {
+            self.state.fuse_latency = latency;
+        }
         let timeouts = std::mem::take(&mut self.fuse_timeouts_in_window);
-        self.state.fuse_timeouts = timeouts;
         let now = Instant::now();
         let mut paused = std::mem::take(&mut self.state.prefetch_paused_accum);
         if let Some(since) = self.state.prefetch_paused_since {
@@ -664,9 +673,18 @@ impl MetricsDaemon {
     }
 
     /// Updates the shared state for reporters to read.
+    /// The state as published: the running state plus the session figures,
+    /// which are summarised here rather than on every event.
+    fn published_state(&self) -> AggregatedState {
+        let mut state = self.state.clone();
+        state.fuse_session_latency = self.fuse_session_latency.summary();
+        state
+    }
+
     fn update_shared_state(&self) {
+        let published = self.published_state();
         if let Ok(mut guard) = self.shared_state.write() {
-            guard.state = self.state.clone();
+            guard.state = published;
             guard.history = self.history.clone();
         }
     }
@@ -1675,7 +1693,7 @@ mod tests {
         assert_eq!(sample_field(&events, "fuse_latency_max_ms"), Some("10000"));
         assert_eq!(sample_field(&events, "fuse_latency_count"), Some("2"));
         assert_eq!(sample_field(&events, "fuse_timeouts"), Some("1"));
-        assert_eq!(daemon.state.fuse_timeouts, 1);
+        assert_eq!(daemon.state.fuse_session_timeouts, 1);
 
         let events = capture_events(|| daemon.log_prefetch_sample());
         assert_eq!(
@@ -1683,6 +1701,52 @@ mod tests {
             Some("0"),
             "a delta per sample, not cumulative"
         );
+    }
+
+    #[test]
+    fn test_session_latency_survives_empty_samples_and_recent_is_held() {
+        let (mut daemon, _tx) = create_daemon();
+        for ms in 1..=100 {
+            fuse_done(&mut daemon, ms, true, true);
+        }
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 10_000_000,
+        });
+        capture_events(|| daemon.log_prefetch_sample());
+        let recent = daemon.state.fuse_latency;
+        assert_eq!(recent.map(|s| s.count), Some(101));
+
+        capture_events(|| daemon.log_prefetch_sample());
+        capture_events(|| daemon.log_prefetch_sample());
+        let published = daemon.published_state();
+        assert_eq!(published.fuse_latency, recent, "empty samples keep recent");
+        let session = published.fuse_session_latency.expect("session figures");
+        assert_eq!((session.count, session.max_us), (101, 10_000_000));
+        assert_eq!(published.fuse_session_timeouts, 1);
+
+        for ms in [20, 30] {
+            fuse_done(&mut daemon, ms, true, true);
+        }
+        daemon.process_event(MetricEvent::JobTimedOut {
+            duration_us: 11_000_000,
+        });
+        let events = capture_events(|| daemon.log_prefetch_sample());
+        assert_eq!(sample_field(&events, "fuse_timeouts"), Some("1"));
+        let published = daemon.published_state();
+        assert_eq!(published.fuse_latency.map(|s| s.count), Some(3));
+        let session = published.fuse_session_latency.unwrap();
+        assert_eq!((session.count, session.max_us), (104, 11_000_000));
+        assert_eq!(published.fuse_session_timeouts, 2, "accumulates");
+    }
+
+    #[test]
+    fn test_session_latency_is_live_between_samples() {
+        let (mut daemon, _tx) = create_daemon();
+        assert!(daemon.published_state().fuse_session_latency.is_none());
+        fuse_done(&mut daemon, 40, true, true);
+        fuse_done(&mut daemon, 9_000, true, false);
+        let session = daemon.published_state().fuse_session_latency.unwrap();
+        assert_eq!((session.count, session.max_us), (1, 40_000));
     }
 
     #[test]

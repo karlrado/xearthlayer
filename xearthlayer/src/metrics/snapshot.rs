@@ -140,11 +140,13 @@ pub struct TelemetrySnapshot {
     pub total_encode_time_ms: u64,
 
     // === Lane metrics (#296) ===
-    /// FUSE generation latency over the last completed 60 s sample, cache
-    /// hits excluded. `None` until a sample closes with at least one job.
+    /// FUSE generation latency of the most recent 60 s sample that had any,
+    /// cache hits excluded. Held across empty samples; `None` until one closes.
     pub fuse_latency: Option<LatencySummary>,
-    /// FUSE requests abandoned at the timeout in the last closed sample.
-    pub fuse_timeouts: usize,
+    /// FUSE generation latency since start. `None` until the first generation.
+    pub fuse_session_latency: Option<LatencySummary>,
+    /// FUSE requests abandoned at the timeout since start.
+    pub fuse_session_timeouts: usize,
     /// FUSE demand jobs in flight
     pub demand_in_flight: usize,
     /// True while the prefetch lane stands aside for demand
@@ -210,7 +212,8 @@ impl Default for TelemetrySnapshot {
             total_assembly_time_ms: 0,
             total_encode_time_ms: 0,
             fuse_latency: None,
-            fuse_timeouts: 0,
+            fuse_session_latency: None,
+            fuse_session_timeouts: 0,
             demand_in_flight: 0,
             prefetch_paused: false,
             prefetch_lane_load: 0.0,

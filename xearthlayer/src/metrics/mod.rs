@@ -20,7 +20,7 @@ mod system;
 pub use client::MetricsClient;
 pub use daemon::{MetricsDaemon, MetricsStateSnapshot, SharedMetricsState};
 pub use event::MetricEvent;
-pub use latency::{LatencySummary, LatencyWindow};
+pub use latency::{LatencyHistogram, LatencySummary, LatencyWindow};
 pub use memory_probe::{
     configure_allocator, log_allocator_environment, log_malloc_trim_at_shutdown, AllocatorConfig,
     AllocatorSample, MemoryProbe, MemorySample, ProcessMemoryProbe,

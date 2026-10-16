@@ -1,8 +1,8 @@
 //! Prefetch system status widget.
 //!
 //! Three lines: the prefetcher's state with its flight phase and cycle size,
-//! the prefetch lane's load and backlog, and the FUSE generation latency of
-//! the last sample (coloured against the generation timeout).
+//! the prefetch lane's load and backlog, and the session FUSE generation
+//! latency (coloured from the latest sample against the generation timeout).
 
 use std::time::Duration;
 
@@ -34,6 +34,7 @@ pub struct PrefetchSystemWidget<'a> {
     stats: Option<&'a DetailedPrefetchStats>,
     lane: LaneView,
     latency: Option<&'a LatencySummary>,
+    recent: Option<&'a LatencySummary>,
     generation_timeout: Duration,
     timeouts: usize,
 }
@@ -53,12 +54,21 @@ impl<'a> PrefetchSystemWidget<'a> {
             stats,
             lane,
             latency,
+            recent: None,
             generation_timeout,
             timeouts: 0,
         }
     }
 
-    /// FUSE waits that hit the generation timeout in the sample. Shown only
+    /// The most recent sample that had FUSE generations. The colour comes
+    /// from it so one early stall does not keep the session line red; until
+    /// the first sample closes the session figures colour the line.
+    pub fn with_recent(mut self, recent: Option<&'a LatencySummary>) -> Self {
+        self.recent = recent;
+        self
+    }
+
+    /// FUSE waits that hit the generation timeout this session. Shown only
     /// when non-zero: the no-harm bar counts them.
     pub fn with_timeouts(mut self, timeouts: usize) -> Self {
         self.timeouts = timeouts;
@@ -125,10 +135,7 @@ impl<'a> PrefetchSystemWidget<'a> {
         let Some(summary) = self.latency else {
             return Line::from(vec![
                 label,
-                Span::styled(
-                    "no FUSE generations this sample",
-                    Style::default().fg(LABEL_COLOR),
-                ),
+                Span::styled("no FUSE generations yet", Style::default().fg(LABEL_COLOR)),
             ]);
         };
         let mut text = format!(
@@ -147,7 +154,10 @@ impl<'a> PrefetchSystemWidget<'a> {
         }
         Line::from(vec![
             label,
-            Span::styled(text, Style::default().fg(self.latency_color(summary))),
+            Span::styled(
+                text,
+                Style::default().fg(self.latency_color(self.recent.unwrap_or(summary))),
+            ),
         ])
     }
 }
@@ -290,11 +300,26 @@ mod tests {
     }
 
     #[test]
+    fn numbers_come_from_session_and_colour_from_recent() {
+        let state = PrefetchState::Active;
+        let session = summary(100, 6_000, 12_000);
+        let recent = summary(90, 400, 900);
+        let (buf, out) = render(widget(&state, Some(&session)).with_recent(Some(&recent)));
+        assert!(out.contains("max 12.0s"), "got:\n{out}");
+        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Green);
+
+        let bad_recent = summary(100, 6_000, 11_000);
+        let calm_session = summary(100, 800, 2_000);
+        let (buf, out) = render(widget(&state, Some(&calm_session)).with_recent(Some(&bad_recent)));
+        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Red);
+    }
+
+    #[test]
     fn renders_a_placeholder_without_a_sample() {
         let state = PrefetchState::Idle;
         let (_, out) = render(widget(&state, None));
         assert!(
-            out.contains("Latency:  no FUSE generations this sample"),
+            out.contains("Latency:  no FUSE generations yet"),
             "got:\n{out}"
         );
     }
