@@ -607,8 +607,10 @@ The lane fields (#296) are the no-harm instrument:
 - `fuse_latency_p50_ms`, `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
   `fuse_latency_count` describe FUSE demand-generation latency over this sample
   only. Cache hits are excluded. Zeros mean no generation completed in the window.
-- `fuse_timeouts` is per sample: requests abandoned at the FUSE timeout. Their wait
-  is inside the latency figures.
+- `fuse_timeouts` is per sample: requests abandoned at the FUSE timeout, including
+  those that timed out while still queued for the demand lane, before any job
+  started. Their wait, measured from when FUSE made the request, is inside the
+  latency figures.
 - `demand_in_flight` is a gauge of demand jobs running now.
 - `prefetch_paused_secs` is how long the prefetch lane stood aside for demand
   during this sample.

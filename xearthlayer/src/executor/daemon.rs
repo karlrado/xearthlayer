@@ -626,6 +626,15 @@ where
         // Check for cancellation first
         if request.cancellation.is_cancelled() {
             debug!(tile = ?tile, "Request already cancelled");
+            // A FUSE request cancelled before the daemon reached it timed out
+            // while queued on the channel. X-Plane waited the whole time, so
+            // it is reported like any other FUSE timeout; otherwise queue
+            // stalls would vanish from the no-harm measure.
+            if origin.is_fuse() {
+                if let Some(client) = metrics_client {
+                    client.job_timed_out(start.elapsed().as_micros() as u64);
+                }
+            }
             if let Some(tx) = request.response_tx {
                 let _ = tx.send(DdsResponse::empty(start.elapsed()));
             }
@@ -1537,6 +1546,65 @@ mod tests {
         assert!(
             latency >= QUEUED,
             "latency {latency:?} must include the {QUEUED:?} the request sat queued"
+        );
+
+        shutdown.cancel();
+        let _ = run.await;
+    }
+
+    /// A FUSE request can time out while still queued on the demand channel,
+    /// before the daemon reaches it. X-Plane waited the whole time and got a
+    /// placeholder, so it is a timeout like any other: if it went unreported,
+    /// queue stalls would vanish from the no-harm measure.
+    #[tokio::test]
+    async fn test_fuse_request_cancelled_while_queued_reports_a_timeout() {
+        use crate::metrics::MetricEvent;
+        const QUEUED: Duration = Duration::from_millis(150);
+
+        let (metrics_tx, mut metrics_rx) = mpsc::unbounded_channel();
+        let (daemon, tx) = ExecutorDaemon::with_metrics_client(
+            ExecutorDaemonConfig::default(),
+            Arc::new(MockJobFactory::new()),
+            Arc::new(MockMemoryCache::new()),
+            Arc::new(super::super::NullDdsDiskCache),
+            Arc::new(crate::executor::NullTelemetrySink),
+            MetricsClient::new(metrics_tx),
+        );
+        let shutdown = CancellationToken::new();
+        let run = tokio::spawn(daemon.run(shutdown.clone()));
+
+        let fuse_token = CancellationToken::new();
+        let (fuse_request, fuse_rx) = JobRequest::fuse(test_tile(), fuse_token.clone());
+        let prefetch_token = CancellationToken::new();
+        let prefetch_request = JobRequest {
+            cancellation: prefetch_token.clone(),
+            ..JobRequest::prefetch(TileCoord {
+                row: 101,
+                ..test_tile()
+            })
+        };
+        tokio::time::sleep(QUEUED).await;
+        fuse_token.cancel();
+        prefetch_token.cancel();
+        tx.send(fuse_request).await.unwrap();
+        tx.send(prefetch_request).await.unwrap();
+        assert!(!fuse_rx.await.unwrap().is_success());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let timeouts: Vec<u64> = std::iter::from_fn(|| metrics_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                MetricEvent::JobTimedOut { duration_us } => Some(duration_us),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            timeouts.len(),
+            1,
+            "the queued FUSE request is one timeout; a cancelled prefetch request is none"
+        );
+        assert!(
+            Duration::from_micros(timeouts[0]) >= QUEUED,
+            "the timeout must carry the {QUEUED:?} the request sat queued"
         );
 
         shutdown.cancel();
