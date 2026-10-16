@@ -632,6 +632,18 @@ line's colour comes from the most recent sample that had generations, held
 across empty samples, so one early stall does not keep it red all flight. The
 log fields above are unchanged.
 
+The latency figures cover generations only: a cache hit never waits on a lane,
+and counting it would swamp the percentiles with near-zero waits. That leaves
+the line empty on a well-prefetched flight, which reads as a broken component,
+so it also shows the session cached share: FUSE requests served from the memory
+or DDS disk cache, over those plus FUSE generations (`fuse_jobs_submitted`).
+Requests coalesced onto an in-flight job and all prefetch traffic are excluded.
+The share is a whole percent, shown as `>99%` when some request was generated
+but the rounded value would read 100. It uses the line's neutral style, so it
+never competes with the amber or red of the latency figures. With no FUSE
+request yet the line reads `no FUSE requests yet`; with requests but no
+generations it reads `no FUSE generations yet │ 100% cached`.
+
 To compare prefetch on and off, run the same route with `prefetch.enabled = true`
 and `false` and compare `fuse_latency_p95_ms`, `fuse_latency_max_ms` and
 `fuse_timeouts` across the samples.

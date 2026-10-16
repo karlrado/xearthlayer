@@ -1740,6 +1740,34 @@ mod tests {
     }
 
     #[test]
+    fn test_cache_served_counts_are_fuse_only_and_survive_empty_samples() {
+        let (mut daemon, _tx) = create_daemon();
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: true });
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: true });
+        daemon.process_event(MetricEvent::DdsDiskCacheHit {
+            bytes: 10,
+            is_fuse: true,
+        });
+        // Prefetch-origin hits and submissions must not count.
+        daemon.process_event(MetricEvent::MemoryCacheHit { is_fuse: false });
+        daemon.process_event(MetricEvent::DdsDiskCacheHit {
+            bytes: 10,
+            is_fuse: false,
+        });
+        daemon.process_event(MetricEvent::JobSubmitted { is_fuse: true });
+        daemon.process_event(MetricEvent::JobSubmitted { is_fuse: false });
+
+        capture_events(|| daemon.log_prefetch_sample());
+        capture_events(|| daemon.log_prefetch_sample());
+        let published = daemon.published_state();
+        assert_eq!(
+            published.fuse_memory_cache_hits + published.fuse_dds_disk_cache_hits,
+            3
+        );
+        assert_eq!(published.fuse_jobs_submitted, 1);
+    }
+
+    #[test]
     fn test_session_latency_is_live_between_samples() {
         let (mut daemon, _tx) = create_daemon();
         assert!(daemon.published_state().fuse_session_latency.is_none());

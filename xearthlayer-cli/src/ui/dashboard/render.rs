@@ -224,7 +224,11 @@ fn render_prefetch_system(
             lane_config.generation_timeout,
         )
         .with_recent(telemetry.fuse_latency.as_ref())
-        .with_timeouts(telemetry.fuse_session_timeouts),
+        .with_timeouts(telemetry.fuse_session_timeouts)
+        .with_cache_served(
+            telemetry.fuse_memory_cache_hits + telemetry.fuse_dds_disk_cache_hits,
+            telemetry.fuse_jobs_submitted,
+        ),
         inner,
     );
 }

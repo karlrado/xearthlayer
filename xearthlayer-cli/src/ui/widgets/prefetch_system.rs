@@ -37,6 +37,8 @@ pub struct PrefetchSystemWidget<'a> {
     recent: Option<&'a LatencySummary>,
     generation_timeout: Duration,
     timeouts: usize,
+    cached: u64,
+    generated: u64,
 }
 
 impl<'a> PrefetchSystemWidget<'a> {
@@ -57,6 +59,8 @@ impl<'a> PrefetchSystemWidget<'a> {
             recent: None,
             generation_timeout,
             timeouts: 0,
+            cached: 0,
+            generated: 0,
         }
     }
 
@@ -73,6 +77,29 @@ impl<'a> PrefetchSystemWidget<'a> {
     pub fn with_timeouts(mut self, timeouts: usize) -> Self {
         self.timeouts = timeouts;
         self
+    }
+
+    /// Session FUSE requests served from cache against those that needed a
+    /// generation. Latency covers generations only, so without this the line
+    /// is empty on a well-prefetched flight and reads as a broken component.
+    pub fn with_cache_served(mut self, cached: u64, generated: u64) -> Self {
+        self.cached = cached;
+        self.generated = generated;
+        self
+    }
+
+    /// Whole percent, but never 100 unless every request was cache-served.
+    fn cached_share(&self) -> Option<String> {
+        let total = self.cached + self.generated;
+        if total == 0 {
+            return None;
+        }
+        let pct = (self.cached as f64 * 100.0 / total as f64).round() as u64;
+        Some(if pct >= 100 && self.generated > 0 {
+            ">99%".to_string()
+        } else {
+            format!("{pct}%")
+        })
     }
 
     fn state_color(&self) -> Color {
@@ -132,33 +159,46 @@ impl<'a> PrefetchSystemWidget<'a> {
 
     fn latency_line(&self) -> Line<'static> {
         let label = Span::styled("   Latency:  ", Style::default().fg(LABEL_COLOR));
+        let neutral = Style::default().fg(LABEL_COLOR);
+        let share = self.cached_share();
         let Some(summary) = self.latency else {
-            return Line::from(vec![
-                label,
-                Span::styled("no FUSE generations yet", Style::default().fg(LABEL_COLOR)),
-            ]);
+            let text = match &share {
+                None => "no FUSE requests yet".to_string(),
+                Some(share) => format!("no FUSE generations yet │ {share} cached"),
+            };
+            return Line::from(vec![label, Span::styled(text, neutral)]);
         };
-        let mut text = format!(
+        let figures = format!(
             "p50 {} │ p95 {} │ max {}",
             format_latency(summary.median_us),
             format_latency(summary.p95_us),
             format_latency(summary.max_us)
         );
+        let mut spans = vec![
+            label,
+            Span::styled(
+                figures,
+                Style::default().fg(self.latency_color(self.recent.unwrap_or(summary))),
+            ),
+        ];
+        // The share keeps the neutral style so it never competes with the
+        // amber or red of the latency figures.
+        let mut tail = String::new();
+        if let Some(share) = share {
+            tail.push_str(&format!(" │ {share} cached"));
+        }
         if self.timeouts > 0 {
             let noun = if self.timeouts == 1 {
                 "timeout"
             } else {
                 "timeouts"
             };
-            text.push_str(&format!(" │ {} {noun}", self.timeouts));
+            tail.push_str(&format!(" │ {} {noun}", self.timeouts));
         }
-        Line::from(vec![
-            label,
-            Span::styled(
-                text,
-                Style::default().fg(self.latency_color(self.recent.unwrap_or(summary))),
-            ),
-        ])
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, neutral));
+        }
+        Line::from(spans)
     }
 }
 
@@ -317,11 +357,73 @@ mod tests {
     #[test]
     fn renders_a_placeholder_without_a_sample() {
         let state = PrefetchState::Idle;
-        let (_, out) = render(widget(&state, None));
+        let (_, out) = render(widget(&state, None).with_cache_served(5, 0));
         assert!(
             out.contains("Latency:  no FUSE generations yet"),
             "got:\n{out}"
         );
+    }
+
+    #[test]
+    fn renders_no_requests_before_any_fuse_request() {
+        let state = PrefetchState::Idle;
+        let (_, out) = render(widget(&state, None));
+        assert!(
+            out.contains("Latency:  no FUSE requests yet"),
+            "got:\n{out}"
+        );
+        assert!(!out.contains("cached"), "got:\n{out}");
+    }
+
+    #[test]
+    fn renders_fully_cached_when_requests_need_no_generation() {
+        let state = PrefetchState::Idle;
+        let (_, out) = render(widget(&state, None).with_cache_served(250, 0));
+        assert!(
+            out.contains("Latency:  no FUSE generations yet │ 100% cached"),
+            "got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn renders_the_cached_share_after_the_latency_figures() {
+        let state = PrefetchState::Active;
+        let s = summary(180, 1_400, 3_900);
+        let (_, out) = render(widget(&state, Some(&s)).with_cache_served(97, 3));
+        assert!(
+            out.contains("p50 180ms │ p95 1.4s │ max 3.9s │ 97% cached"),
+            "got:\n{out}"
+        );
+
+        let (_, out) = render(
+            widget(&state, Some(&s))
+                .with_cache_served(97, 3)
+                .with_timeouts(2),
+        );
+        assert!(
+            out.contains("97% cached │ 2 timeouts"),
+            "timeouts stay last, got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn never_rounds_a_partial_share_up_to_100() {
+        let state = PrefetchState::Active;
+        let s = summary(100, 200, 300);
+        let (_, out) = render(widget(&state, Some(&s)).with_cache_served(999, 1));
+        assert!(out.contains(">99% cached"), "got:\n{out}");
+        assert!(!out.contains("100% cached"), "got:\n{out}");
+    }
+
+    #[test]
+    fn cached_segment_stays_neutral_when_latency_is_amber_or_red() {
+        let state = PrefetchState::Active;
+        for (p95, max, expected) in [(800, 6_000, Color::Yellow), (800, 11_000, Color::Red)] {
+            let s = summary(100, p95, max);
+            let (buf, out) = render(widget(&state, Some(&s)).with_cache_served(90, 10));
+            assert_eq!(latency_fg(&buf, &out, "p50"), expected);
+            assert_eq!(latency_fg(&buf, &out, "90% cached"), LABEL_COLOR);
+        }
     }
 
     #[test]
