@@ -672,7 +672,6 @@ impl MetricsDaemon {
         self.last_sample = now;
     }
 
-    /// Updates the shared state for reporters to read.
     /// The state as published: the running state plus the session figures,
     /// which are summarised here rather than on every event.
     fn published_state(&self) -> AggregatedState {
@@ -681,6 +680,7 @@ impl MetricsDaemon {
         state
     }
 
+    /// Updates the shared state for reporters to read.
     fn update_shared_state(&self) {
         let published = self.published_state();
         if let Ok(mut guard) = self.shared_state.write() {
