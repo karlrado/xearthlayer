@@ -76,7 +76,7 @@ pub fn raw_chunk_validator() -> MagicAndSize {
 /// reaches 1, and sizing every level as `blocks_wide * blocks_high * 8`. The
 /// `div_ceil` matters for the tail: 4×4, 2×2 and 1×1 each still occupy one
 /// whole 8-byte block, which the naive `w * h / 2` under-counts.
-const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
+pub(crate) const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
     const HEADER_BYTES: usize = 128;
     const BLOCK_BYTES: usize = 8;
 

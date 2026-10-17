@@ -21,6 +21,7 @@ mod io;
 mod validators;
 
 pub use io::{discard, length_ceiling, write_atomic};
+pub(crate) use validators::full_chain_bc1_dds_size;
 pub use validators::{dds_tile_validator, raw_chunk_validator, MagicAndSize, EXPECTED_DDS_SIZE};
 
 /// Why a cache entry was rejected. Carried for logs; callers branch on the
