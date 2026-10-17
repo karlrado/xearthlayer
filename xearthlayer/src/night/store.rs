@@ -68,43 +68,65 @@ impl RecipeStore {
     /// The recipe for the tile whose south-west corner is `(lat, lon)`.
     ///
     /// Blocking file I/O on a cache miss: call from a blocking context.
+    /// A transient I/O failure is not cached, so the next call retries.
     pub fn get(&self, lat: i32, lon: i32) -> Option<Arc<Recipe>> {
-        self.cache.get_with((lat, lon), || self.load(lat, lon))
+        self.cache
+            .try_get_with((lat, lon), || self.load(lat, lon))
+            .unwrap_or(None)
     }
 
-    fn load(&self, lat: i32, lon: i32) -> Option<Arc<Recipe>> {
-        let path = self
+    /// `Ok(None)` (cached) for an absent or rejected recipe; `Err` (not
+    /// cached) when the file could not be read.
+    fn load(&self, lat: i32, lon: i32) -> Result<Option<Arc<Recipe>>, std::io::Error> {
+        let Some(path) = self
             .roots
             .iter()
             .map(|root| recipe_path(root, lat, lon))
-            .find(|p| p.is_file())?;
-        match read_bounded(&path).and_then(|bytes| parse_recipe(&bytes).map_err(|e| e.to_string()))
-        {
-            Ok(recipe) => Some(Arc::new(recipe)),
-            Err(reason) => {
-                if self.warned.insert(path.clone()) {
-                    warn!(path = %path.display(), %reason, "Night recipe rejected; tile stays dark");
-                }
-                None
+            .find(|p| p.is_file())
+        else {
+            return Ok(None);
+        };
+        let bytes = match read_bounded(&path) {
+            Ok(Some(bytes)) => bytes,
+            Ok(None) => {
+                self.warn_once(&path, "file exceeds the recipe size ceiling");
+                return Ok(None);
             }
+            Err(e) => {
+                self.warn_once(&path, &e.to_string());
+                return Err(e);
+            }
+        };
+        match parse_recipe(&bytes) {
+            Ok(recipe) => Ok(Some(Arc::new(recipe))),
+            Err(e) => {
+                self.warn_once(&path, &e.to_string());
+                Ok(None)
+            }
+        }
+    }
+
+    fn warn_once(&self, path: &Path, reason: &str) {
+        if self.warned.insert(path.to_path_buf()) {
+            warn!(path = %path.display(), %reason, "Night recipe unusable; tile stays dark");
         }
     }
 }
 
-fn read_bounded(path: &Path) -> Result<Vec<u8>, String> {
-    let len = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-    if len > MAX_RECIPE_FILE_BYTES {
-        return Err(format!(
-            "{len} bytes exceeds the {MAX_RECIPE_FILE_BYTES}-byte ceiling"
-        ));
-    }
-    std::fs::read(path).map_err(|e| e.to_string())
+/// The file's bytes, or `None` when it is larger than the ceiling. Reads at
+/// most one byte past the ceiling, whatever the file claims.
+fn read_bounded(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_RECIPE_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    Ok((bytes.len() as u64 <= MAX_RECIPE_FILE_BYTES).then_some(bytes))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::{Path, PathBuf};
     use tempfile::TempDir;
 
     const URBAN: &[u8] = include_bytes!("../../tests/fixtures/night/urban.oxn");
@@ -162,6 +184,36 @@ mod tests {
         put(temp.path(), 37, -123, b"not a recipe");
         let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
         assert!(store.get(37, -123).is_none());
+    }
+
+    #[test]
+    fn a_file_over_the_ceiling_is_rejected_unread() {
+        let temp = TempDir::new().unwrap();
+        put(temp.path(), 37, -123, URBAN);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(recipe_path(temp.path(), 37, -123))
+            .unwrap();
+        file.set_len(MAX_RECIPE_FILE_BYTES + 1).unwrap(); // sparse
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert!(store.get(37, -123).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_io_error_is_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        put(temp.path(), 37, -123, URBAN);
+        let path = recipe_path(temp.path(), 37, -123);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert!(store.get(37, -123).is_none(), "unreadable now");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(store.get(37, -123).is_some(), "the failure was not cached");
     }
 
     #[test]
