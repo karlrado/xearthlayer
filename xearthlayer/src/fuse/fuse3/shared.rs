@@ -555,6 +555,7 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.row, 100000 / 16);
@@ -569,6 +570,7 @@ mod tests {
             col: 10368,
             zoom: 16,
             map_type: "GO2".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.row, 25264 / 16);
@@ -584,6 +586,7 @@ mod tests {
             col: 200,
             zoom: 2,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.zoom, 0); // saturating_sub prevents underflow

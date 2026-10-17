@@ -1471,6 +1471,7 @@ mod tests {
             col: 84000,
             zoom: 20,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
 
         let tile = chunk_to_tile_coords(&coords);
@@ -1689,6 +1690,7 @@ mod tests {
                 col: 5279,
                 zoom: 16,
                 map_type: "BI".to_string(),
+                kind: crate::fuse::TextureKind::Ortho,
             })
     }
 
@@ -1919,6 +1921,7 @@ mod tests {
                     col: 5279 + col,
                     zoom: 16,
                     map_type: "BI".to_string(),
+                    kind: crate::fuse::TextureKind::Ortho,
                 });
             let reply = fs.open(test_request(), ino, 0).await.unwrap();
             fs.read(test_request(), ino, reply.fh, 0, 4096)
@@ -2975,6 +2978,7 @@ mod tests {
             col: tile.col * 16,
             zoom: tile.zoom + 4,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let _ = fs.request_dds_impl(&coords).await;
         responder.await.unwrap();
