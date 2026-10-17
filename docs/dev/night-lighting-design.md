@@ -195,7 +195,7 @@ With the texture quality setting `t` (0 to 4):
 - The first visible level `F` is 1024 px for a ZL16 texture, halving per
   zoom level above 16 and doubling per zoom level below it (512 px at ZL17,
   256 px at ZL18), about 7.5 m per texel throughout.
-- The top level is `F × 2^B`, with a full mip chain down to 4 × 4 and
+- The top level is `F × 2^B`, with a full mip chain down to 1 × 1 and
   BC1 (DXT1) blocks throughout.
 
 | Setting `t` | Blank levels | Top level (ZL16) | File size | Uploaded by X-Plane |
@@ -305,7 +305,12 @@ settings give the same bytes on the same build.
 
 ### LitTextureService (`night/service.rs`)
 
-The entry point FUSE calls, with two operations:
+The entry point FUSE calls. Phase 2a implements the `LitTextureSource` trait
+with `NightLitSource` (sizes from `has_light` and the layout, black bytes);
+phase 2b's `LitTextureService` replaces it behind the same trait. Both answer
+`has_light` once per footprint and remember it for the session, so `size` and
+`read` agree. Phase 2b will retry a transient recipe read failure before
+committing that answer. The service has two operations:
 
 - `size(name) -> u64`: from `has_light` and the layout. It is cheap and
   never generates.
@@ -335,7 +340,7 @@ filename:
 - Virtual inodes carry a kind bit, so a lit texture and its ortho texture
   never share an inode (R8).
 - `lookup`, `getattr`, `open` and `read` route lit inodes to the
-  `LitTextureSource` (phase 1: `BlackLitSource`; phase 2's `LitTextureService` implements the trait). Ortho inodes take the existing path unchanged.
+  `LitTextureSource` (phase 1: `BlackLitSource`; phase 2a: `NightLitSource`; phase 2b's `LitTextureService` replaces it). Ortho inodes take the existing path unchanged.
 - A real `*_LIT.dds` file on disk in a package still wins: real files
   resolve before virtual ones, as today.
 - Lit sizes are read once: the texture setting is read at start and held
@@ -386,6 +391,7 @@ degrades to black, at the narrowest scope it affects (R19):
 | No X-Plane installation found, or `library.txt` missing or unreadable | Every lit texture this session | Once |
 | A palette name that does not resolve, a `.ter` without a lit texture, a missing or undecodable lit file | That class only | Once per name |
 | A recipe rejected by the reading rules, or from a newer major version | That 1° tile | Once per file |
+| A recipe that cannot be read (transient I/O) | That tile, for the session once a size was answered | Once |
 | No recipe for a tile | That tile | Never (normal for countryside) |
 | Generation or encoding fails | That texture, not cached | Every time, as a warning |
 | `X-Plane.prf` unreadable | Nothing: the full setting is assumed | Once |

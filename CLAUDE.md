@@ -213,7 +213,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `RecipeStore` (`store.rs`): recipes found via each ortho source path, `night/<block>/<tile>.oxn`
     - `LitTextureSource` / `BlackLitSource` (`service.rs`) and the 152-byte minimal black DDS (`layout.rs`)
     - FUSE routes `_LIT.dds` names (`TextureKind::Lit`, `LIT_INODE_FLAG`) to the lit source, never the executor
-    - Phase 2a: `NightLitSource` (`service.rs`) answers lit `stat`/`open` with the real file size for the player's texture setting; `LaminarArt` (`laminar/`) reads the installed lit art, `StartupTextureSetting` (`prefs.rs`) reads the setting once at start, and `footprint.rs` sizes urban footprints. Wired by `MountManager::set_night_lighting` from `night.enabled` (default true); when the X-Plane installation is not found the black default stays
+    - Phase 2a: `NightLitSource` (`service.rs`) answers lit `stat`/`open` with the real file size for the player's texture setting; `LaminarArt` (`laminar/`) reads the installed lit art, `StartupTextureSetting` (`prefs.rs`) reads the setting once at start, and `footprint.rs` decides whether a footprint has light (`has_light`) and `layout.rs` (`LitLayout`) sizes the file. Wired by `MountManager::set_night_lighting` from `night.enabled` (default true); when the X-Plane installation is not found the black default stays
     - Lit urban footprints are full-size but black until phase 2b (`night.brightness` is not implemented)
     - Publisher copies `yOrtho4XP_Night/` recipes into the package's `night/` folder
     - See `docs/dev/night-lighting-design.md`
@@ -412,11 +412,11 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/ortho_union/` | Ortho union index module |
 | `xearthlayer/src/night/recipe.rs` | OXO `.oxn` recipe reader and validation |
 | `xearthlayer/src/night/store.rs` | RecipeStore - finds and caches recipes per ortho source |
-| `xearthlayer/src/night/service.rs` | LitTextureSource trait and BlackLitSource |
+| `xearthlayer/src/night/service.rs` | LitTextureSource trait, BlackLitSource and NightLitSource |
 | `xearthlayer/src/night/layout.rs` | Lit DDS layout, `minimal_black_dds()` |
 | `xearthlayer/src/night/laminar/` | Laminar lit art reader (`art.rs`, `library.rs`, `ter.rs`) |
 | `xearthlayer/src/night/prefs.rs` | StartupTextureSetting - texture setting read once from `X-Plane.prf` |
-| `xearthlayer/src/night/footprint.rs` | Urban footprint sizing for lit textures |
+| `xearthlayer/src/night/footprint.rs` | Footprint geometry and `has_light` (decides full-size vs minimal) |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
 | `xearthlayer/src/ortho_union/builder.rs` | OrthoUnionIndexBuilder (with progress + caching) |
 | `xearthlayer/src/update/mod.rs` | Version update checking (VersionManifest, UpdateInfo) |

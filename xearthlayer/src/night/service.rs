@@ -1,12 +1,18 @@
 //! Where FUSE gets lit textures.
 //!
 //! The lit path never touches the ortho executor, coalescer or caches
-//! (requirement R8). Phase 1 serves the minimal black DDS for every name.
+//! (requirement R8). `BlackLitSource` (phase 1) serves the minimal black DDS
+//! for every name; `NightLitSource` (phase 2a) serves full-size black
+//! textures where the recipe and the user's art say there is light, and the
+//! minimal DDS elsewhere.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use bytes::Bytes;
+use dashmap::DashMap;
 use futures::future::BoxFuture;
+use tracing::{debug, warn};
 
 use super::layout::minimal_black_dds;
 use super::{Footprint, LaminarArt, LitLayout, RecipeStore, TextureSettingSource};
@@ -47,9 +53,6 @@ impl LitTextureSource for BlackLitSource {
 /// sit inside the blocking pool's `BLOCKING_POOL_HEADROOM`.
 const LIT_PROBE_PERMITS: usize = 2;
 
-/// Footprints whose answer is remembered.
-const LIT_PROBE_CACHE_ENTRIES: u64 = 65_536;
-
 /// Zoom levels a lit footprint is computed for. `parse_dds_filename` accepts
 /// any two-digit zoom and `Footprint::from_name` shifts by it, so anything
 /// outside this range is dark without computing anything.
@@ -62,7 +65,11 @@ pub struct NightLitSource {
     store: Arc<RecipeStore>,
     art: Arc<LaminarArt>,
     setting: Arc<dyn TextureSettingSource>,
-    lit: moka::sync::Cache<(u32, u32, u8), bool>,
+    /// Session-stable answers. Never evicts: an evicted entry could be
+    /// re-probed to a different answer, and a lit file's size must not change
+    /// while the kernel may hold the old one (R7). One byte-sized entry per
+    /// footprint ever asked about.
+    lit: DashMap<(u32, u32, u8), bool>,
     probes: tokio::sync::Semaphore,
 }
 
@@ -76,7 +83,7 @@ impl NightLitSource {
             store,
             art,
             setting,
-            lit: moka::sync::Cache::new(LIT_PROBE_CACHE_ENTRIES),
+            lit: DashMap::new(),
             probes: tokio::sync::Semaphore::new(LIT_PROBE_PERMITS),
         }
     }
@@ -87,20 +94,23 @@ impl NightLitSource {
         }
         let key = (name.row, name.col, name.zoom);
         if let Some(hit) = self.lit.get(&key) {
-            return hit;
+            return *hit;
         }
+        let started = Instant::now();
         let Ok(_permit) = self.probes.acquire().await else {
             return false;
         };
         if let Some(hit) = self.lit.get(&key) {
-            return hit; // another probe answered while we waited
+            return *hit; // another probe answered while we waited
         }
+        let wait_ms = started.elapsed().as_millis() as u64;
+        let probe_started = Instant::now();
         let (store, art, footprint) = (
             Arc::clone(&self.store),
             Arc::clone(&self.art),
             Footprint::from_name(name),
         );
-        match tokio::task::spawn_blocking(move || {
+        let lit = match tokio::task::spawn_blocking(move || {
             footprint.has_light(
                 |lat, lon| store.get(lat, lon),
                 |n| art.lit_terrain(n).is_some(),
@@ -108,12 +118,26 @@ impl NightLitSource {
         })
         .await
         {
-            Ok(answer) => {
-                self.lit.insert(key, answer);
-                answer
+            Ok(answer) => answer,
+            Err(_) => {
+                // The probe is meant to be panic-free: XEL's panic hook
+                // unmounts on any panic. This arm is a last resort, and it
+                // remembers the dark answer so size and read keep agreeing.
+                warn!("Night lighting: lit probe failed; footprint stays dark this session");
+                false
             }
-            Err(_) => false, // panicked: dark for this call, not remembered
-        }
+        };
+        self.lit.insert(key, lit);
+        debug!(
+            row = name.row,
+            col = name.col,
+            zoom = name.zoom,
+            lit,
+            wait_ms,
+            probe_ms = probe_started.elapsed().as_millis() as u64,
+            "Night lighting: lit probe"
+        );
+        lit
     }
 
     fn layout(&self, name: &DdsFilename) -> LitLayout {
@@ -264,6 +288,25 @@ mod tests {
                 let size = source.size(&name).await;
                 assert_eq!(source.read(&name, 0, u32::MAX).await.len() as u64, size);
             }
+        }
+
+        #[tokio::test]
+        async fn a_size_answer_is_remembered_for_the_session() {
+            let (temp, source) = fixture();
+            let name = name_at(37.20, -122.725);
+            assert_eq!(source.size(&name).await, 2_796_344);
+            std::fs::remove_file(crate::night::recipe_path(
+                &temp.path().join("pkg"),
+                37,
+                -123,
+            ))
+            .unwrap();
+            assert_eq!(source.size(&name).await, 2_796_344, "memoised");
+            assert_eq!(
+                source.read(&name, 0, u32::MAX).await.len() as u64,
+                2_796_344,
+                "read agrees with the memoised size"
+            );
         }
 
         #[tokio::test]

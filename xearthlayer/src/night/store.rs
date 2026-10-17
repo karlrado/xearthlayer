@@ -98,6 +98,17 @@ impl RecipeStore {
             }
         };
         match parse_recipe(&bytes) {
+            Ok(recipe) if recipe.tile != tile_name(lat, lon) => {
+                self.warn_once(
+                    &path,
+                    &format!(
+                        "recipe is for tile {}, expected {}",
+                        recipe.tile,
+                        tile_name(lat, lon)
+                    ),
+                );
+                Ok(None)
+            }
             Ok(recipe) => Ok(Some(Arc::new(recipe))),
             Err(e) => {
                 self.warn_once(&path, &e.to_string());
@@ -184,6 +195,14 @@ mod tests {
         put(temp.path(), 37, -123, b"not a recipe");
         let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
         assert!(store.get(37, -123).is_none());
+    }
+
+    #[test]
+    fn a_recipe_for_another_tile_is_rejected() {
+        let temp = TempDir::new().unwrap();
+        put(temp.path(), 38, -123, URBAN); // urban.oxn is tile +37-123
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert!(store.get(38, -123).is_none());
     }
 
     #[test]

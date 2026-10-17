@@ -441,8 +441,7 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
     // [night] section
     if let Some(section) = ini.section(Some("night")) {
         if let Some(v) = section.get("enabled") {
-            let v = v.to_lowercase();
-            config.night.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
+            config.night.enabled = parse_bool(v);
         }
     }
 

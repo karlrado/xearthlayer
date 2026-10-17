@@ -544,8 +544,7 @@ impl ConfigKey {
 
             // Night lighting settings
             ConfigKey::NightEnabled => {
-                let v = value.to_lowercase();
-                config.night.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
+                config.night.enabled = super::parser::parse_bool(value);
             }
         }
     }

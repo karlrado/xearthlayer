@@ -80,8 +80,8 @@ impl Footprint {
                 }
                 let index = usize::from(class.get(row, col));
                 if index != 0
-                    && is_lit(&r.palette[index])
                     && sample(&r.brightness, top - lat, lon - west) > 0
+                    && is_lit(&r.palette[index])
                 {
                     return true;
                 }
@@ -164,6 +164,16 @@ mod tests {
     #[test]
     fn lit_where_an_urban_class_meets_radiance() {
         assert!(fp(37.24, 37.16, -122.74, -122.71).has_light(only_tile(37, -123), urban_only));
+    }
+
+    #[test]
+    fn lit_when_only_the_second_straddled_tile_has_light() {
+        // Spans lon -123.02..-122.70: tiles (37,-124), which has no recipe, then
+        // (37,-123), which holds the lit urban block.
+        let f = fp(37.24, 37.16, -123.02, -122.70);
+        assert_eq!(f.tiles(), vec![(37, -124), (37, -123)]);
+        assert!(f.has_light(only_tile(37, -123), urban_only));
+        assert!(!f.has_light(only_tile(37, -124), urban_only));
     }
 
     #[test]

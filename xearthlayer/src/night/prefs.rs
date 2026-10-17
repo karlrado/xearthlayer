@@ -66,7 +66,6 @@ impl TextureSettingSource for FixedTextureSetting {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    #[cfg(test)]
     use tempfile::TempDir;
 
     fn prefs(text: &str) -> (TempDir, PathBuf) {

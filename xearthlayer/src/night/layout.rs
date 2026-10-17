@@ -1,4 +1,6 @@
-//! The layout of lit DDS files. Phase 1 has one: the minimal black DDS.
+//! The layout of lit DDS files: the minimal black DDS (phase 1), and
+//! `LitLayout`, the full mip chain geometry and all-zero bytes of a lit
+//! footprint (phase 2a).
 
 use std::sync::OnceLock;
 

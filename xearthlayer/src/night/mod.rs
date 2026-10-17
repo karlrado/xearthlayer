@@ -1,8 +1,10 @@
 //! Night lighting: lit textures generated from OXO night recipes.
 //!
 //! See `docs/dev/night-lighting-design.md`. Phase 1 reads recipes and
-//! serves a minimal black texture for every lit name; phase 2 generates
-//! light from the recipes and the user's Laminar lit art.
+//! serves a minimal black texture for every lit name. Phase 2a answers lit
+//! `stat`/`open` with the real file size (footprints from recipes, lit art
+//! from the user's Laminar installation, texture setting from the preferences)
+//! but still serves black pixels. Phase 2b generates the light.
 
 pub mod footprint;
 pub mod laminar;

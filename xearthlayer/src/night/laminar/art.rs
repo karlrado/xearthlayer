@@ -56,9 +56,22 @@ impl LaminarArt {
     }
 
     fn resolve(&self, palette_name: &str) -> Option<LitTerrain> {
-        let file = self.library()?.resolve(palette_name)?;
+        let Some(file) = self.library()?.resolve(palette_name) else {
+            warn!(
+                name = palette_name,
+                "Night lighting: palette name not in the Laminar library; this class stays dark"
+            );
+            return None;
+        };
         let ter_path = self.terrain_root.join(file);
-        let text = std::fs::read_to_string(&ter_path).ok()?;
+        let text = match std::fs::read_to_string(&ter_path) {
+            Ok(text) => text,
+            Err(e) => {
+                warn!(name = palette_name, path = %ter_path.display(), error = %e,
+                      "Night lighting: lit terrain unreadable; this class stays dark");
+                return None;
+            }
+        };
         let lit = parse_lit_terrain(&text, ter_path.parent()?);
         match lit {
             Some(lit) if lit.texture.is_file() => Some(lit),
@@ -140,6 +153,75 @@ mod tests {
         assert!(art
             .lit_terrain("lib/g10/terrain10/urban_tmp_sdry3.ter")
             .is_none());
+    }
+
+    /// Runs `f` under a subscriber and returns everything it logged.
+    fn logged<F: FnOnce()>(f: F) -> String {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct Buf(Arc<Mutex<Vec<u8>>>);
+        impl Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf(Arc::new(Mutex::new(Vec::new())));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buf.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    #[test]
+    fn an_unresolved_palette_name_warns_once_naming_it() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        let log = logged(|| {
+            assert!(art.lit_terrain("lib/g10/terrain10/nope.ter").is_none());
+            assert!(art.lit_terrain("lib/g10/terrain10/nope.ter").is_none());
+        });
+        assert_eq!(log.matches("WARN").count(), 1, "{log}");
+        assert!(log.contains("lib/g10/terrain10/nope.ter"), "{log}");
+    }
+
+    #[test]
+    fn an_unreadable_ter_warns_with_name_and_path() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        std::fs::remove_file(temp.path().join("terrain12/urban_tmp_sdry3.ter")).unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        let log = logged(|| {
+            assert!(art
+                .lit_terrain("lib/g10/terrain10/urban_tmp_sdry3.ter")
+                .is_none());
+        });
+        assert!(log.contains("WARN"), "{log}");
+        assert!(log.contains("urban_tmp_sdry3.ter"), "{log}");
+    }
+
+    #[test]
+    fn a_park_logs_no_warning() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        let log = logged(|| {
+            assert!(art
+                .lit_terrain("lib/g10/terrain10/urban_tmp_sdry_prk.ter")
+                .is_none());
+        });
+        assert!(!log.contains("WARN"), "{log}");
     }
 
     #[test]
