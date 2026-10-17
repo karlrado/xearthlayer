@@ -64,6 +64,9 @@ pub struct OrchestratorConfig {
     /// FUSE kernel configuration.
     pub fuse: FuseConfig,
 
+    /// Whether the ortho mount serves generated night lighting (`night.enabled`).
+    pub night_enabled: bool,
+
     /// Whether TUI mode is active (affects logging behavior).
     pub tui_mode: bool,
 }
@@ -209,6 +212,7 @@ impl OrchestratorConfig {
             prefetch,
             prewarm,
             fuse,
+            night_enabled: config.night.enabled,
             tui_mode,
         }
     }

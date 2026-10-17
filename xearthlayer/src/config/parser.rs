@@ -438,6 +438,14 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
+    // [night] section
+    if let Some(section) = ini.section(Some("night")) {
+        if let Some(v) = section.get("enabled") {
+            let v = v.to_lowercase();
+            config.night.enabled = v == "true" || v == "1" || v == "yes" || v == "on";
+        }
+    }
+
     Ok(config)
 }
 
@@ -519,6 +527,27 @@ mod tests {
         assert_eq!(loaded.fuse.congestion_threshold, 384);
         assert_eq!(loaded.prefetch.cycle_interval_ms, 3000);
         assert_eq!(loaded.packages.concurrent_downloads, 9);
+    }
+
+    #[test]
+    fn test_night_enabled_round_trips() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        assert!(config.night.enabled);
+        config.night.enabled = false;
+        config.save_to(&config_path).unwrap();
+        let loaded = ConfigFile::load_from(&config_path).unwrap();
+        assert!(!loaded.night.enabled);
+    }
+
+    #[test]
+    fn test_night_enabled_defaults_true_without_section() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        std::fs::write(&path, "[general]\nupdate_check = true\n").unwrap();
+        let loaded = ConfigFile::load_from(&path).unwrap();
+        assert!(loaded.night.enabled);
     }
 
     #[test]

@@ -48,6 +48,7 @@ pub use file::{
     ExecutorSettings,
     GenerationSettings,
     LoggingSettings,
+    NightSettings,
     PackagesSettings,
     PatchesSettings,
     PrefetchSettings,

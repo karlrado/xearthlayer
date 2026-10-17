@@ -164,6 +164,8 @@ pub struct MountManager {
     fuse_congestion_threshold: u16,
     /// Upper bound in seconds for a single DDS generation behind a FUSE read.
     generation_timeout_secs: u64,
+    /// Whether the ortho mount serves generated night lighting (`night.enabled`).
+    night_enabled: bool,
 }
 
 impl MountManager {
@@ -187,6 +189,7 @@ impl MountManager {
             fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
             generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
+            night_enabled: false,
         }
     }
 
@@ -208,6 +211,44 @@ impl MountManager {
     pub fn set_fuse_limits(&mut self, max_background: u16, congestion_threshold: u16) {
         self.fuse_max_background = max_background;
         self.fuse_congestion_threshold = congestion_threshold;
+    }
+
+    /// Enable or disable generated night lighting for the ortho mount.
+    ///
+    /// Off by default; the service turns it on from `night.enabled`. When on
+    /// but the X-Plane installation cannot be found, lit textures stay black.
+    pub fn set_night_lighting(&mut self, enabled: bool) {
+        self.night_enabled = enabled;
+    }
+
+    /// The lit source for this installation, or `None` (black) when the
+    /// X-Plane installation behind the scenery path cannot be found.
+    fn night_lit_source(
+        &self,
+        index: &OrthoUnionIndex,
+    ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
+        let scenery = self.scenery_path.as_ref()?;
+        let env = match crate::xplane::XPlaneEnvironment::from_custom_scenery_path(scenery) {
+            Ok(env) => env,
+            Err(e) => {
+                tracing::warn!(error = %e, "Night lighting: X-Plane installation not found; lit textures stay dark");
+                return None;
+            }
+        };
+        let art_root = env
+            .resources_path()
+            .join("default scenery")
+            .join("1000 world terrain");
+        let prefs = env
+            .installation_path()
+            .join("Output")
+            .join("preferences")
+            .join("X-Plane.prf");
+        Some(Arc::new(crate::night::NightLitSource::new(
+            Arc::new(crate::night::RecipeStore::from_index(index)),
+            Arc::new(crate::night::LaminarArt::new(art_root)),
+            Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
+        )))
     }
 
     /// Set the upper bound for a single DDS generation behind a FUSE read.
@@ -517,6 +558,12 @@ impl MountManager {
 
         if let Some(budget) = pinned_budget {
             ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
+        }
+
+        if self.night_enabled {
+            if let Some(source) = self.night_lit_source(&index_for_prefetch) {
+                ortho_union_fs = ortho_union_fs.with_lit_source(source);
+            }
         }
 
         // Wire metrics client for coalesced request tracking
@@ -983,6 +1030,14 @@ mod tests {
         let manager = MountManager::new();
         assert_eq!(manager.mount_count(), 0);
         assert!(!manager.has_mounts());
+    }
+
+    #[test]
+    fn test_night_lighting_off_by_default_and_settable() {
+        let mut manager = MountManager::new();
+        assert!(!manager.night_enabled);
+        manager.set_night_lighting(true);
+        assert!(manager.night_enabled);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # Night Lighting Design
 
-**Status**: Phase 1 implemented (packaging and black serving); phase 2 proposed
+**Status**: Phase 1 and phase 2a implemented (packaging, black serving, real lit sizes); phase 2b proposed
 **Created**: 2026-10-17
 **Branch**: `blackmarble` (local until 0.5.0 release preparation)
 
@@ -338,8 +338,10 @@ filename:
   `LitTextureSource` (phase 1: `BlackLitSource`; phase 2's `LitTextureService` implements the trait). Ortho inodes take the existing path unchanged.
 - A real `*_LIT.dds` file on disk in a package still wins: real files
   resolve before virtual ones, as today.
-- Lit reads use direct I/O, as virtual ortho textures already do on Linux,
-  so the kernel never serves a stale size after a settings change.
+- Lit sizes are read once: the texture setting is read at start and held
+  for the session, so a lit file's size never changes while the mount is
+  up and the kernel cannot serve a stale one. A change to the setting
+  takes effect the next time XEL starts.
 - The single global DDS size (`EXPECTED_DDS_SIZE`) and the placeholder
   validator stay ortho-only. Lit sizes come from the service.
 

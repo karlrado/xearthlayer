@@ -474,6 +474,24 @@ max_background = 256
 congestion_threshold = 192
 ```
 
+### [night]
+
+Controls night lighting. Packages built with OXO night recipes carry `night/` folders; XEarthLayer serves `*_LIT.dds` textures for those tiles, sized from your own X-Plane lit art.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | true | Serve generated lit textures. `false` makes every lit texture the minimal dark texture |
+
+Lit textures are built from the X-Plane installation behind your Custom Scenery path. If that installation cannot be found, lit textures stay dark whatever this setting says. The texture quality setting is read once when XEarthLayer starts, so a change to it takes effect on the next start.
+
+In this release lit urban footprints are the full size but still black; the visible lights arrive in a later phase.
+
+**Example:**
+```ini
+[night]
+enabled = true
+```
+
 ## Complete Example
 
 ```ini
@@ -551,6 +569,10 @@ enabled = true
 ; The Linux kernel default of 12/9 causes X-Plane freezes at DSF boundaries
 max_background = 256
 congestion_threshold = 192
+
+[night]
+; Night lighting from OXO night recipes in installed packages (false = always dark)
+enabled = true
 ```
 
 ## Config CLI Commands
@@ -663,6 +685,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.disable_overlays` | `true`, `false` | Suppress XEL overlays at runtime |
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
+| `night.enabled` | `true`, `false` | Serve generated night lighting textures |
 
 ## CLI Overrides
 
