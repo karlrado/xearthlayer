@@ -239,7 +239,7 @@ fn read_scale(layer: &[(Value, Value)]) -> Result<BrightnessScale, RecipeError> 
     let rmax_nw = get(scale, "rmax_nw")
         .and_then(as_f64)
         .ok_or(RecipeError::Malformed("rmax_nw"))?;
-    if r0_nw.is_nan() || r0_nw <= 0.0 || rmax_nw.is_nan() || rmax_nw <= 0.0 {
+    if !r0_nw.is_finite() || r0_nw <= 0.0 || !rmax_nw.is_finite() || rmax_nw <= 0.0 {
         return Err(RecipeError::Malformed("scale values"));
     }
     Ok(BrightnessScale { r0_nw, rmax_nw })
@@ -458,6 +458,41 @@ mod tests {
             parse_recipe(&file(b"OXN1", &v)),
             Err(RecipeError::ClassIndex { .. })
         ));
+    }
+
+    fn brightness_with_scale(r0: f64, rmax: f64) -> Value {
+        let mut l = layer("brightness", 1, 1, &[5]);
+        if let Value::Map(m) = &mut l {
+            m.push((
+                text("scale"),
+                Value::Map(vec![
+                    (text("kind"), text("log1p")),
+                    (text("r0_nw"), Value::Float(r0)),
+                    (text("rmax_nw"), Value::Float(rmax)),
+                ]),
+            ));
+        }
+        l
+    }
+
+    #[test]
+    fn rejects_a_non_finite_or_nan_scale() {
+        for (r0, rmax) in [
+            (1.0, f64::INFINITY),
+            (f64::INFINITY, 300.0),
+            (1.0, f64::NAN),
+        ] {
+            let v = recipe(1, &[""], vec![brightness_with_scale(r0, rmax)]);
+            assert!(
+                matches!(
+                    parse_recipe(&file(b"OXN1", &v)),
+                    Err(RecipeError::Malformed("scale values"))
+                ),
+                "r0={r0} rmax={rmax}"
+            );
+        }
+        let ok = recipe(1, &[""], vec![brightness_with_scale(1.0, 300.0)]);
+        assert!(parse_recipe(&file(b"OXN1", &ok)).is_ok());
     }
 
     #[test]

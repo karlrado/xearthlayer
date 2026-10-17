@@ -119,7 +119,7 @@ impl Ortho4XPProcessor {
     const NIGHT_SOURCE_DIR: &'static str = "yOrtho4XP_Night";
 
     /// The package folder for recipes. Not in XEL's root allowlist, so X-Plane
-    /// never sees it, on this or any earlier XEL version.
+    /// never sees it, on this and every XEL version since 0.3.0.
     const NIGHT_PACKAGE_DIR: &'static str = "night";
 
     /// Ortho4XP's tile name, `+37-118`, and 10 degree block, `+30-120`.

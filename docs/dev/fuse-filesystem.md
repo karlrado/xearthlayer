@@ -230,7 +230,7 @@ Orthophoto DDS files follow the Ortho4XP naming convention:
 
 The regex pattern for recognition:
 ```regex
-(\d+)_(\d+)_([A-Za-z]+)(\d{2})\.dds$
+(\d+)_(\d+)_([A-Za-z]+\d?)(\d{2})(_LIT)?\.dds$
 ```
 
 ### Lit Textures (Night Lighting)

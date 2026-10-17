@@ -1818,6 +1818,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_request_dds_impl_serves_black_for_a_lit_name_without_a_request() {
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let coords = crate::fuse::DdsFilename {
+            row: 25712,
+            col: 12960,
+            zoom: 16,
+            map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Lit,
+        };
+
+        let data = fs.request_dds_impl(&coords).await;
+
+        assert_eq!(data, crate::night::minimal_black_dds());
+        assert_eq!(data.len(), 152);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a lit name must never reach the DDS client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_real_lit_file_on_disk_wins_over_the_virtual_lit_texture() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        std::fs::write(pkg_dir.join("textures/25712_12960_BI16_LIT.dds"), [7u8; 10]).unwrap();
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+        let (client, _requests) = CountingDdsClient::new();
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE);
+
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+
+        assert_eq!(entry.attr.size, 10, "the real file, not the 152-byte black");
+        assert!(
+            entry.attr.ino < crate::fuse::support::inode::VIRTUAL_INODE_BASE,
+            "a real file has a real inode"
+        );
+    }
+
+    #[tokio::test]
     async fn test_lit_source_is_injectable() {
         use fuse3::raw::Filesystem;
         struct Fixed;

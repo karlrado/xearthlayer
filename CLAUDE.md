@@ -208,6 +208,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking
     - See `docs/dev/geo-index-design.md` for design details
 
+19. **Night Lighting** (`xearthlayer/src/night/`)
+    - Recipe reader (`recipe.rs`): OXO `.oxn` format 1
+    - `RecipeStore` (`store.rs`): recipes found via each ortho source path, `night/<block>/<tile>.oxn`
+    - `LitTextureSource` / `BlackLitSource` (`service.rs`) and the 152-byte minimal black DDS (`layout.rs`)
+    - FUSE routes `_LIT.dds` names (`TextureKind::Lit`, `LIT_INODE_FLAG`) to the lit source, never the executor
+    - Publisher copies `yOrtho4XP_Night/` recipes into the package's `night/` folder
+    - See `docs/dev/night-lighting-design.md`
+
 ### Module Dependencies
 
 ```
@@ -400,6 +408,10 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer-cli/src/preflight/` | The concrete startup checks and the registry |
 | `xearthlayer/src/geo_index/` | GeoIndex geospatial reference database |
 | `xearthlayer/src/ortho_union/` | Ortho union index module |
+| `xearthlayer/src/night/recipe.rs` | OXO `.oxn` recipe reader and validation |
+| `xearthlayer/src/night/store.rs` | RecipeStore - finds and caches recipes per ortho source |
+| `xearthlayer/src/night/service.rs` | LitTextureSource trait and BlackLitSource |
+| `xearthlayer/src/night/layout.rs` | Lit DDS layout, `minimal_black_dds()` |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
 | `xearthlayer/src/ortho_union/builder.rs` | OrthoUnionIndexBuilder (with progress + caching) |
 | `xearthlayer/src/update/mod.rs` | Version update checking (VersionManifest, UpdateInfo) |
@@ -535,7 +547,7 @@ matrix jobs are renamed.
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
-- **Night lighting**: `docs/dev/night-lighting-design.md` (proposed: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
+- **Night lighting**: `docs/dev/night-lighting-design.md` (phase 1 implemented (packaging and black serving), phase 2 proposed: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
 - **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.

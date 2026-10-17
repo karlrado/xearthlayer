@@ -64,14 +64,15 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
 | Decision | Choice | Why |
 |---|---|---|
 | Light model | Laminar pattern × VIIRS gain | The project owner's decision. The class picks the Laminar lit texture for street-scale structure; the brightness layer scales its intensity. Nothing lights outside Laminar's urban and industrial classes |
-| Where lit work runs | A separate lit path beside the ortho executor, never a job on the demand or prefetch lane | Lit generation must not delay ortho generation (R17) and must not share coalescing or cache keys with it (R8). A separate path guarantees both by construction |
+| Where lit work runs | A separate lit path beside the ortho executor, never a job on the demand or prefetch lane | Lit generation must not delay ortho generation (R17) and must not share coalescing or cache keys with it (R8). A separate path guarantees both: lit inodes are routed to the lit source, and the ortho request path returns the black texture for a lit name as a guard |
 | Texel density | 1024 px at the first visible level of a ZL16 texture (about 7.5 m per texel), scaling by zoom | The project owner's decision: about 2.8 MB of video memory per urban ZL16 texture, against about 10.7 MB at 2048 px |
 | Decoding Laminar's art | `ddsfile` (header and mip layout) and `bcdec_rs` (a pure Rust port of `bcdec`) | No DDS decoder exists in XEL. Decoding happens once per art file per session, so correctness and size matter, not speed |
 | Encoding lit textures | XEL's existing compressor selection: ISPC by default, the wgpu worker when `texture.compressor = gpu` | The most efficient encoders XEL has. A lit texture is under a tenth of an ortho tile's texels |
 | Recipe container | `ciborium` for CBOR, `flate2` for the zlib layers | CBOR is the format's choice; `flate2` is already a dependency |
 | Caching | Memory only, keyed by footprint and a settings fingerprint | Regeneration is cheap (tens of milliseconds) and deterministic. A disk tier would need invalidation whenever X-Plane, its settings or the art changed |
 | Configuration | `night.enabled` and `night.brightness` | `brightness` is a visual preference, not a performance knob. It is a development setting, reviewed before release |
-| Recipes in a package | `night/<10° block>/<tile>.oxn` | Hidden from X-Plane by the union index's existing root allowlist, on this and every earlier XEL version |
+| Recipes in a package | `night/<10° block>/<tile>.oxn` | Hidden from X-Plane by the union index's existing root allowlist, on this and every XEL version since 0.3.0 |
+| Publishing night packages | Staging library only until XEL 0.5.0 is the minimum client | Pre-0.5.0 XEL (filename regex without `(_LIT)?`) answers ENOENT for every `_LIT.dds` an OXO night `.ter` names, so a night package must not reach any library a pre-0.5.0 client reads. Whether to also bump the package spec version is open |
 | Delivery | Two phases: packaging and black serving first, the generator second | Phase 1 alone makes OXO night packages publishable and safe |
 
 ## Architecture
@@ -320,7 +321,7 @@ filename:
 - Virtual inodes carry a kind bit, so a lit texture and its ortho texture
   never share an inode (R8).
 - `lookup`, `getattr`, `open` and `read` route lit inodes to the
-  `LitTextureService`. Ortho inodes take the existing path unchanged.
+  `LitTextureSource` (phase 1: `BlackLitSource`; phase 2's `LitTextureService` implements the trait). Ortho inodes take the existing path unchanged.
 - A real `*_LIT.dds` file on disk in a package still wins: real files
   resolve before virtual ones, as today.
 - Lit reads use direct I/O, as virtual ortho textures already do on Linux,
@@ -340,8 +341,10 @@ filename:
 - `.ter` files are already copied byte for byte, and the dedupe module only
   reads them, so lit lines survive both (R3).
 - Archiving already includes every folder in the package. On an XEL
-  version without this feature, the union index's root allowlist hides
-  `night/`, so packages install and run unchanged (R2).
+  version since 0.3.0, the union index's root allowlist hides `night/`, but
+  that version cannot serve the lit textures: it answers ENOENT for every
+  `_LIT.dds` an OXO night `.ter` names. Night packages therefore must not
+  reach a library a pre-0.5.0 client reads (see Decisions).
 
 ### Configuration (R20)
 
@@ -504,6 +507,7 @@ from the user's own X-Plane installation and never redistributed.
 - Whether X-Plane re-reads lit textures after a mid-session change to the
   texture setting.
 - Whether `night.brightness` survives to release or becomes a constant.
+- Publishing night packages: staging library only until XEL 0.5.0 is the minimum client; whether to also bump the package spec version.
 
 ## Out of Scope
 
