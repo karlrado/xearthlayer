@@ -4,6 +4,7 @@
 //! serves a minimal black texture for every lit name; phase 2 generates
 //! light from the recipes and the user's Laminar lit art.
 
+pub mod laminar;
 pub mod layout;
 pub mod recipe;
 pub mod service;
