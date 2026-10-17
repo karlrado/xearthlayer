@@ -221,16 +221,30 @@ flight settles this.
 
 ### XPlanePrefs (`night/prefs.rs`)
 
-- Reads `renopt_tex_res_04` from `Output/preferences/X-Plane.prf` at
-  start, and re-reads it when the file's modification time changes
-  (checked every 5 seconds).
+The texture setting comes from a `TextureSettingSource` trait, so where it
+comes from can change without touching the layout, the service or FUSE:
+
+```rust
+pub trait TextureSettingSource: Send + Sync {
+    /// X-Plane's texture quality, 0 (lowest) to 4 (full).
+    fn texture_setting(&self) -> u8;
+}
+```
+
+- The implementation XEL ships, `StartupTextureSetting`, reads
+  `renopt_tex_res_04` from `Output/preferences/X-Plane.prf` once, when XEL
+  starts, and holds it for the session.
 - If the file is missing or unreadable, it assumes the full setting
   (`t = 4`) and logs once (R16).
-- The setting feeds the blank-level count, the file size and the cache
-  fingerprint. A change makes new lookups use the new layout. Whether
-  X-Plane re-reads lit files from disk after a mid-session change is
-  established on the tuning flight; if it does not, a change takes effect
-  at the next scenery load, which is documented rather than worked around.
+- The setting feeds the blank-level count and the file size. Because it
+  never changes within a session, a lit file's size never changes either,
+  so the kernel's attribute cache can never serve a stale size, on Linux or
+  on macOS (which has no direct I/O). A change to the texture setting takes
+  effect the next time XEL starts.
+- Following the file while running stays possible: a watching
+  implementation of the same trait can replace `StartupTextureSetting`.
+  It would also have to answer the stale-size question (attribute
+  timeouts, macOS page cache), which is why it is not the default.
 - VR's `vr_renopt_tex_res_04` is not followed. This is a documented
   limitation.
 
@@ -505,7 +519,8 @@ from the user's own X-Plane installation and never redistributed.
 - Whether X-Plane accepts a 32768 px header at texture setting 0 (see the
   layout's risk).
 - Whether X-Plane re-reads lit textures after a mid-session change to the
-  texture setting.
+  texture setting, which decides whether a watching
+  `TextureSettingSource` is worth building.
 - Whether `night.brightness` survives to release or becomes a constant.
 - Publishing night packages: staging library only until XEL 0.5.0 is the minimum client; whether to also bump the package spec version.
 
