@@ -69,14 +69,29 @@ pub fn generate_visible(
     let mut patterns: HashMap<String, Option<Arc<LitPattern>>> = HashMap::new();
     let mut img = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 255]));
 
+    // Most texels share their neighbour's tile and class: remember the
+    // current tile's recipe, its patterns by palette index, and its metres
+    // per degree of longitude, so the per-texel work is arithmetic.
+    let mut current: Option<(i32, i32)> = None;
+    let mut recipe: Option<Arc<Recipe>> = None;
+    let mut by_index: Vec<Option<Option<Arc<LitPattern>>>> = Vec::new();
+    let mut metres_per_lon_degree = 0.0;
+
     for (i, &lat) in lats.iter().enumerate() {
         let lat0 = lat.floor() as i32;
         let top = f64::from(lat0) + 1.0;
         for (j, &lon) in lons.iter().enumerate() {
             let lon0 = lon.floor() as i32;
-            let recipe = recipes
-                .entry((lat0, lon0))
-                .or_insert_with(|| recipe_for(lat0, lon0));
+            if current != Some((lat0, lon0)) {
+                current = Some((lat0, lon0));
+                recipe = recipes
+                    .entry((lat0, lon0))
+                    .or_insert_with(|| recipe_for(lat0, lon0))
+                    .clone();
+                by_index = vec![None; recipe.as_ref().map_or(0, |r| r.palette.len())];
+                metres_per_lon_degree =
+                    METRES_PER_DEGREE * (f64::from(lat0) + 0.5).to_radians().cos();
+            }
             let Some(r) = recipe.as_deref() else {
                 continue;
             };
@@ -89,15 +104,18 @@ pub fn generate_visible(
             if g <= 0.0 {
                 continue;
             }
-            let class_name = &r.palette[index];
-            let pattern = patterns
-                .entry(class_name.clone())
-                .or_insert_with(|| pattern_for(class_name));
+            let pattern = by_index[index].get_or_insert_with(|| {
+                let class_name = &r.palette[index];
+                patterns
+                    .entry(class_name.clone())
+                    .or_insert_with(|| pattern_for(class_name))
+                    .clone()
+            });
             let Some(p) = pattern.as_deref() else {
                 continue;
             };
             // World-anchored ground metres from the tile's south-west corner.
-            let metres_x = dx * METRES_PER_DEGREE * (f64::from(lat0) + 0.5).to_radians().cos();
+            let metres_x = dx * metres_per_lon_degree;
             let metres_y = dy * METRES_PER_DEGREE;
             let c = p.sample(metres_x / p.ground_scale_m, metres_y / p.ground_scale_m);
             let scale = g as f32;

@@ -444,15 +444,17 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
             config.night.enabled = parse_bool(v);
         }
         if let Some(v) = section.get("brightness") {
-            config.night.brightness =
-                v.trim()
-                    .parse()
-                    .map_err(|_| ConfigFileError::InvalidValue {
-                        section: "night".to_string(),
-                        key: "brightness".to_string(),
-                        value: v.to_string(),
-                        reason: "must be a number from 0.5 to 1.5".to_string(),
-                    })?;
+            let invalid = || ConfigFileError::InvalidValue {
+                section: "night".to_string(),
+                key: "brightness".to_string(),
+                value: v.to_string(),
+                reason: "must be a number from 0.5 to 1.5".to_string(),
+            };
+            let value: f64 = v.trim().parse().map_err(|_| invalid())?;
+            if !(0.5..=1.5).contains(&value) {
+                return Err(invalid());
+            }
+            config.night.brightness = value;
         }
     }
 
@@ -566,6 +568,19 @@ mod tests {
                 .brightness,
             0.75
         );
+    }
+
+    #[test]
+    fn test_night_brightness_out_of_range_is_rejected_on_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        for bad in ["3", "-1", "NaN", "inf", "abc"] {
+            std::fs::write(&path, format!("[night]\nbrightness = {bad}\n")).unwrap();
+            assert!(
+                ConfigFile::load_from(&path).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]

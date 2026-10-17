@@ -242,7 +242,9 @@ impl LitTextureSource for NightLitSource {
                 let layout = self.layout(name);
                 // Header and blank levels need no pixels; only a read that
                 // reaches the visible levels generates them.
-                if offset.saturating_add(u64::from(len)) <= layout.payload_start() {
+                if offset >= layout.total_len
+                    || offset.saturating_add(u64::from(len)) <= layout.payload_start()
+                {
                     return layout.read_black(offset, len);
                 }
                 match self.payload(name, &layout).await {
