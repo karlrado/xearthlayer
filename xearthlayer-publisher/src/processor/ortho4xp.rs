@@ -115,6 +115,66 @@ impl Ortho4XPProcessor {
     /// Ortho4XP tile directory prefix.
     const TILE_PREFIX: &'static str = "zOrtho4XP_";
 
+    /// OXO's night recipe tree beside the tile folders.
+    const NIGHT_SOURCE_DIR: &'static str = "yOrtho4XP_Night";
+
+    /// The package folder for recipes. Not in XEL's root allowlist, so X-Plane
+    /// never sees it, on this or any earlier XEL version.
+    const NIGHT_PACKAGE_DIR: &'static str = "night";
+
+    /// Ortho4XP's tile name, `+37-118`, and 10 degree block, `+30-120`.
+    fn night_names(lat: i32, lon: i32) -> (String, String) {
+        let tile = format!("{:+03}{:+04}", lat, lon);
+        let block = format!(
+            "{:+03}{:+04}",
+            lat.div_euclid(10) * 10,
+            lon.div_euclid(10) * 10
+        );
+        (tile, block)
+    }
+
+    /// A version 1 recipe starts with `OXN1`. The publisher does not link the
+    /// runtime, so it checks the magic only; XEL validates the rest.
+    fn is_v1_recipe(path: &Path) -> bool {
+        use std::io::Read;
+        let mut magic = [0u8; 4];
+        fs::File::open(path)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .map(|()| &magic == b"OXN1")
+            .unwrap_or(false)
+    }
+
+    /// Warn about recipes in the night tree that no scanned tile claims.
+    fn report_orphan_recipes(&self, scan_result: &SceneryScanResult, summary: &mut ProcessSummary) {
+        let Some(source) = scan_result.tiles.first().and_then(|t| t.path.parent()) else {
+            return;
+        };
+        let claimed: HashSet<String> = scan_result
+            .tiles
+            .iter()
+            .map(|t| Self::night_names(t.latitude, t.longitude).0)
+            .collect();
+        let Ok(blocks) = fs::read_dir(source.join(Self::NIGHT_SOURCE_DIR)) else {
+            return;
+        };
+        for block in blocks.flatten() {
+            let Ok(files) = fs::read_dir(block.path()) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let path = file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("oxn") {
+                    continue;
+                }
+                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                    if !claimed.contains(stem) {
+                        summary.add_warning(stem, "night recipe has no matching tile; not copied");
+                    }
+                }
+            }
+        }
+    }
+
     /// Parse a tile ID into latitude and longitude.
     ///
     /// Expected formats:
@@ -352,7 +412,13 @@ impl SceneryProcessor for Ortho4XPProcessor {
                 continue;
             }
 
-            if let Some(tile_info) = self.scan_tile_directory(&path)? {
+            if let Some(mut tile_info) = self.scan_tile_directory(&path)? {
+                let (tile, block) = Self::night_names(tile_info.latitude, tile_info.longitude);
+                let recipe = source
+                    .join(Self::NIGHT_SOURCE_DIR)
+                    .join(block)
+                    .join(format!("{tile}.oxn"));
+                tile_info.night_recipe = recipe.is_file().then_some(recipe);
                 tiles.push(tile_info);
             }
         }
@@ -442,11 +508,39 @@ impl SceneryProcessor for Ortho4XPProcessor {
                 }
             }
 
+            // Copy the night recipe into night/<block>/<tile>.oxn
+            if let Some(recipe) = &tile.night_recipe {
+                if Self::is_v1_recipe(recipe) {
+                    let (name, block) = Self::night_names(tile.latitude, tile.longitude);
+                    let dir = package_dir.join(Self::NIGHT_PACKAGE_DIR).join(block);
+                    fs::create_dir_all(&dir).map_err(|e| PublishError::CreateDirectoryFailed {
+                        path: dir.clone(),
+                        source: e,
+                    })?;
+                    let dest = dir.join(format!("{name}.oxn"));
+                    fs::copy(recipe, &dest).map_err(|e| PublishError::WriteFailed {
+                        path: dest,
+                        source: e,
+                    })?;
+                    summary.night_recipe_count += 1;
+                } else {
+                    summary.add_warning(
+                        &tile.id,
+                        format!(
+                            "night recipe {} is not a version 1 recipe; not copied",
+                            recipe.display()
+                        ),
+                    );
+                }
+            }
+
             // Count skipped DDS files
             if self.skip_dds {
                 summary.dds_skipped += tile.dds_files.len();
             }
         }
+
+        self.report_orphan_recipes(scan_result, &mut summary);
 
         let dsf = compress_dsf_files(&dsf_jobs, &self.dsf_compressor)?;
         summary.dsf_count = dsf.files;
@@ -903,5 +997,89 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn put_recipe(source: &Path, block: &str, tile: &str, bytes: &[u8]) {
+        let dir = source.join("yOrtho4XP_Night").join(block);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(format!("{tile}.oxn")), bytes).unwrap();
+    }
+
+    #[test]
+    fn test_scan_finds_the_night_recipe_beside_the_tile() {
+        let temp = TempDir::new().unwrap();
+        create_mock_tile(temp.path(), "+37-118");
+        put_recipe(temp.path(), "+30-120", "+37-118", b"OXN1rest");
+        let result = Ortho4XPProcessor::new().scan(temp.path()).unwrap();
+        assert_eq!(result.tiles.len(), 1, "the night tree is not a tile");
+        assert_eq!(
+            result.tiles[0].night_recipe.as_deref(),
+            Some(
+                temp.path()
+                    .join("yOrtho4XP_Night/+30-120/+37-118.oxn")
+                    .as_path()
+            )
+        );
+    }
+
+    #[test]
+    fn test_scan_without_a_night_tree_has_no_recipes() {
+        let temp = TempDir::new().unwrap();
+        create_mock_tile(temp.path(), "+37-118");
+        let result = Ortho4XPProcessor::new().scan(temp.path()).unwrap();
+        assert!(result.tiles[0].night_recipe.is_none());
+    }
+
+    /// Publish `source` into a fresh repository as region "na", the way
+    /// `test_process_creates_package_structure` does. Keep the TempDir alive.
+    fn publish(source: &Path) -> (TempDir, Repository, ProcessSummary) {
+        let repo_temp = TempDir::new().unwrap();
+        let repo = Repository::init(repo_temp.path()).unwrap();
+        let processor = Ortho4XPProcessor::new();
+        let scan = processor.scan(source).unwrap();
+        let summary = processor
+            .process(&scan, "na", PackageType::Ortho, &repo)
+            .unwrap();
+        (repo_temp, repo, summary)
+    }
+
+    #[test]
+    fn test_process_copies_recipes_into_the_package_night_tree() {
+        let source = TempDir::new().unwrap();
+        create_mock_tile(source.path(), "+37-118");
+        put_recipe(source.path(), "+30-120", "+37-118", b"OXN1rest");
+        let (_repo_temp, repo, summary) = publish(source.path());
+        let copied = repo
+            .package_dir("na", PackageType::Ortho)
+            .join("night/+30-120/+37-118.oxn");
+        assert_eq!(fs::read(copied).unwrap(), b"OXN1rest");
+        assert_eq!(summary.night_recipe_count, 1);
+        assert!(!summary.has_warnings());
+    }
+
+    #[test]
+    fn test_process_skips_a_recipe_that_is_not_version_1() {
+        let source = TempDir::new().unwrap();
+        create_mock_tile(source.path(), "+37-118");
+        put_recipe(source.path(), "+30-120", "+37-118", b"OXN2rest");
+        let (_repo_temp, repo, summary) = publish(source.path());
+        assert!(!repo
+            .package_dir("na", PackageType::Ortho)
+            .join("night")
+            .exists());
+        assert_eq!(summary.night_recipe_count, 0);
+        assert_eq!(summary.warnings.len(), 1);
+        assert_eq!(summary.warnings[0].tile_id, "zOrtho4XP_+37-118");
+    }
+
+    #[test]
+    fn test_process_reports_a_recipe_with_no_tile() {
+        let source = TempDir::new().unwrap();
+        create_mock_tile(source.path(), "+37-118");
+        put_recipe(source.path(), "+30-120", "+38-118", b"OXN1rest");
+        let (_repo_temp, _repo, summary) = publish(source.path());
+        assert_eq!(summary.night_recipe_count, 0);
+        assert_eq!(summary.warnings.len(), 1);
+        assert_eq!(summary.warnings[0].tile_id, "+38-118");
     }
 }

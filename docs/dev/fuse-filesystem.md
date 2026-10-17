@@ -233,6 +233,10 @@ The regex pattern for recognition:
 (\d+)_(\d+)_([A-Za-z]+)(\d{2})\.dds$
 ```
 
+### Lit Textures (Night Lighting)
+
+Names ending `_LIT.dds` are lit textures for night lighting. They get their own inode (`LIT_INODE_FLAG`), never reach the DDS client, coalescer or caches, and are served by a `LitTextureSource`, which in phase 1 is the 152-byte black DDS. See [night-lighting-design.md](night-lighting-design.md).
+
 ## FUSE Operations
 
 ### Directory Operations

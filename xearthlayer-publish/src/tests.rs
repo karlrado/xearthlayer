@@ -667,6 +667,7 @@ fn create_test_scan_result() -> SceneryScanResult {
             ter_files: vec![PathBuf::from("test.ter")],
             mask_files: vec![PathBuf::from("test_mask.png")],
             dds_files: Vec::new(),
+            night_recipe: None,
         },
         TileInfo {
             id: "+38-122".to_string(),
@@ -677,6 +678,7 @@ fn create_test_scan_result() -> SceneryScanResult {
             ter_files: vec![PathBuf::from("test.ter")],
             mask_files: Vec::new(),
             dds_files: Vec::new(),
+            night_recipe: None,
         },
     ])
 }
@@ -872,6 +874,7 @@ mod add_tests {
                 ter_count: 2,
                 mask_count: 1,
                 dds_skipped: 100,
+                night_recipe_count: 0,
                 warnings: Vec::new(),
             })
             .build();
@@ -920,6 +923,7 @@ mod add_tests {
                 ter_count: 0,
                 mask_count: 0,
                 dds_skipped: 0,
+                night_recipe_count: 0,
                 warnings: Vec::new(),
             })
             .build();
@@ -1013,6 +1017,7 @@ mod add_tests {
                 ter_count: 0,
                 mask_count: 0,
                 dds_skipped: 0,
+                night_recipe_count: 0,
                 warnings: Vec::new(),
             })
             .build();

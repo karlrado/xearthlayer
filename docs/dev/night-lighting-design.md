@@ -1,6 +1,6 @@
 # Night Lighting Design
 
-**Status**: Proposed
+**Status**: Phase 1 implemented (packaging and black serving); phase 2 proposed
 **Created**: 2026-10-17
 **Branch**: `blackmarble` (local until 0.5.0 release preparation)
 

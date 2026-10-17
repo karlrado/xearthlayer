@@ -312,6 +312,10 @@ zzXEL_na_ortho/
 | `*.net` | Keep if present | Network definitions |
 | `*.obj` | Keep if present | Object definitions |
 
+### Night Recipes
+
+The processor also carries OXO night recipes from `yOrtho4XP_Night/<block>/<tile>.oxn` beside the tile folders into the package at `night/<block>/<tile>.oxn`, where `<tile>` is the Ortho4XP tile name (`+37-118`) and `<block>` its 10 degree block (`+30-120`). It checks only the `OXN1` magic, because the publisher does not link the runtime; XEL validates the rest. A recipe of another version, or one with no matching tile, produces a warning and is not copied. A source without the night tree publishes exactly as before. See [night-lighting-design.md](night-lighting-design.md).
+
 ### DSF Compression
 
 `DsfCompressor` (`publisher/dsf_compress.rs`) writes each DSF as a 7z archive with one entry named after the file, using LZMA with a 16 MiB dictionary and a plain header. That is the profile of Laminar's own Global Scenery DSF files, and X-Plane has decoded it natively since version 10. The dictionary size is chosen for the consumer rather than the producer: X-Plane allocates the dictionary for every DSF it decodes, so matching Laminar keeps packages inside a memory budget the sim already carries.

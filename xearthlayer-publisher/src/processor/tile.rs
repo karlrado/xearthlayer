@@ -51,6 +51,10 @@ pub struct TileInfo {
     /// These are typically skipped during processing because XEarthLayer
     /// generates them on-demand from satellite imagery.
     pub dds_files: Vec<PathBuf>,
+
+    /// This tile's night recipe (`yOrtho4XP_Night/<block>/<tile>.oxn`), when
+    /// the source has one. Copied into the package's `night/` folder.
+    pub night_recipe: Option<PathBuf>,
 }
 
 impl TileInfo {
@@ -70,6 +74,7 @@ impl TileInfo {
             ter_files: Vec::new(),
             mask_files: Vec::new(),
             dds_files: Vec::new(),
+            night_recipe: None,
         }
     }
 
@@ -110,6 +115,9 @@ pub struct ProcessSummary {
 
     /// Total DDS files that were skipped.
     pub dds_skipped: usize,
+
+    /// Night recipes copied into the package.
+    pub night_recipe_count: usize,
 
     /// Warnings generated during processing.
     pub warnings: Vec<TileWarning>,
