@@ -40,7 +40,7 @@ bytes = "1.11.0"
 dashmap = "6.1"
 tokio-util = "0.7"
 parking_lot = "0.12"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 glob = "0.3"
 flate2.workspace = true
 tar.workspace = true

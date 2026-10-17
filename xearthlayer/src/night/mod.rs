@@ -5,5 +5,7 @@
 //! light from the recipes and the user's Laminar lit art.
 
 pub mod recipe;
+pub mod store;
 
 pub use recipe::{parse_recipe, BrightnessScale, Grid, Recipe, RecipeError, SUPPORTED_MAJOR};
+pub use store::{block_name, recipe_path, tile_name, RecipeStore};
