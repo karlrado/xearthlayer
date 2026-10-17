@@ -7,6 +7,7 @@ use dashmap::DashMap;
 use tracing::{debug, warn};
 
 use super::library::LibraryIndex;
+use super::pattern::{load_pattern, LitPattern};
 use super::ter::{parse_lit_terrain, LitTerrain};
 
 /// The lit art of one X-Plane installation (`1000 world terrain`).
@@ -14,6 +15,8 @@ pub struct LaminarArt {
     terrain_root: PathBuf,
     library: OnceLock<Option<LibraryIndex>>,
     resolved: DashMap<String, Option<Arc<LitTerrain>>>,
+    /// Decoded patterns by `texture|ground scale`; Laminar has nine textures.
+    patterns: DashMap<String, Option<Arc<LitPattern>>>,
 }
 
 impl LaminarArt {
@@ -23,7 +26,26 @@ impl LaminarArt {
             terrain_root,
             library: OnceLock::new(),
             resolved: DashMap::new(),
+            patterns: DashMap::new(),
         }
+    }
+
+    /// The decoded lit pattern a palette name stands for, or `None` (dark).
+    ///
+    /// Blocking file I/O and decoding on first use of a texture.
+    pub fn pattern(&self, palette_name: &str) -> Option<Arc<LitPattern>> {
+        let lit = self.lit_terrain(palette_name)?;
+        let key = format!("{}|{}", lit.texture.display(), lit.ground_scale_m);
+        if let Some(hit) = self.patterns.get(&key) {
+            return hit.clone();
+        }
+        let pattern = load_pattern(&lit.texture, lit.ground_scale_m).map(Arc::new);
+        if pattern.is_none() {
+            warn!(texture = %lit.texture.display(),
+                  "Night lighting: lit texture is not a readable DXT1 DDS; this class stays dark");
+        }
+        self.patterns.insert(key, pattern.clone());
+        pattern
     }
 
     /// The lit terrain a recipe palette name stands for, or `None` (dark).
@@ -222,6 +244,40 @@ mod tests {
                 .is_none());
         });
         assert!(!log.contains("WARN"), "{log}");
+    }
+
+    #[test]
+    fn pattern_decodes_the_lit_texture() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        let mut dds = crate::dds::DdsHeader::new(4, 4, 1, crate::dds::DdsFormat::BC1).to_bytes();
+        dds.extend_from_slice(&[0x00, 0xF8, 0, 0, 0, 0, 0, 0]);
+        std::fs::write(
+            temp.path().join("textures12/urban_FAR/uw5_FAR_LIT.dds"),
+            dds,
+        )
+        .unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        let p = art
+            .pattern("lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .unwrap();
+        assert_eq!(
+            (p.size, p.ground_scale_m, p.rgb[0]),
+            (4, 3072.0, [255, 0, 0])
+        );
+        assert!(art
+            .pattern("lib/g10/terrain10/urban_tmp_sdry_prk.ter")
+            .is_none());
+    }
+
+    #[test]
+    fn an_undecodable_lit_texture_has_no_pattern() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true); // writes b"DDS " only
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert!(art
+            .pattern("lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .is_none());
     }
 
     #[test]
