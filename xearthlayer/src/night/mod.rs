@@ -10,6 +10,7 @@ pub mod recipe;
 pub mod service;
 pub mod store;
 
+pub use laminar::{LaminarArt, LitTerrain};
 pub use layout::minimal_black_dds;
 pub use recipe::{parse_recipe, BrightnessScale, Grid, Recipe, RecipeError, SUPPORTED_MAJOR};
 pub use service::{BlackLitSource, LitTextureSource};
