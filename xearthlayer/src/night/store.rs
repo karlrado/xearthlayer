@@ -20,21 +20,12 @@ const RECIPE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
 /// Larger files are rejected unread. Real recipes are tens of kilobytes.
 const MAX_RECIPE_FILE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Ortho4XP's tile name: `+37-123`.
-pub fn tile_name(lat: i32, lon: i32) -> String {
-    format!("{:+03}{:+04}", lat, lon)
-}
-
-/// Ortho4XP's 10 degree block: each coordinate floored to a multiple of 10.
-pub fn block_name(lat: i32, lon: i32) -> String {
-    tile_name(lat.div_euclid(10) * 10, lon.div_euclid(10) * 10)
-}
+pub use xearthlayer_package::night::{block_name, tile_name};
 
 /// Where a source keeps a tile's recipe: `<root>/night/<block>/<tile>.oxn`.
 pub fn recipe_path(root: &Path, lat: i32, lon: i32) -> PathBuf {
-    root.join("night")
-        .join(block_name(lat, lon))
-        .join(format!("{}.oxn", tile_name(lat, lon)))
+    root.join(xearthlayer_package::night::PACKAGE_DIR)
+        .join(xearthlayer_package::night::recipe_relative_path(lat, lon))
 }
 
 /// Recipes per tile, loaded lazily and evicted by size. Absence is cached.

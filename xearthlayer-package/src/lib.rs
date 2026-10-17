@@ -50,6 +50,7 @@ mod installed;
 mod library;
 mod metadata;
 mod naming;
+pub mod night;
 mod spec;
 mod types;
 

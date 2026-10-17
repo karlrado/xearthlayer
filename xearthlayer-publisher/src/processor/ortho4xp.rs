@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use super::{ProcessSummary, SceneryFormat, SceneryProcessor, SceneryScanResult, TileInfo};
 use crate::{compress_dsf_files, DsfCompressor, PublishError, PublishResult, Repository};
-use xearthlayer_package::PackageType;
+use xearthlayer_package::{night, PackageType};
 
 /// Ortho4XP output processor.
 ///
@@ -115,32 +115,14 @@ impl Ortho4XPProcessor {
     /// Ortho4XP tile directory prefix.
     const TILE_PREFIX: &'static str = "zOrtho4XP_";
 
-    /// OXO's night recipe tree beside the tile folders.
-    const NIGHT_SOURCE_DIR: &'static str = "yOrtho4XP_Night";
-
-    /// The package folder for recipes. Not in XEL's root allowlist, so X-Plane
-    /// never sees it, on this and every XEL version since 0.3.0.
-    const NIGHT_PACKAGE_DIR: &'static str = "night";
-
-    /// Ortho4XP's tile name, `+37-118`, and 10 degree block, `+30-120`.
-    fn night_names(lat: i32, lon: i32) -> (String, String) {
-        let tile = format!("{:+03}{:+04}", lat, lon);
-        let block = format!(
-            "{:+03}{:+04}",
-            lat.div_euclid(10) * 10,
-            lon.div_euclid(10) * 10
-        );
-        (tile, block)
-    }
-
     /// A version 1 recipe starts with `OXN1`. The publisher does not link the
     /// runtime, so it checks the magic only; XEL validates the rest.
-    fn is_v1_recipe(path: &Path) -> bool {
+    fn has_v1_magic(path: &Path) -> bool {
         use std::io::Read;
         let mut magic = [0u8; 4];
         fs::File::open(path)
             .and_then(|mut f| f.read_exact(&mut magic))
-            .map(|()| &magic == b"OXN1")
+            .map(|()| magic == night::MAGIC_V1)
             .unwrap_or(false)
     }
 
@@ -149,12 +131,13 @@ impl Ortho4XPProcessor {
         let Some(source) = scan_result.tiles.first().and_then(|t| t.path.parent()) else {
             return;
         };
-        let claimed: HashSet<String> = scan_result
+        let night_root = source.join(night::SOURCE_DIR);
+        let claimed: HashSet<PathBuf> = scan_result
             .tiles
             .iter()
-            .map(|t| Self::night_names(t.latitude, t.longitude).0)
+            .map(|t| night::recipe_relative_path(t.latitude, t.longitude))
             .collect();
-        let Ok(blocks) = fs::read_dir(source.join(Self::NIGHT_SOURCE_DIR)) else {
+        let Ok(blocks) = fs::read_dir(&night_root) else {
             return;
         };
         for block in blocks.flatten() {
@@ -167,7 +150,11 @@ impl Ortho4XPProcessor {
                     continue;
                 }
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if !claimed.contains(stem) {
+                    let claimed_here = path
+                        .strip_prefix(&night_root)
+                        .map(|rel| claimed.contains(rel))
+                        .unwrap_or(false);
+                    if !claimed_here {
                         summary.add_warning(stem, "night recipe has no matching tile; not copied");
                     }
                 }
@@ -413,11 +400,12 @@ impl SceneryProcessor for Ortho4XPProcessor {
             }
 
             if let Some(mut tile_info) = self.scan_tile_directory(&path)? {
-                let (tile, block) = Self::night_names(tile_info.latitude, tile_info.longitude);
                 let recipe = source
-                    .join(Self::NIGHT_SOURCE_DIR)
-                    .join(block)
-                    .join(format!("{tile}.oxn"));
+                    .join(night::SOURCE_DIR)
+                    .join(night::recipe_relative_path(
+                        tile_info.latitude,
+                        tile_info.longitude,
+                    ));
                 tile_info.night_recipe = recipe.is_file().then_some(recipe);
                 tiles.push(tile_info);
             }
@@ -510,14 +498,18 @@ impl SceneryProcessor for Ortho4XPProcessor {
 
             // Copy the night recipe into night/<block>/<tile>.oxn
             if let Some(recipe) = &tile.night_recipe {
-                if Self::is_v1_recipe(recipe) {
-                    let (name, block) = Self::night_names(tile.latitude, tile.longitude);
-                    let dir = package_dir.join(Self::NIGHT_PACKAGE_DIR).join(block);
-                    fs::create_dir_all(&dir).map_err(|e| PublishError::CreateDirectoryFailed {
-                        path: dir.clone(),
-                        source: e,
-                    })?;
-                    let dest = dir.join(format!("{name}.oxn"));
+                if Self::has_v1_magic(recipe) {
+                    let dest = package_dir
+                        .join(night::PACKAGE_DIR)
+                        .join(night::recipe_relative_path(tile.latitude, tile.longitude));
+                    if let Some(dir) = dest.parent() {
+                        fs::create_dir_all(dir).map_err(|e| {
+                            PublishError::CreateDirectoryFailed {
+                                path: dir.to_path_buf(),
+                                source: e,
+                            }
+                        })?;
+                    }
                     fs::copy(recipe, &dest).map_err(|e| PublishError::WriteFailed {
                         path: dest,
                         source: e,
@@ -1081,5 +1073,15 @@ mod tests {
         assert_eq!(summary.night_recipe_count, 0);
         assert_eq!(summary.warnings.len(), 1);
         assert_eq!(summary.warnings[0].tile_id, "+38-118");
+    }
+
+    #[test]
+    fn test_process_reports_a_recipe_in_the_wrong_block() {
+        let source = TempDir::new().unwrap();
+        create_mock_tile(source.path(), "+37-118");
+        put_recipe(source.path(), "+30-110", "+37-118", b"OXN1rest");
+        let (_repo_temp, _repo, summary) = publish(source.path());
+        assert_eq!(summary.night_recipe_count, 0);
+        assert_eq!(summary.warnings.len(), 1);
     }
 }
