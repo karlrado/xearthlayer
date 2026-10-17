@@ -7,6 +7,7 @@
 //! but still serves black pixels. Phase 2b generates the light.
 
 pub mod footprint;
+pub mod generator;
 pub mod laminar;
 pub mod layout;
 pub mod prefs;

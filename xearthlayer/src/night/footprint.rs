@@ -99,7 +99,7 @@ fn span(from: f64, to: f64, cells_per_degree: f64, len: usize) -> std::ops::Rang
 }
 
 /// The grid cell containing a point `dy` degrees below the top, `dx` east of the west edge.
-fn sample(grid: &Grid, dy: f64, dx: f64) -> u8 {
+pub(crate) fn sample(grid: &Grid, dy: f64, dx: f64) -> u8 {
     let row = ((dy * grid.height as f64).floor().max(0.0) as usize).min(grid.height - 1);
     let col = ((dx * grid.width as f64).floor().max(0.0) as usize).min(grid.width - 1);
     grid.get(row, col)
