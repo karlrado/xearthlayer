@@ -4,6 +4,7 @@
 //! serves a minimal black texture for every lit name; phase 2 generates
 //! light from the recipes and the user's Laminar lit art.
 
+pub mod footprint;
 pub mod laminar;
 pub mod layout;
 pub mod prefs;
@@ -11,6 +12,7 @@ pub mod recipe;
 pub mod service;
 pub mod store;
 
+pub use footprint::Footprint;
 pub use laminar::{LaminarArt, LitTerrain};
 pub use layout::minimal_black_dds;
 pub use prefs::{
