@@ -162,6 +162,9 @@ pub const DEFAULT_FUSE_CONGESTION_THRESHOLD: u16 = DEFAULT_FUSE_MAX_BACKGROUND *
 /// carry night recipes and the X-Plane installation is found.
 pub const DEFAULT_NIGHT_ENABLED: bool = true;
 
+/// Default night lighting brightness multiplier.
+pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
+
 // =============================================================================
 // Control plane defaults
 // =============================================================================
@@ -300,6 +303,7 @@ impl Default for ConfigFile {
             },
             night: NightSettings {
                 enabled: DEFAULT_NIGHT_ENABLED,
+                brightness: DEFAULT_NIGHT_BRIGHTNESS,
             },
         }
     }

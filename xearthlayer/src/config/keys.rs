@@ -114,6 +114,7 @@ pub enum ConfigKey {
 
     // Night lighting settings
     NightEnabled,
+    NightBrightness,
 }
 
 impl FromStr for ConfigKey {
@@ -182,6 +183,7 @@ impl FromStr for ConfigKey {
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
             "night.enabled" => Ok(ConfigKey::NightEnabled),
+            "night.brightness" => Ok(ConfigKey::NightBrightness),
 
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
         }
@@ -244,6 +246,7 @@ impl ConfigKey {
             ConfigKey::FuseMaxBackground => "fuse.max_background",
             ConfigKey::FuseCongestionThreshold => "fuse.congestion_threshold",
             ConfigKey::NightEnabled => "night.enabled",
+            ConfigKey::NightBrightness => "night.brightness",
         }
     }
 
@@ -373,6 +376,7 @@ impl ConfigKey {
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
             ConfigKey::FuseCongestionThreshold => config.fuse.congestion_threshold.to_string(),
             ConfigKey::NightEnabled => config.night.enabled.to_string(),
+            ConfigKey::NightBrightness => config.night.brightness.to_string(),
         }
     }
 
@@ -546,6 +550,9 @@ impl ConfigKey {
             ConfigKey::NightEnabled => {
                 config.night.enabled = super::parser::parse_bool(value);
             }
+            ConfigKey::NightBrightness => {
+                config.night.brightness = value.parse().unwrap();
+            }
         }
     }
 
@@ -618,6 +625,7 @@ impl ConfigKey {
             ConfigKey::FuseMaxBackground => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::NightEnabled => Box::new(BooleanSpec),
+            ConfigKey::NightBrightness => Box::new(FloatRangeSpec::new(0.5, 1.5)),
         }
     }
 
@@ -678,6 +686,7 @@ impl ConfigKey {
             ConfigKey::FuseCongestionThreshold,
             // Night lighting settings
             ConfigKey::NightEnabled,
+            ConfigKey::NightBrightness,
         ]
     }
 }
@@ -969,6 +978,25 @@ mod tests {
         assert_eq!(ConfigKey::NightEnabled.get(&config), "false");
         assert!(ConfigKey::NightEnabled.set(&mut config, "maybe").is_err());
         assert!(!config.night.enabled, "a rejected value changes nothing");
+    }
+
+    #[test]
+    fn night_brightness_parses_enumerates_and_validates() {
+        assert_eq!(
+            "night.brightness".parse::<ConfigKey>().unwrap(),
+            ConfigKey::NightBrightness
+        );
+        assert!(ConfigKey::all().contains(&ConfigKey::NightBrightness));
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::NightBrightness.get(&config), "1");
+        ConfigKey::NightBrightness.set(&mut config, "1.25").unwrap();
+        assert_eq!(config.night.brightness, 1.25);
+        assert!(ConfigKey::NightBrightness.set(&mut config, "2.0").is_err());
+        assert!(ConfigKey::NightBrightness.set(&mut config, "0.4").is_err());
+        assert_eq!(
+            config.night.brightness, 1.25,
+            "a rejected value changes nothing"
+        );
     }
 
     #[test]

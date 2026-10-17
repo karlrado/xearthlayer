@@ -22,5 +22,5 @@ pub use prefs::{
     FixedTextureSetting, StartupTextureSetting, TextureSettingSource, FULL_TEXTURE_SETTING,
 };
 pub use recipe::{parse_recipe, BrightnessScale, Grid, Recipe, RecipeError, SUPPORTED_MAJOR};
-pub use service::{BlackLitSource, LitTextureSource, NightLitSource};
+pub use service::{BlackLitSource, LitTextureSource, NightLitSource, DEFAULT_NIGHT_BRIGHTNESS};
 pub use store::{block_name, recipe_path, tile_name, RecipeStore};

@@ -443,6 +443,17 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         if let Some(v) = section.get("enabled") {
             config.night.enabled = parse_bool(v);
         }
+        if let Some(v) = section.get("brightness") {
+            config.night.brightness =
+                v.trim()
+                    .parse()
+                    .map_err(|_| ConfigFileError::InvalidValue {
+                        section: "night".to_string(),
+                        key: "brightness".to_string(),
+                        value: v.to_string(),
+                        reason: "must be a number from 0.5 to 1.5".to_string(),
+                    })?;
+        }
     }
 
     Ok(config)
@@ -538,6 +549,23 @@ mod tests {
         config.save_to(&config_path).unwrap();
         let loaded = ConfigFile::load_from(&config_path).unwrap();
         assert!(!loaded.night.enabled);
+    }
+
+    #[test]
+    fn test_night_brightness_round_trips_and_defaults_to_one() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        assert_eq!(config.night.brightness, 1.0);
+        config.night.brightness = 0.75;
+        config.save_to(&config_path).unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&config_path)
+                .unwrap()
+                .night
+                .brightness,
+            0.75
+        );
     }
 
     #[test]

@@ -116,6 +116,16 @@ pub fn generate_visible(
     img
 }
 
+/// BC1-encode the first visible level and its mip chain down to 1 x 1, as
+/// the bytes that follow the blank levels in a lit DDS (no header).
+pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
+    let dds = crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode(image)?;
+    Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
+}
+
+/// Bytes of a DDS header (magic plus the 124-byte header).
+const DDS_HEADER_LEN: usize = 128;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,6 +206,15 @@ mod tests {
         // The other urban block sits under radiance 0.
         let img = generate_visible(&name_at(37.875, -122.85), 32, golden, red, 1.0);
         assert_eq!(lit_texels(&img), 0);
+    }
+
+    #[test]
+    fn encoded_visible_levels_fit_the_layout() {
+        let layout = crate::night::LitLayout::new(18, 4); // first visible 256
+        let img = generate_visible(&name_at(37.20, -122.725), 256, golden, red, 1.0);
+        let payload = encode_visible(img).unwrap();
+        assert_eq!(payload.len() as u64, layout.payload_len());
+        assert!(payload.iter().any(|&b| b != 0), "light survives encoding");
     }
 
     #[test]

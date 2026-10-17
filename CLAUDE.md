@@ -214,7 +214,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `LitTextureSource` / `BlackLitSource` (`service.rs`) and the 152-byte minimal black DDS (`layout.rs`)
     - FUSE routes `_LIT.dds` names (`TextureKind::Lit`, `LIT_INODE_FLAG`) to the lit source, never the executor
     - Phase 2a: `NightLitSource` (`service.rs`) answers lit `stat`/`open` with the real file size for the player's texture setting; `LaminarArt` (`laminar/`) reads the installed lit art, `StartupTextureSetting` (`prefs.rs`) reads the setting once at start, and `footprint.rs` decides whether a footprint has light (`has_light`) and `layout.rs` (`LitLayout`) sizes the file. Wired by `MountManager::set_night_lighting` from `night.enabled` (default true); when the X-Plane installation is not found the black default stays
-    - Lit urban footprints are full-size but black until phase 2b (`night.brightness` is not implemented)
+    - Flight-test generator (`generator.rs`, a phase 2b slice): first visible level from the nearest recipe class cell, Laminar pattern decoded by `laminar/pattern.rs` (`ddsfile` + `bcdec_rs`) and tiled straight, anchored per 1 degree tile, times a provisional gain from VIIRS radiance (`GAIN_*` constants) and `night.brightness` (0.5 to 1.5); encoded with the default ISPC BC1 encoder and served after the blank levels by `LitLayout::read_lit`; payloads cached in memory (256 MB), 2 generation permits. Stochastic tiling and soft class edges are still to come
     - Publisher copies `yOrtho4XP_Night/` recipes into the package's `night/` folder
     - See `docs/dev/night-lighting-design.md`
 

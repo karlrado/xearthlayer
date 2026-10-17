@@ -481,15 +481,19 @@ Controls night lighting. Packages built with OXO night recipes carry `night/` fo
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `enabled` | true | Serve generated lit textures. `false` makes every lit texture the minimal dark texture |
+| `brightness` | 1.0 | Overall lit brightness, 0.5 to 1.5. A development setting while the lighting is tuned |
 
 Lit textures are built from the X-Plane installation behind your Custom Scenery path. If that installation cannot be found, lit textures stay dark whatever this setting says. The texture quality setting is read once when XEarthLayer starts, so a change to it takes effect on the next start.
 
-In this release lit urban footprints are the full size but still black; the visible lights arrive in a later phase.
+Lit urban ground glows where your X-Plane art and NASA VIIRS night lights say a city is. This release uses a first, simpler generator: the street pattern may repeat every few kilometres and city edges follow a coarse grid. Smoother lighting arrives in a later phase.
+
+The brightness of the night lights comes from NASA Black Marble VNP46A4/VJ146A4 annual nighttime lights.
 
 **Example:**
 ```ini
 [night]
 enabled = true
+brightness = 1.0
 ```
 
 ## Complete Example
@@ -573,6 +577,8 @@ congestion_threshold = 192
 [night]
 ; Night lighting from OXO night recipes in installed packages (false = always dark)
 enabled = true
+; Overall lit brightness, 0.5 to 1.5 (development setting)
+brightness = 1.0
 ```
 
 ## Config CLI Commands
@@ -686,6 +692,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
 | `night.enabled` | `true`, `false` | Serve generated night lighting textures |
+| `night.brightness` | 0.5 to 1.5 | Overall lit brightness (development setting) |
 
 ## CLI Overrides
 

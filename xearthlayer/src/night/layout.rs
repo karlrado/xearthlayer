@@ -66,6 +66,39 @@ impl LitLayout {
         }
         Bytes::from(out)
     }
+
+    /// Bytes of the visible levels (first visible level down to 1 x 1).
+    pub fn payload_len(&self) -> u64 {
+        full_chain_bc1_dds_size(self.first_visible, self.first_visible) as u64
+            - self.header.len() as u64
+    }
+
+    /// Where the visible levels start: after the header and the blank levels.
+    pub fn payload_start(&self) -> u64 {
+        self.total_len - self.payload_len()
+    }
+
+    /// Bytes `[offset, offset + len)` of the lit texture: the header, zero
+    /// blank levels, then `payload` (BC1 visible levels). A payload of the
+    /// wrong length is ignored and the texture reads black (same size, R7).
+    pub fn read_lit(&self, offset: u64, len: u32, payload: &Bytes) -> Bytes {
+        if payload.len() as u64 != self.payload_len() {
+            return self.read_black(offset, len);
+        }
+        let payload_start = self.payload_start();
+        let start = offset.min(self.total_len);
+        let end = start.saturating_add(u64::from(len)).min(self.total_len);
+        if start >= payload_start {
+            // Entirely inside the payload: a refcount slice, no copy.
+            return payload.slice((start - payload_start) as usize..(end - payload_start) as usize);
+        }
+        let mut out = self.read_black(start, (end - start) as u32).to_vec();
+        if end > payload_start {
+            let from = (payload_start - start) as usize;
+            out[from..].copy_from_slice(&payload[..(end - payload_start) as usize]);
+        }
+        Bytes::from(out)
+    }
 }
 
 /// The texture served wherever nothing is lit: 4 x 4 DXT1 with its full
@@ -79,6 +112,49 @@ pub fn minimal_black_dds() -> Bytes {
         Bytes::from(bytes)
     })
     .clone()
+}
+
+#[cfg(test)]
+mod lit_tests {
+    use super::*;
+
+    #[test]
+    fn payload_follows_header_and_blank_levels() {
+        let l = LitLayout::new(16, 4); // top 2048, first visible 1024
+        assert_eq!(
+            l.payload_len(),
+            full_chain_bc1_dds_size(1024, 1024) as u64 - 128
+        );
+        assert_eq!(l.payload_start(), 128 + 2048 * 2048 / 2);
+        assert_eq!(l.payload_start() + l.payload_len(), l.total_len);
+    }
+
+    #[test]
+    fn lit_reads_compose_header_zeros_and_payload() {
+        let l = LitLayout::new(18, 4); // top 512, first visible 256
+        let payload = Bytes::from(vec![7u8; l.payload_len() as usize]);
+        let start = l.payload_start();
+        assert_eq!(&l.read_lit(0, 4, &payload)[..], b"DDS ");
+        assert!(
+            l.read_lit(128, 64, &payload).iter().all(|&b| b == 0),
+            "blank level"
+        );
+        let across = l.read_lit(start - 2, 4, &payload);
+        assert_eq!(&across[..], &[0, 0, 7, 7]);
+        let all: usize = (0..l.total_len)
+            .step_by(1 << 16)
+            .map(|o| l.read_lit(o, 1 << 16, &payload).len())
+            .sum();
+        assert_eq!(all as u64, l.total_len);
+        assert!(l.read_lit(l.total_len, 8, &payload).is_empty());
+    }
+
+    #[test]
+    fn a_wrong_size_payload_reads_black() {
+        let l = LitLayout::new(18, 4);
+        let bad = Bytes::from(vec![7u8; 10]);
+        assert_eq!(l.read_lit(0, u32::MAX, &bad), l.read_black(0, u32::MAX));
+    }
 }
 
 #[cfg(test)]

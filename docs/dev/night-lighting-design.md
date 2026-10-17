@@ -1,6 +1,6 @@
 # Night Lighting Design
 
-**Status**: Phase 1 and phase 2a implemented (packaging, black serving, real lit sizes); phase 2b proposed
+**Status**: Phase 1 and phase 2a implemented (packaging, black serving, real lit sizes); a phase 2b flight-test generator implemented (nearest class, straight world-anchored tiling, provisional gain, `night.brightness`); stochastic tiling, soft class edges and tuning proposed
 **Created**: 2026-10-17
 **Branch**: `blackmarble` (local until 0.5.0 release preparation)
 

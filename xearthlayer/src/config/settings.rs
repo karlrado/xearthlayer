@@ -267,6 +267,9 @@ pub struct NightSettings {
     /// Generate lit textures from OXO night recipes (default: true).
     /// When false, every lit texture is the minimal black texture.
     pub enabled: bool,
+    /// Overall lit brightness multiplier, 0.5 to 1.5 (default: 1.0).
+    /// A development setting while the gain curve is tuned.
+    pub brightness: f64,
 }
 
 /// FUSE filesystem settings for kernel background request limits.

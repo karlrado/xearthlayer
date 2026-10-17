@@ -116,6 +116,7 @@ impl ServiceOrchestrator {
         let mut mount_manager = MountManager::with_scenery_path(&config.custom_scenery_path);
         mount_manager.set_fuse_limits(config.fuse.max_background, config.fuse.congestion_threshold);
         mount_manager.set_night_lighting(config.night_enabled);
+        mount_manager.set_night_brightness(config.night_brightness);
         if let Some(timeout_secs) = config.service.generation_timeout() {
             mount_manager.set_generation_timeout(timeout_secs);
         }

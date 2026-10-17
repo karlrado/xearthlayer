@@ -66,6 +66,8 @@ pub struct OrchestratorConfig {
 
     /// Whether the ortho mount serves generated night lighting (`night.enabled`).
     pub night_enabled: bool,
+    /// Overall lit brightness multiplier (`night.brightness`).
+    pub night_brightness: f64,
 
     /// Whether TUI mode is active (affects logging behavior).
     pub tui_mode: bool,
@@ -213,6 +215,7 @@ impl OrchestratorConfig {
             prewarm,
             fuse,
             night_enabled: config.night.enabled,
+            night_brightness: config.night.brightness,
             tui_mode,
         }
     }

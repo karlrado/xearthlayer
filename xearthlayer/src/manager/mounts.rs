@@ -166,6 +166,8 @@ pub struct MountManager {
     generation_timeout_secs: u64,
     /// Whether the ortho mount serves generated night lighting (`night.enabled`).
     night_enabled: bool,
+    /// Overall lit brightness multiplier (`night.brightness`).
+    night_brightness: f64,
 }
 
 impl MountManager {
@@ -190,6 +192,7 @@ impl MountManager {
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
             generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
             night_enabled: false,
+            night_brightness: crate::night::DEFAULT_NIGHT_BRIGHTNESS,
         }
     }
 
@@ -221,6 +224,11 @@ impl MountManager {
         self.night_enabled = enabled;
     }
 
+    /// Overall lit brightness for the night lit source (`night.brightness`).
+    pub fn set_night_brightness(&mut self, brightness: f64) {
+        self.night_brightness = brightness;
+    }
+
     /// The lit source for this installation, or `None` (black) when the
     /// X-Plane installation behind the scenery path cannot be found.
     fn night_lit_source(
@@ -244,11 +252,14 @@ impl MountManager {
             .join("Output")
             .join("preferences")
             .join("X-Plane.prf");
-        Some(Arc::new(crate::night::NightLitSource::new(
-            Arc::new(crate::night::RecipeStore::from_index(index)),
-            Arc::new(crate::night::LaminarArt::new(art_root)),
-            Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
-        )))
+        Some(Arc::new(
+            crate::night::NightLitSource::new(
+                Arc::new(crate::night::RecipeStore::from_index(index)),
+                Arc::new(crate::night::LaminarArt::new(art_root)),
+                Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
+            )
+            .with_brightness(self.night_brightness),
+        ))
     }
 
     /// Set the upper bound for a single DDS generation behind a FUSE read.
@@ -1038,6 +1049,14 @@ mod tests {
         assert!(!manager.night_enabled);
         manager.set_night_lighting(true);
         assert!(manager.night_enabled);
+    }
+
+    #[test]
+    fn test_night_brightness_defaults_to_one_and_is_settable() {
+        let mut manager = MountManager::new();
+        assert_eq!(manager.night_brightness, 1.0);
+        manager.set_night_brightness(1.25);
+        assert_eq!(manager.night_brightness, 1.25);
     }
 
     #[test]

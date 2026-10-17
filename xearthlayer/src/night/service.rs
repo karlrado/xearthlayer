@@ -58,6 +58,16 @@ const LIT_PROBE_PERMITS: usize = 2;
 /// outside this range is dark without computing anything.
 const SUPPORTED_LIT_ZOOMS: std::ops::RangeInclusive<u8> = 12..=22;
 
+/// Concurrent lit generations (CPU: about a million texels plus a BC1 encode
+/// each). Kept small so lit work never crowds ortho generation (R17).
+const LIT_GENERATION_PERMITS: usize = 2;
+
+/// Memory for generated visible levels (about 0.7 MB per urban ZL16 texture).
+const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Default overall brightness (`night.brightness`).
+pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
+
 /// Phase 2a's lit source: full-size, correctly laid out black textures where
 /// the recipe and the user's art say there is light; the minimal black DDS
 /// everywhere else.
@@ -71,6 +81,11 @@ pub struct NightLitSource {
     /// footprint ever asked about.
     lit: DashMap<(u32, u32, u8), bool>,
     probes: tokio::sync::Semaphore,
+    /// Generated visible levels by footprint. Evicting is safe: a payload
+    /// regenerates to the same bytes (R13) and never changes the size.
+    payloads: moka::sync::Cache<(u32, u32, u8), Bytes>,
+    generations: tokio::sync::Semaphore,
+    brightness: f64,
 }
 
 impl NightLitSource {
@@ -85,6 +100,71 @@ impl NightLitSource {
             setting,
             lit: DashMap::new(),
             probes: tokio::sync::Semaphore::new(LIT_PROBE_PERMITS),
+            payloads: moka::sync::Cache::builder()
+                .max_capacity(LIT_PAYLOAD_CACHE_BYTES)
+                .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
+                .build(),
+            generations: tokio::sync::Semaphore::new(LIT_GENERATION_PERMITS),
+            brightness: DEFAULT_NIGHT_BRIGHTNESS,
+        }
+    }
+
+    /// Overall lit brightness (`night.brightness`, 0.5 to 1.5 in config).
+    pub fn with_brightness(mut self, brightness: f64) -> Self {
+        self.brightness = brightness;
+        self
+    }
+
+    /// The generated visible levels of a lit footprint, or `None` (black)
+    /// when generation fails. Not cached on failure.
+    async fn payload(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
+        let key = (name.row, name.col, name.zoom);
+        if let Some(hit) = self.payloads.get(&key) {
+            return Some(hit);
+        }
+        let _permit = self.generations.acquire().await.ok()?;
+        if let Some(hit) = self.payloads.get(&key) {
+            return Some(hit);
+        }
+        let started = Instant::now();
+        let (store, art, owned, size, brightness) = (
+            Arc::clone(&self.store),
+            Arc::clone(&self.art),
+            name.clone(),
+            layout.first_visible,
+            self.brightness,
+        );
+        let generated = tokio::task::spawn_blocking(move || {
+            let image = super::generator::generate_visible(
+                &owned,
+                size,
+                |lat, lon| store.get(lat, lon),
+                |n| art.pattern(n),
+                brightness,
+            );
+            super::generator::encode_visible(image)
+        })
+        .await;
+        match generated {
+            Ok(Ok(payload)) => {
+                debug!(
+                    row = name.row,
+                    col = name.col,
+                    zoom = name.zoom,
+                    ms = started.elapsed().as_millis() as u64,
+                    "Night lighting: lit texture generated"
+                );
+                self.payloads.insert(key, payload.clone());
+                Some(payload)
+            }
+            Ok(Err(e)) => {
+                warn!(error = %e, "Night lighting: lit encode failed; texture served black");
+                None
+            }
+            Err(_) => {
+                warn!("Night lighting: lit generation failed; texture served black");
+                None
+            }
         }
     }
 
@@ -159,7 +239,16 @@ impl LitTextureSource for NightLitSource {
     fn read<'a>(&'a self, name: &'a DdsFilename, offset: u64, len: u32) -> BoxFuture<'a, Bytes> {
         Box::pin(async move {
             if self.has_light(name).await {
-                self.layout(name).read_black(offset, len)
+                let layout = self.layout(name);
+                // Header and blank levels need no pixels; only a read that
+                // reaches the visible levels generates them.
+                if offset.saturating_add(u64::from(len)) <= layout.payload_start() {
+                    return layout.read_black(offset, len);
+                }
+                match self.payload(name, &layout).await {
+                    Some(payload) => layout.read_lit(offset, len, &payload),
+                    None => layout.read_black(offset, len),
+                }
             } else {
                 BlackLitSource.read(name, offset, len).await
             }
@@ -233,7 +322,11 @@ mod tests {
                 "TEXTURE_LIT ../textures12/urban_FAR/uw5_FAR_LIT.dds\n",
             )
             .unwrap();
-            std::fs::write(art.join("textures12/urban_FAR/uw5_FAR_LIT.dds"), b"DDS ").unwrap();
+            // A 4 x 4 solid red DXT1 lit texture.
+            let mut dds =
+                crate::dds::DdsHeader::new(4, 4, 1, crate::dds::DdsFormat::BC1).to_bytes();
+            dds.extend_from_slice(&[0x00, 0xF8, 0, 0, 0, 0, 0, 0]);
+            std::fs::write(art.join("textures12/urban_FAR/uw5_FAR_LIT.dds"), dds).unwrap();
 
             let source = NightLitSource::new(
                 Arc::new(RecipeStore::new(vec![pkg])),
@@ -279,6 +372,33 @@ mod tests {
             let name = name_at(37.60, -122.20); // countryside in the golden tile
             assert_eq!(source.size(&name).await, 152);
             assert_eq!(source.read(&name, 0, 4096).await, minimal_black_dds());
+        }
+
+        #[tokio::test]
+        async fn a_lit_footprint_has_light_in_its_visible_levels() {
+            let (_t, source) = fixture();
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let visible = source.read(&name, layout.payload_start(), 1 << 20).await;
+            assert_eq!(
+                visible.len() as u64,
+                layout.payload_len(),
+                "short read at EOF"
+            );
+            assert!(visible.iter().any(|&b| b != 0), "generated light");
+            let blank = source.read(&name, 128, 4096).await;
+            assert!(blank.iter().all(|&b| b == 0), "the fade level stays black");
+        }
+
+        #[tokio::test]
+        async fn zero_brightness_keeps_it_black() {
+            let (_t, source) = fixture();
+            let source = source.with_brightness(0.0);
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let visible = source.read(&name, layout.payload_start(), 1 << 20).await;
+            assert!(visible.iter().all(|&b| b == 0));
+            assert_eq!(source.size(&name).await, layout.total_len, "size unchanged");
         }
 
         #[tokio::test]
