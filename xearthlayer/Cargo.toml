@@ -12,6 +12,7 @@ name = "xearthlayer"
 path = "src/lib.rs"
 
 [dependencies]
+ciborium = "0.2"
 xearthlayer-package = { path = "../xearthlayer-package" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
 reqwest.workspace = true
