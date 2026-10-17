@@ -4,8 +4,12 @@
 //! serves a minimal black texture for every lit name; phase 2 generates
 //! light from the recipes and the user's Laminar lit art.
 
+pub mod layout;
 pub mod recipe;
+pub mod service;
 pub mod store;
 
+pub use layout::minimal_black_dds;
 pub use recipe::{parse_recipe, BrightnessScale, Grid, Recipe, RecipeError, SUPPORTED_MAJOR};
+pub use service::{BlackLitSource, LitTextureSource};
 pub use store::{block_name, recipe_path, tile_name, RecipeStore};
