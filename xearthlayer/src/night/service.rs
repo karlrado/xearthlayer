@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use futures::future::BoxFuture;
 use tracing::{debug, warn};
 
@@ -80,10 +80,10 @@ pub fn lit_generation_permits(cores: usize) -> usize {
     (cores / 8).clamp(MIN_LIT_GENERATION_PERMITS, MAX_LIT_GENERATION_PERMITS)
 }
 
-/// Extra attempts at a recipe read that failed with an I/O error before a
-/// footprint is answered dark for the session.
-const PROBE_RETRIES: u32 = 2;
-const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+/// Extra attempts at a recipe read that failed with an I/O error before the
+/// tile is given up on for the session.
+const RECIPE_RETRIES: u32 = 2;
+const RECIPE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
 
 /// Calls `attempt` until it succeeds, at most `retries + 1` times.
 fn with_retries<T, E>(
@@ -103,6 +103,62 @@ fn with_retries<T, E>(
     }
 }
 
+/// A recipe that could not be read, even after retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unreadable;
+
+/// Recipe reads for the lit path: retried, and given up on for the session
+/// once the retries run out.
+///
+/// `RecipeStore` caches no I/O error, so each attempt here really rereads.
+/// Once a tile's retries are exhausted it is remembered here, and later
+/// reads of it fail at once: the retries, their delay and the warning cost
+/// once per tile, not once per footprint.
+struct SessionRecipes {
+    store: Arc<RecipeStore>,
+    given_up: DashSet<(i32, i32)>,
+}
+
+impl SessionRecipes {
+    fn new(store: Arc<RecipeStore>) -> Self {
+        Self {
+            store,
+            given_up: DashSet::new(),
+        }
+    }
+
+    /// The tile's recipe (`None` for none), or `Unreadable`. Blocking I/O.
+    fn get(&self, lat: i32, lon: i32) -> Result<Option<Arc<Recipe>>, Unreadable> {
+        if self.given_up.contains(&(lat, lon)) {
+            return Err(Unreadable);
+        }
+        with_retries(RECIPE_RETRIES, RECIPE_RETRY_DELAY, || {
+            self.store.get_checked(lat, lon)
+        })
+        .map_err(|e| {
+            if self.given_up.insert((lat, lon)) {
+                warn!(lat, lon, error = %e,
+                      "Night lighting: recipe unreadable after retries; tile stays dark this session");
+            }
+            Unreadable
+        })
+    }
+
+    /// Every recipe the generator can read for `footprint`, or `Unreadable`
+    /// when one of them cannot be read. Blocking I/O.
+    fn for_footprint(&self, footprint: &Footprint) -> Result<FootprintRecipes, Unreadable> {
+        footprint
+            .expanded(FIELD_MARGIN_DEG)
+            .tiles()
+            .into_iter()
+            .map(|(lat, lon)| Ok(((lat, lon), self.get(lat, lon)?)))
+            .collect()
+    }
+}
+
+/// The recipes of the tiles a footprint's field covers.
+type FootprintRecipes = HashMap<(i32, i32), Option<Arc<Recipe>>>;
+
 /// Memory for generated visible levels (about 0.7 MB per urban ZL16 texture).
 const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 
@@ -114,7 +170,7 @@ pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 /// the visible levels, coalesced across concurrent readers, with permits
 /// following the core count); the minimal black DDS everywhere else.
 pub struct NightLitSource {
-    store: Arc<RecipeStore>,
+    recipes: Arc<SessionRecipes>,
     art: Arc<LaminarArt>,
     setting: Arc<dyn TextureSettingSource>,
     /// Session-stable answers. Never evicts: an evicted entry could be
@@ -124,7 +180,9 @@ pub struct NightLitSource {
     lit: DashMap<(u32, u32, u8), bool>,
     probes: tokio::sync::Semaphore,
     /// Generated visible levels by footprint. Evicting is safe: a payload
-    /// regenerates to the same bytes (R13) and never changes the size.
+    /// regenerates to the same bytes (R13), or to none (black) once one of its
+    /// recipes has been given up on, and never changes the size. A payload is
+    /// only built from a complete set of recipes.
     payloads: moka::future::Cache<(u32, u32, u8), Bytes>,
     generations: tokio::sync::Semaphore,
     brightness: f64,
@@ -138,7 +196,7 @@ impl NightLitSource {
         setting: Arc<dyn TextureSettingSource>,
     ) -> Self {
         Self {
-            store,
+            recipes: Arc::new(SessionRecipes::new(store)),
             art,
             setting,
             lit: DashMap::new(),
@@ -168,8 +226,8 @@ impl NightLitSource {
     }
 
     /// The generated visible levels of a lit footprint, or `None` (black)
-    /// when generation fails. Concurrent callers for one key share one
-    /// generation; a failure is not cached.
+    /// when generation fails or a recipe cannot be read. Concurrent callers
+    /// for one key share one generation; a failure is not cached.
     async fn payload(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
         let key = (name.row, name.col, name.zoom);
         self.payloads
@@ -180,8 +238,8 @@ impl NightLitSource {
     async fn generate(&self, name: DdsFilename, size: u32) -> Option<Bytes> {
         let _permit = self.generations.acquire().await.ok()?;
         let started = Instant::now();
-        let (store, art, generator, owned, size, brightness) = (
-            Arc::clone(&self.store),
+        let (recipes, art, generator, owned, size, brightness) = (
+            Arc::clone(&self.recipes),
             Arc::clone(&self.art),
             Arc::clone(&self.generator),
             name.clone(),
@@ -189,20 +247,35 @@ impl NightLitSource {
             self.brightness,
         );
         let generated = tokio::task::spawn_blocking(move || {
-            let recipes = |lat: i32, lon: i32| store.get(lat, lon);
+            // All recipes first: a payload missing one would be cached and
+            // differ from its regeneration (R13).
+            let Ok(fetched) = recipes.for_footprint(&Footprint::from_name(&owned)) else {
+                return None;
+            };
+            let lookup = |lat: i32, lon: i32| fetched.get(&(lat, lon)).cloned().flatten();
             let patterns = |n: &str| art.pattern(n);
             let image = generator.generate(&LitRequest {
                 name: &owned,
                 size,
                 brightness,
-                recipes: &recipes,
+                recipes: &lookup,
                 patterns: &patterns,
             });
-            super::generator::encode_visible(image)
+            Some(super::generator::encode_visible(image))
         })
         .await;
         match generated {
-            Ok(Ok(payload)) => {
+            Ok(None) => {
+                // Warned once, when the tile was given up on.
+                debug!(
+                    row = name.row,
+                    col = name.col,
+                    zoom = name.zoom,
+                    "Night lighting: a recipe is unreadable; texture served black"
+                );
+                None
+            }
+            Ok(Some(Ok(payload))) => {
                 debug!(
                     row = name.row,
                     col = name.col,
@@ -212,7 +285,7 @@ impl NightLitSource {
                 );
                 Some(payload)
             }
-            Ok(Err(e)) => {
+            Ok(Some(Err(e))) => {
                 warn!(error = %e, "Night lighting: lit encode failed; texture served black");
                 None
             }
@@ -240,27 +313,12 @@ impl NightLitSource {
         }
         let wait_ms = started.elapsed().as_millis() as u64;
         let probe_started = Instant::now();
-        let (store, art) = (Arc::clone(&self.store), Arc::clone(&self.art));
+        let (recipes, art) = (Arc::clone(&self.recipes), Arc::clone(&self.art));
         let footprint = Footprint::from_name(name);
         let lit = match tokio::task::spawn_blocking(move || {
-            // Every tile the generator could read for this footprint.
-            let recipes: HashMap<(i32, i32), Option<Arc<Recipe>>> = footprint
-                .expanded(FIELD_MARGIN_DEG)
-                .tiles()
-                .into_iter()
-                .map(|(lat, lon)| {
-                    let recipe = with_retries(PROBE_RETRIES, PROBE_RETRY_DELAY, || {
-                        store.get_checked(lat, lon)
-                    })
-                    .unwrap_or_else(|e| {
-                        warn!(lat, lon, error = %e,
-                              "Night lighting: recipe unreadable after retries; footprint stays dark this session");
-                        None
-                    });
-                    ((lat, lon), recipe)
-                })
-                .collect();
-            let lookup = |lat: i32, lon: i32| recipes.get(&(lat, lon)).cloned().flatten();
+            // The field reads every tile the generator could read for this
+            // footprint, once each; an unreadable one counts as dark.
+            let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().flatten();
             RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some())
         })
         .await
@@ -274,7 +332,7 @@ impl NightLitSource {
                 false
             }
         };
-        self.lit.insert(key, lit);
+        let lit = self.remember(key, lit);
         debug!(
             row = name.row,
             col = name.col,
@@ -285,6 +343,13 @@ impl NightLitSource {
             "Night lighting: lit probe"
         );
         lit
+    }
+
+    /// Commits a probe answer and returns the committed one: the first
+    /// answer for a key wins, so two probes that finish with different
+    /// answers cannot give `size` and `read` different lengths (R7).
+    fn remember(&self, key: (u32, u32, u8), lit: bool) -> bool {
+        *self.lit.entry(key).or_insert(lit)
     }
 
     fn layout(&self, name: &DdsFilename) -> LitLayout {
@@ -438,7 +503,11 @@ mod tests {
 
         /// The ZL16 texture name whose footprint contains (lat, lon).
         fn name_at(lat: f64, lon: f64) -> DdsFilename {
-            let n = f64::from(1u32 << 16);
+            name_at_zoom(lat, lon, 16)
+        }
+
+        fn name_at_zoom(lat: f64, lon: f64, zoom: u8) -> DdsFilename {
+            let n = f64::from(1u32 << zoom);
             let x = ((lon + 180.0) / 360.0 * n) as u32;
             let lat_r = lat.to_radians();
             let y = ((1.0 - (lat_r.tan() + 1.0 / lat_r.cos()).ln() / std::f64::consts::PI) / 2.0
@@ -446,10 +515,72 @@ mod tests {
             DdsFilename {
                 row: y / 16 * 16,
                 col: x / 16 * 16,
-                zoom: 16,
+                zoom,
                 map_type: "BI".into(),
                 kind: TextureKind::Lit,
             }
+        }
+
+        /// Makes the fixture's recipe unreadable; false when running as root,
+        /// where permissions do not apply.
+        #[cfg(unix)]
+        fn set_recipe_readable(temp: &TempDir, readable: bool) -> bool {
+            use std::os::unix::fs::PermissionsExt;
+            let path = crate::night::recipe_path(&temp.path().join("pkg"), 37, -123);
+            let mode = if readable { 0o644 } else { 0o000 };
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            readable || std::fs::File::open(&path).is_err()
+        }
+
+        #[test]
+        fn the_first_committed_probe_answer_wins() {
+            // Two probes of one footprint can finish with different answers
+            // (one recipe read failing after its retries); whichever commits
+            // first is the answer for everyone, so size and read agree (R7).
+            let (_t, source) = fixture();
+            let key = (1, 2, 16);
+            assert!(source.remember(key, true));
+            assert!(source.remember(key, false), "the later answer is dropped");
+            assert!(source.lit.get(&key).is_some_and(|v| *v));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn a_recipe_read_failure_during_generation_is_not_a_payload() {
+            // A payload built without one of its recipes would be cached and
+            // differ from a regeneration (R13): generation gives up instead,
+            // and the read serves full-size black.
+            let (temp, source) = fixture();
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            if !set_recipe_readable(&temp, false) {
+                return;
+            }
+            assert_eq!(source.payload(&name, &layout).await, None);
+            assert_eq!(source.payloads.entry_count(), 0, "nothing cached");
+            source.payloads.run_pending_tasks().await;
+            assert!(source
+                .payloads
+                .get(&(name.row, name.col, name.zoom))
+                .await
+                .is_none());
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_unreadable_tile_is_remembered_for_the_session() {
+            // After its retries a tile is given up on for the session, so the
+            // retries, their delay and the warning cost once per tile, not
+            // once per footprint.
+            let (temp, source) = fixture();
+            if !set_recipe_readable(&temp, false) {
+                return;
+            }
+            assert_eq!(source.size(&name_at(37.20, -122.725)).await, 152);
+            assert!(set_recipe_readable(&temp, true));
+            let other = name_at_zoom(37.17, -122.74, 17);
+            assert_eq!(source.size(&other).await, 152, "the tile stays given up");
+            assert_eq!(source.read(&other, 0, u32::MAX).await, minimal_black_dds());
         }
 
         #[tokio::test]
