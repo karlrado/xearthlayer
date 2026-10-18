@@ -67,7 +67,7 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
 | Where lit work runs | A separate lit path beside the ortho executor, never a job on the demand or prefetch lane | Lit generation must not delay ortho generation (R17) and must not share coalescing or cache keys with it (R8). A separate path guarantees both: lit inodes are routed to the lit source, and the ortho request path returns the black texture for a lit name as a guard |
 | Texel density | 1024 px at the first visible level of a ZL16 texture (about 7.5 m per texel), scaling by zoom | The project owner's decision: about 2.8 MB of video memory per urban ZL16 texture, against about 10.7 MB at 2048 px |
 | Decoding Laminar's art | `ddsfile` (header and mip layout) and `bcdec_rs` (a pure Rust port of `bcdec`) | No DDS decoder exists in XEL. Decoding happens once per art file per session, so correctness and size matter, not speed |
-| Encoding lit textures | XEL's existing compressor selection: ISPC by default, the wgpu worker when `texture.compressor = gpu` | The most efficient encoders XEL has. A lit texture is under a tenth of an ortho tile's texels |
+| Encoding lit textures | The default ISPC encoder, whatever `texture.compressor` says | A lit payload is about a tenth of an ortho tile, so the GPU channel worker is not wired into the lit path |
 | Recipe container | `ciborium` for CBOR, `flate2` for the zlib layers | CBOR is the format's choice; `flate2` is already a dependency |
 | Caching | Memory only, keyed by footprint and a settings fingerprint | Regeneration is cheap (tens of milliseconds) and deterministic. A disk tier would need invalidation whenever X-Plane, its settings or the art changed |
 | Configuration | `night.enabled` and `night.brightness` | `brightness` is a visual preference, not a performance knob. It is a development setting, reviewed before release |
@@ -302,12 +302,13 @@ For each texel of the first visible level, the CPU implementation:
      textures and 1° tiles have no seam.
 4. **Applies the gain** (`gain.rs`). Brightness is interpolated
    bilinearly in its byte (log) domain, with 0 where a neighbour has no
-   recipe, and converted to radiance `R` with the recipe's `scale`. The gain is a linear ramp in `ln(R)` from a floor
-   radiance (gain 0) to a ceiling radiance (gain 1), raised to a gamma, then
-   multiplied by `night.brightness` and clamped to 0 to 1 (R10). The floor,
-   ceiling and gamma are constants in code, set by the tuning flight; the
-   provisional values are a floor of 1.6 (a gain of about 0.05 at 2), a ceiling of 150 nW·cm⁻²·sr⁻¹ and a
-   gamma of 1.0.
+   recipe, and converted to radiance `R` with the recipe's `scale`. The
+   gain is a linear ramp in `ln(R)` from a floor radiance (gain 0) to a
+   ceiling radiance (gain 1), raised to a gamma, then multiplied by
+   `night.brightness` and clamped to 0 to 1 (R10). The floor, ceiling and
+   gamma are constants in code, set by the tuning flight; the provisional
+   values are a floor of 1.6 (a gain of about 0.05 at 2), a ceiling of
+   150 nW·cm⁻²·sr⁻¹ and a gamma of 1.0.
 5. **Outputs** the weighted sum of class patterns × gain, as RGB.
 
 `encode_visible` then box-filters the lower levels from the first visible
@@ -455,10 +456,12 @@ the tuning flight that sets the gain constants and confirms `LUMINANCE 150`.
   4; the layout's zero-region reads at every boundary.
 - **Generator properties.** The same input gives identical bytes;
   adjacent footprints match along their shared edge at the first visible
-  level; the same ground gives the same light at any zoom (a ZL16 texture
-  and the ZL18 textures nested in it agree); no brightness step appears at
-  a degree line, where two tiles' recipes meet; an empty footprint gives the minimal black DDS; blank levels are
-  all zero and the next level is not.
+  level; the same ground gives the same light at any zoom (a ZL15 texture
+  at 128 px and the ZL16 texture covering one quarter of it at 64 px
+  agree to within 2 levels per channel); no brightness step appears at a
+  degree line, where two tiles' recipes meet; an empty footprint gives
+  the minimal black DDS; blank levels are all zero and the next level is
+  not.
 - **FUSE integration.** `stat` and a full read agree on size; a lit
   texture and the ortho texture with the same row, column and zoom have
   different inodes and different bytes; `night/` does not appear in a
@@ -555,10 +558,10 @@ from the user's own X-Plane installation and never redistributed.
 ## Open Questions
 
 - The gain constants and `LUMINANCE 150`: set on the tuning flight.
-- The ZL16/ZL18 edge at SFO: the ZL16 hill texture `25360_10464_GO216` looked
-  unlit at an edge where ZL18 was lit. An offline run of the real generator
-  on the real package lit that texture (22% of texels), so the generator is
-  ruled out. Serving or X-Plane's drawing remain the candidates; the next
+- The ZL16/ZL18 edge at SFO: in the 2026-10-17 flight the ZL16 hill texture
+  `25360_10464_GO216` looked unlit at an edge where ZL18 was lit. An
+  offline run of the real generator on the real package lit that texture
+  (22% of texels), so the generator is ruled out. Serving or X-Plane's drawing remain the candidates; the next
   flight with `--debug` decides between them.
 - Whether X-Plane accepts a 32768 px header at texture setting 0 (see the
   layout's risk).
