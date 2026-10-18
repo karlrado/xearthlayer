@@ -214,17 +214,23 @@ mod tests {
 
     #[test]
     fn the_same_ground_gives_the_same_light_at_any_zoom() {
-        // A ZL15 texture at 2N px and the ZL16 texture covering its north-west
-        // quarter at N px have identical texel centres, so their pixels match.
-        let z15 = name_at(37.20, -122.725);
-        let z15 = name(z15.row / 32 * 16, z15.col / 32 * 16, 15);
-        let z16 = name(z15.row * 2, z15.col * 2, 16);
+        // A ZL15 texture at 2N px contains the ZL16 texture at N px as one of
+        // its quarters; their texel centres coincide, so their pixels match.
+        let z16 = name_at(37.20, -122.725);
+        let z15 = name(z16.row / 32 * 16, z16.col / 32 * 16, 15);
         let big = generate(&z15, 128, golden, speckled, 1.0);
         let small = generate(&z16, 64, golden, speckled, 1.0);
+        assert!(
+            lit_texels(&small) > 64 * 64 / 20,
+            "the compared ground holds the lit block: {}",
+            lit_texels(&small)
+        );
+        let x0 = (z16.col - 2 * z15.col) / 16 * 64;
+        let y0 = (z16.row - 2 * z15.row) / 16 * 64;
         let mut worst = 0i32;
         for y in 0..64 {
             for x in 0..64 {
-                let (a, b) = (big.get_pixel(x, y), small.get_pixel(x, y));
+                let (a, b) = (big.get_pixel(x0 + x, y0 + y), small.get_pixel(x, y));
                 for ch in 0..3 {
                     worst = worst.max((i32::from(a[ch]) - i32::from(b[ch])).abs());
                 }
@@ -234,17 +240,34 @@ mod tests {
     }
 
     #[test]
-    fn no_seam_at_a_degree_line() {
+    fn no_brightness_step_at_a_degree_line() {
         // Texture col 10544 at ZL16 spans lon -122.080..-121.992, across -122.
-        let lit = |lat0: i32, lon0: i32| synthetic(lat0, lon0, 120, |_, _| 1, 4, |_, _| 255);
-        let recipes =
-            move |a: i32, b: i32| ((a, b) == (37, -123) || (a, b) == (37, -122)).then(|| lit(a, b));
+        // The west tile is brighter than the east one. Brightness 100 is
+        // radiance 8 (gain 0.36); nearest-cell brightness would step from
+        // full light to that at the line, bilinear brightness ramps.
+        let west = synthetic(37, -123, 120, |_, _| 1, 4, |_, _| 255);
+        let east = synthetic(37, -122, 120, |_, _| 1, 4, |_, _| 100);
+        let recipes = move |a: i32, b: i32| match (a, b) {
+            (37, -123) => Some(west.clone()),
+            (37, -122) => Some(east.clone()),
+            _ => None,
+        };
         // Row 25392 spans lat 37.440..37.510.
         let img = generate(&name(25392, 10544, 16), 64, recipes, white, 1.0);
-        let values: Vec<u8> = img.pixels().map(|p| p[0]).collect();
-        let (lo, hi) = (values.iter().min().unwrap(), values.iter().max().unwrap());
-        assert!(hi - lo <= 1, "flat lit ground, {lo}..{hi}");
-        assert!(*lo >= 254, "gain 1 at byte 255: {lo}");
+        let (mut lo, mut hi, mut step) = (255u8, 0u8, 0i32);
+        for y in 0..64 {
+            for x in 0..64 {
+                let v = img.get_pixel(x, y)[0];
+                lo = lo.min(v);
+                hi = hi.max(v);
+                if x < 63 {
+                    let next = img.get_pixel(x + 1, y)[0];
+                    step = step.max((i32::from(next) - i32::from(v)).abs());
+                }
+            }
+        }
+        assert!(hi - lo >= 10, "both brightnesses show: {lo}..{hi}");
+        assert!(step <= 3, "largest step between neighbours {step}");
     }
 
     #[test]
