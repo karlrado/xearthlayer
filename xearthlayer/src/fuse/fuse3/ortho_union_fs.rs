@@ -1380,6 +1380,7 @@ mod tests {
                 cancellation,
                 response_tx: Some(tx),
                 origin: RequestOrigin::Fuse,
+                created: std::time::Instant::now(),
             };
             let _ = self.tx.try_send(request);
             rx
@@ -1399,6 +1400,7 @@ mod tests {
                 cancellation,
                 response_tx: Some(tx),
                 origin,
+                created: std::time::Instant::now(),
             };
             let _ = self.tx.try_send(request);
             rx
