@@ -292,7 +292,7 @@ For each texel of the first visible level, the CPU implementation:
    radiance (gain 0) to a ceiling radiance (gain 1), raised to a gamma, then
    multiplied by `night.brightness` and clamped to 0 to 1 (R10). The floor,
    ceiling and gamma are constants in code, set by the tuning flight; the
-   provisional values are a floor of 2, a ceiling of 150 nW·cm⁻²·sr⁻¹ and a
+   provisional values are a floor of 1.6 (a gain of about 0.05 at 2), a ceiling of 150 nW·cm⁻²·sr⁻¹ and a
    gamma of 1.0.
 5. **Outputs** the weighted sum of class patterns × gain, as RGB.
 
