@@ -222,7 +222,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `LitTextureSource` / `BlackLitSource` (`service.rs`) and the 152-byte minimal black DDS (`layout.rs`)
     - FUSE routes `_LIT.dds` names (`TextureKind::Lit`, `LIT_INODE_FLAG`) to the lit source, never the executor
     - Phase 2a: `NightLitSource` (`service.rs`) answers lit `stat`/`open` with the real file size for the player's texture setting; `LaminarArt` (`laminar/`) reads the installed lit art, `StartupTextureSetting` (`prefs.rs`) reads the setting once at start, and `footprint.rs` decides whether a footprint has light (`has_light`) and `layout.rs` (`LitLayout`) sizes the file. Wired by `MountManager::set_night_lighting` from `night.enabled` (default true); when the X-Plane installation is not found the black default stays
-    - Flight-test generator (`generator.rs`, a phase 2b slice): first visible level from the nearest recipe class cell, Laminar pattern decoded by `laminar/pattern.rs` (`ddsfile` + `bcdec_rs`) and tiled straight, anchored per 1 degree tile, times a provisional gain from VIIRS radiance (`GAIN_*` constants) and `night.brightness` (0.5 to 1.5); encoded with the default ISPC BC1 encoder and served after the blank levels by `LitLayout::read_lit`; payloads cached in memory (256 MB), concurrent reads of one footprint coalesced (moka `optionally_get_with`), generation permits follow the core count (2 to 4), recipe reads retried before a footprint is answered dark, probe footprint widened by `LIGHT_REACH_DEG`. Stochastic tiling and soft class edges are still to come
+    - Generator (`generator/`): `LitGenerator::generate(&LitRequest) -> RgbaImage` is infallible and `encode_visible` BC1-encodes with the default ISPC encoder. `CpuLitGenerator` (`cpu.rs`) computes each texel from its ground position alone: `RecipeField` (`field.rs`) gives bilinear brightness and class weights from globally indexed cells (warped by value noise, `noise.rs`, so class edges are soft and cross 1 degree tiles), `gain.rs` maps VIIRS radiance and `night.brightness` (0.5 to 1.5) to a gain, and `tiling.rs` samples the Laminar pattern decoded by `laminar/pattern.rs` with hex stochastic tiling in Web Mercator metres. `NightLitSource` serves the result after the blank levels via `LitLayout::read_lit`: payloads cached in memory (256 MB) keyed `(row, col, zoom)`, concurrent reads of one footprint coalesced (moka `optionally_get_with`), generation permits `(cores / 8).clamp(2, 4)` and 2 probe permits held inside `BLOCKING_POOL_HEADROOM` by a compile-time assertion, probe recipe reads retried before a footprint is answered dark, probe footprint widened by `LIGHT_REACH_DEG`. Tuning continues by flight
     - Publisher copies `yOrtho4XP_Night/` recipes into the package's `night/` folder
     - See `docs/dev/night-lighting-design.md`
 
@@ -438,6 +438,8 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/night/laminar/` | Laminar lit art reader (`art.rs`, `library.rs`, `ter.rs`) |
 | `xearthlayer/src/night/prefs.rs` | StartupTextureSetting - texture setting read once from `X-Plane.prf` |
 | `xearthlayer/src/night/footprint.rs` | Footprint geometry and `has_light` (decides full-size vs minimal) |
+| `xearthlayer/src/night/generator/cpu.rs` | CpuLitGenerator: per-texel lit generation from ground position |
+| `xearthlayer/src/night/generator/tiling.rs` | Hex stochastic tiling of the Laminar pattern in Web Mercator metres |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
 | `xearthlayer/src/ortho_union/builder.rs` | OrthoUnionIndexBuilder (with progress + caching) |
 | `xearthlayer/src/update/mod.rs` | Version update checking (VersionManifest, UpdateInfo) |
@@ -574,7 +576,7 @@ matrix jobs are renamed.
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
-- **Night lighting**: `docs/dev/night-lighting-design.md` (phase 1 and 2a implemented (packaging, black serving, real lit sizes), phase 2b proposed: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
+- **Night lighting**: `docs/dev/night-lighting-design.md` (phases 1, 2a and 2b implemented (packaging, black serving, real lit sizes, generated lit textures): lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
 - **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.

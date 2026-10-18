@@ -1,6 +1,6 @@
 # Night Lighting Design
 
-**Status**: Phase 1 and phase 2a implemented (packaging, black serving, real lit sizes); a phase 2b flight-test generator implemented (nearest class, straight world-anchored tiling, provisional gain, `night.brightness`); stochastic tiling, soft class edges and tuning proposed
+**Status**: Phase 1, phase 2a and phase 2b implemented (packaging, black serving, real lit sizes, the `LitGenerator` trait with its CPU implementation, bilinear world fields, warped soft class edges, hex stochastic tiling, and a coalesced service); tuning continues by flight
 **Created**: 2026-10-17
 **Branch**: `blackmarble` (local until 0.5.0 release preparation)
 
@@ -110,10 +110,12 @@ texture kind. Everything else is new code in `xearthlayer/src/night/`:
 | `night/footprint.rs` | A lit texture's ground footprint and `has_light` |
 | `night/layout.rs` | The lit DDS layout: sizes, blank levels, zero regions |
 | `night/prefs.rs` | `XPlanePrefs`: the texture quality setting |
-| `night/generator/mod.rs` | The `LitGenerator` trait |
-| `night/generator/cpu.rs` | The CPU implementation |
-| `night/generator/tiling.rs` | Hex-grid stochastic tiling |
+| `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, and `encode_visible` |
 | `night/generator/gain.rs` | The gain curve |
+| `night/generator/noise.rs` | Integer hashing and world-anchored value noise |
+| `night/generator/field.rs` | `RecipeField`: recipe layers as continuous functions of world position |
+| `night/generator/tiling.rs` | Hex-grid stochastic tiling in Web Mercator metres |
+| `night/generator/cpu.rs` | `CpuLitGenerator`, the CPU implementation |
 | `night/service.rs` | `LitTextureService`: the FUSE-facing entry point |
 
 ### Recipe reader (`night/recipe.rs`)
@@ -252,14 +254,20 @@ pub trait TextureSettingSource: Send + Sync {
 
 ```rust
 pub trait LitGenerator: Send + Sync {
-    /// Visible levels' pixels for one footprint, top first.
-    fn generate(&self, request: &LitRequest<'_>) -> Result<LitImage, LitError>;
+    /// `size` x `size` pixels, north up, black wherever nothing is lit.
+    fn generate(&self, request: &LitRequest<'_>) -> RgbaImage;
 }
 ```
 
-`LitRequest` carries the footprint, the recipes it touches, the resolved
-patterns and the settings. The trait leaves room for a GPU generator
-later (R17); the CPU implementation comes first.
+`LitRequest` carries the texture name (footprint and zoom), the size of the
+first visible level, `night.brightness`, and two lookups: recipes by 1
+degree tile and lit patterns by palette name. The trait leaves room for a
+GPU generator later (R17); the CPU implementation comes first.
+
+`generate` is infallible. Once recipes and patterns are resolved there is no
+failure mode: a missing recipe or pattern is black, not an error. Encoding
+can fail, so it lives outside the trait, in `encode_visible`, whose error
+the service turns into a black texture.
 
 For each texel of the first visible level, the CPU implementation:
 
@@ -267,28 +275,34 @@ For each texel of the first visible level, the CPU implementation:
    them its Web Mercator position.
 2. **Weights the classes.** The class layer is sampled at the four nearest
    cell centres, with the sample position first warped by a smooth,
-   world-anchored value noise of about half a cell (45 m). Each lit class
-   gets a bilinear weight. The warp breaks the 90 m cell grid into organic
-   edges (R12).
+   world-anchored value noise (`noise.rs`) of 0.5 cell amplitude and 2 cell
+   wavelength (about 45 m and 180 m at 3 arc-seconds). Each lit class gets
+   a bilinear weight, merged per class; class 0 and cells without a recipe
+   carry no weight. The warp breaks the 90 m cell grid into organic edges
+   (R12). Cells are indexed globally (row 0 at the north pole, column 0 at
+   180 W), so a sample near a 1 degree edge reads the neighbouring tile's
+   cells, and `RecipeField` fetches every recipe a footprint plus a small
+   margin touches once. A tile whose grid size differs from the field's
+   reads as missing.
 3. **Samples each weighted class's pattern** by hex-grid stochastic
    tiling (`tiling.rs`), anchored to world position at the pattern's own
    ground scale (R11):
-   - A hex grid is laid over the world, with cells the size of the
-     pattern's ground scale.
+   - A triangle lattice (the dual of a hex grid) is laid over Web Mercator
+     metres, with cells the size of the pattern's ground scale.
    - Each hex vertex hashes its integer grid coordinates to a random
      offset and a rotation in 90° steps.
    - A texel blends the pattern as transformed by its three nearest
-     vertices, with barycentric weights sharpened and renormalised so
-     the blend keeps the pattern's contrast. Each vertex converts world
-     position to pattern coordinates with the ground scale at its own
-     latitude, so the result has no global shear and is continuous
-     everywhere.
+     vertices, with barycentric weights raised to `BLEND_SHARPNESS = 4`
+     and renormalised so the blend keeps the pattern's contrast. Each
+     vertex converts world position to pattern coordinates with the
+     ground scale scaled by cos(latitude) at that vertex, so the result
+     has no global shear and is continuous everywhere.
    - Because the transforms depend only on world position, two textures
      compute the same light for the same ground, so edges between
      textures and 1° tiles have no seam.
 4. **Applies the gain** (`gain.rs`). Brightness is interpolated
-   bilinearly in its byte (log) domain and converted to radiance `R` with
-   the recipe's `scale`. The gain is a linear ramp in `ln(R)` from a floor
+   bilinearly in its byte (log) domain, with 0 where a neighbour has no
+   recipe, and converted to radiance `R` with the recipe's `scale`. The gain is a linear ramp in `ln(R)` from a floor
    radiance (gain 0) to a ceiling radiance (gain 1), raised to a gamma, then
    multiplied by `night.brightness` and clamped to 0 to 1 (R10). The floor,
    ceiling and gamma are constants in code, set by the tuning flight; the
@@ -296,8 +310,12 @@ For each texel of the first visible level, the CPU implementation:
    gamma of 1.0.
 5. **Outputs** the weighted sum of class patterns × gain, as RGB.
 
-The lower levels are box-filtered from the first visible level, as the
-ortho path does, and BC1-encoded through the configured compressor.
+`encode_visible` then box-filters the lower levels from the first visible
+level, as the ortho path does, and BC1-encodes them with the default ISPC
+encoder, whatever `texture.compressor` says. A lit payload is about a tenth
+of an ortho tile, so wiring the GPU channel worker into the lit path is not
+worth it now. A real ZL16 texture at 1024 px generates in 294 ms (release
+build, developer machine).
 
 Determinism (R13): hashes use fixed seeds and integer inputs, and the
 generator holds no state between calls, so the same recipe, art and
@@ -305,12 +323,10 @@ settings give the same bytes on the same build.
 
 ### LitTextureService (`night/service.rs`)
 
-The entry point FUSE calls. Phase 2a implements the `LitTextureSource` trait
-with `NightLitSource` (sizes from `has_light` and the layout, black bytes);
-phase 2b's `LitTextureService` replaces it behind the same trait. Both answer
-`has_light` once per footprint and remember it for the session, so `size` and
-`read` agree. Phase 2b will retry a transient recipe read failure before
-committing that answer. The service has two operations:
+The entry point FUSE calls. `NightLitSource` is the phase 2b service (the
+phase 2a name is kept) behind the `LitTextureSource` trait. It answers
+`has_light` once per footprint and remembers the answer for the session, so
+`size` and `read` agree (R7). The service has two operations:
 
 - `size(name) -> u64`: from `has_light` and the layout. It is cheap and
   never generates.
@@ -319,15 +335,28 @@ committing that answer. The service has two operations:
 
 Inside:
 
+- **Probe.** `has_light` reads the recipes of the footprint widened by
+  `LIGHT_REACH_DEG` (2/1200 degree: the class warp plus one bilinear cell at
+  3 arc-seconds), so a footprint next to lit ground is not answered dark
+  while the generator would light its edge. A recipe read that fails with
+  an I/O error is retried twice, 50 ms apart (`RecipeStore::get_checked`
+  does not cache a failure), before the footprint is answered dark for the
+  session. Probes are limited to 2 permits.
 - **Coalescing.** Concurrent requests for one footprint share one
-  generation. The key is the footprint plus the settings fingerprint, in a
-  coalescer of the lit path's own (R8).
-- **CPU budget.** A semaphore of a few permits derived from the core count
-  bounds concurrent generations, which run on the blocking pool. The
-  permits are added to `LaneSizing::blocking_threads_required()`, the
-  blocking pool's cap, as every pool is (#227).
-- **Cache.** Payloads live in a memory cache bounded by bytes, keyed like
-  the coalescer. Nothing is written to disk.
+  generation through moka's `optionally_get_with` on the payload cache,
+  which is the lit path's own (R8). The key is `(row, col, zoom)` with no
+  settings fingerprint, because `night.brightness` and the texture setting
+  are fixed for the session. A failed generation is not cached.
+- **CPU budget.** A semaphore of `(cores / 8).clamp(2, 4)` permits bounds
+  concurrent generations, which run on the blocking pool. Generation and
+  probe permits are not added to `LaneSizing::blocking_threads_required()`.
+  They sit inside `BLOCKING_POOL_HEADROOM` (32), held there by a
+  compile-time assertion that probe permits plus the maximum generation
+  permits are at most a quarter of the headroom. This keeps `executor` free
+  of a dependency on `night`.
+- **Cache.** Payloads live in a memory cache bounded by bytes (256 MB).
+  Nothing is written to disk. Evicting is safe: a payload regenerates to
+  the same bytes and the size never changes.
 
 ### FUSE changes
 
@@ -426,7 +455,9 @@ the tuning flight that sets the gain constants and confirms `LUMINANCE 150`.
   4; the layout's zero-region reads at every boundary.
 - **Generator properties.** The same input gives identical bytes;
   adjacent footprints match along their shared edge at the first visible
-  level; an empty footprint gives the minimal black DDS; blank levels are
+  level; the same ground gives the same light at any zoom (a ZL16 texture
+  and the ZL18 textures nested in it agree); no brightness step appears at
+  a degree line, where two tiles' recipes meet; an empty footprint gives the minimal black DDS; blank levels are
   all zero and the next level is not.
 - **FUSE integration.** `stat` and a full read agree on size; a lit
   texture and the ortho texture with the same row, column and zoom have
@@ -524,6 +555,11 @@ from the user's own X-Plane installation and never redistributed.
 ## Open Questions
 
 - The gain constants and `LUMINANCE 150`: set on the tuning flight.
+- The ZL16/ZL18 edge at SFO: the ZL16 hill texture `25360_10464_GO216` looked
+  unlit at an edge where ZL18 was lit. An offline run of the real generator
+  on the real package lit that texture (22% of texels), so the generator is
+  ruled out. Serving or X-Plane's drawing remain the candidates; the next
+  flight with `--debug` decides between them.
 - Whether X-Plane accepts a 32768 px header at texture setting 0 (see the
   layout's risk).
 - Whether X-Plane re-reads lit textures after a mid-session change to the
