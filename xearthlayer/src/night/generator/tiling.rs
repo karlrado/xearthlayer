@@ -25,8 +25,6 @@ const UNSKEW: f64 = 0.211_324_865_405_187_1;
 const TILING_SEED: u64 = 0x4E49_4748_545F_4C49;
 
 /// Web Mercator metres of a latitude and longitude.
-// Used by the CPU generator.
-#[allow(dead_code)]
 pub fn mercator(lat: f64, lon: f64) -> (f64, f64) {
     let x = EARTH_RADIUS_M * lon.to_radians();
     let y = EARTH_RADIUS_M
@@ -42,8 +40,6 @@ fn latitude_of(y: f64) -> f64 {
 }
 
 /// The pattern's colour at Web Mercator `(x, y)` metres.
-// Used by the CPU generator.
-#[allow(dead_code)]
 pub fn sample(pattern: &LitPattern, x: f64, y: f64) -> [f32; 3] {
     let cell = pattern.ground_scale_m;
     let (a, b) = (x / cell, y / cell);
