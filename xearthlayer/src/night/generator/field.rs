@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::noise::value_noise;
 use super::RecipeLookup;
 use crate::night::footprint::Footprint;
 use crate::night::recipe::{BrightnessScale, Grid, Recipe};
@@ -18,8 +19,6 @@ pub const FIELD_MARGIN_DEG: f64 = 0.01;
 /// A recipe layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Layer {
-    // used from Task 4/6
-    #[allow(dead_code)]
     Class,
     Brightness,
 }
@@ -63,8 +62,6 @@ impl RecipeField {
         }
     }
 
-    // used from Task 4/6
-    #[allow(dead_code)]
     pub(crate) fn recipe(&self, lat0: i32, lon0: i32) -> Option<&Arc<Recipe>> {
         self.tiles.get(&(lat0, lon0))
     }
@@ -91,7 +88,7 @@ impl RecipeField {
         let (ny_i, nx_i) = (ny as i64, nx as i64);
         let lat0 = 89 - row.div_euclid(ny_i);
         let lon0 = col.div_euclid(nx_i) - 180;
-        let r = self.tiles.get(&(lat0 as i32, lon0 as i32))?;
+        let r = self.recipe(lat0 as i32, lon0 as i32)?;
         let g = Self::grid(r, layer);
         if g.height != ny || g.width != nx {
             return None;
@@ -126,6 +123,78 @@ impl RecipeField {
             return 0.0;
         }
         self.scale.radiance_at(b)
+    }
+}
+
+/// Warp of the class sample position, in class cells (about 45 m at 3
+/// arc-seconds): breaks the cell grid into organic edges (R12).
+pub const WARP_AMPLITUDE_CELLS: f64 = 0.5;
+/// Wavelength of the warp, in class cells.
+pub const WARP_WAVELENGTH_CELLS: f64 = 2.0;
+const WARP_SEED_X: u64 = 0x5741_5250_5F58_0001;
+const WARP_SEED_Y: u64 = 0x5741_5250_5F59_0002;
+
+/// One lit candidate at a point: a class of one tile's palette and its weight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClassWeight {
+    pub tile: (i32, i32),
+    pub index: u8,
+    pub weight: f64,
+}
+
+impl RecipeField {
+    /// The palette name of class `index` in `tile`.
+    pub fn palette_name(&self, tile: (i32, i32), index: u8) -> Option<&str> {
+        self.recipe(tile.0, tile.1)?
+            .palette
+            .get(usize::from(index))
+            .map(String::as_str)
+    }
+
+    /// The classes at a point with their weights: the bilinear weights of the
+    /// four class cell centres around the warped position, merged per class.
+    /// Class 0 and cells without a recipe carry no entry, so the weights sum
+    /// to less than 1 near the edge of classified ground.
+    pub fn class_weights(&self, lat: f64, lon: f64, out: &mut Vec<ClassWeight>) {
+        out.clear();
+        let Some((ny, nx)) = self.dims(Layer::Class) else {
+            return;
+        };
+        let gx = (lon + 180.0) * nx as f64;
+        let gy = (90.0 - lat) * ny as f64;
+        let (wx, wy) = (gx / WARP_WAVELENGTH_CELLS, gy / WARP_WAVELENGTH_CELLS);
+        let u = gx + WARP_AMPLITUDE_CELLS * value_noise(wx, wy, WARP_SEED_X) - 0.5;
+        let v = gy + WARP_AMPLITUDE_CELLS * value_noise(wx, wy, WARP_SEED_Y) - 0.5;
+        let (c0, r0) = (u.floor(), v.floor());
+        let (fx, fy) = (u - c0, v - r0);
+        let (c0, r0) = (c0 as i64, r0 as i64);
+        for (dr, dc, w) in [
+            (0, 0, (1.0 - fx) * (1.0 - fy)),
+            (0, 1, fx * (1.0 - fy)),
+            (1, 0, (1.0 - fx) * fy),
+            (1, 1, fx * fy),
+        ] {
+            if w <= 0.0 {
+                continue;
+            }
+            let (row, col) = (r0 + dr, c0 + dc);
+            let index = match self.cell(Layer::Class, ny, nx, row, col) {
+                Some(i) if i != 0 => i,
+                _ => continue,
+            };
+            let tile = (
+                (89 - row.div_euclid(ny as i64)) as i32,
+                (col.div_euclid(nx as i64) - 180) as i32,
+            );
+            match out.iter_mut().find(|e| e.tile == tile && e.index == index) {
+                Some(e) => e.weight += w,
+                None => out.push(ClassWeight {
+                    tile,
+                    index,
+                    weight: w,
+                }),
+            }
+        }
     }
 }
 
@@ -224,5 +293,75 @@ mod tests {
             "{at_edge}"
         );
         assert_eq!(field.radiance(37.5, -121.5), 0.0, "no recipe at all");
+    }
+
+    fn weight_sum(field: &RecipeField, lat: f64, lon: f64) -> f64 {
+        let mut out = Vec::new();
+        field.class_weights(lat, lon, &mut out);
+        out.iter().map(|w| w.weight).sum()
+    }
+
+    #[test]
+    fn deep_inside_a_class_the_weight_is_one() {
+        let r = synthetic(37, -123, 120, |_, _| 1, 4, |_, _| 255);
+        let lookup = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+        let field = RecipeField::new(&footprint(38.0, 37.0, -123.0, -122.0), &lookup);
+        let mut out = Vec::new();
+        field.class_weights(37.5, -122.5, &mut out);
+        assert_eq!(out.len(), 1, "one class, merged");
+        assert!((out[0].weight - 1.0).abs() < 1e-9);
+        assert_eq!(field.palette_name(out[0].tile, out[0].index), Some("lit"));
+    }
+
+    #[test]
+    fn class_zero_and_missing_tiles_carry_no_weight() {
+        let r = synthetic(37, -123, 120, |_, _| 0, 4, |_, _| 255);
+        let lookup = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+        let field = RecipeField::new(&footprint(38.0, 37.0, -123.0, -122.0), &lookup);
+        assert_eq!(weight_sum(&field, 37.5, -122.5), 0.0);
+        assert_eq!(weight_sum(&field, 36.5, -122.5), 0.0, "no recipe");
+    }
+
+    /// West half of the tile lit (columns < 60 of 120), east half class 0.
+    fn half_lit() -> RecipeField {
+        let r = synthetic(37, -123, 120, |_, c| u8::from(c < 60), 4, |_, _| 255);
+        let lookup = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+        RecipeField::new(&footprint(38.0, 37.0, -123.0, -122.0), &lookup)
+    }
+
+    #[test]
+    fn a_class_edge_is_a_ramp_not_a_step() {
+        // The edge is at lon -122.5; a cell is 1/120 degree. Sample across it.
+        let field = half_lit();
+        let cell = 1.0 / 120.0;
+        let ramp: Vec<f64> = (-30..=30)
+            .map(|k| weight_sum(&field, 37.5003, -122.5 + f64::from(k) * cell / 10.0))
+            .collect();
+        let between = ramp.iter().filter(|w| **w > 0.05 && **w < 0.95).count();
+        assert!(
+            between >= 5,
+            "at least half a cell of intermediate weights: {ramp:?}"
+        );
+        assert!(ramp.first().unwrap() > &0.95 && ramp.last().unwrap() < &0.05);
+    }
+
+    #[test]
+    fn a_class_edge_is_not_straight() {
+        // Where the weight crosses 0.5 moves along the edge, by the warp.
+        let field = half_lit();
+        let cell = 1.0 / 120.0;
+        let crossings: Vec<f64> = (0..40)
+            .map(|k| {
+                let lat = 37.3 + f64::from(k) * cell * 0.7;
+                (0..400)
+                    .map(|s| -122.5 - 2.0 * cell + f64::from(s) * cell / 100.0)
+                    .find(|&lon| weight_sum(&field, lat, lon) < 0.5)
+                    .unwrap()
+            })
+            .collect();
+        let spread = crossings.iter().cloned().fold(f64::MIN, f64::max)
+            - crossings.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(spread > 0.3 * cell, "the 50% line wanders by {spread} deg");
+        assert!(spread < 2.0 * cell, "but stays near the edge: {spread} deg");
     }
 }
