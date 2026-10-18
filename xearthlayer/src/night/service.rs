@@ -17,6 +17,7 @@ use dashmap::DashMap;
 use futures::future::BoxFuture;
 use tracing::{debug, warn};
 
+use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{CpuLitGenerator, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
 use super::{Footprint, LaminarArt, LitLayout, Recipe, RecipeStore, TextureSettingSource};
@@ -83,11 +84,6 @@ pub fn lit_generation_permits(cores: usize) -> usize {
 /// footprint is answered dark for the session.
 const PROBE_RETRIES: u32 = 2;
 const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
-
-/// How far light can reach past the lit cells, in degrees: the class warp
-/// plus one bilinear cell at 3 arc-seconds, so a footprint next to lit ground
-/// is not answered dark while the generator would light its edge.
-const LIGHT_REACH_DEG: f64 = 2.0 / 1200.0;
 
 /// Calls `attempt` until it succeeds, at most `retries + 1` times.
 fn with_retries<T, E>(
@@ -245,9 +241,11 @@ impl NightLitSource {
         let wait_ms = started.elapsed().as_millis() as u64;
         let probe_started = Instant::now();
         let (store, art) = (Arc::clone(&self.store), Arc::clone(&self.art));
-        let footprint = Footprint::from_name(name).expanded(LIGHT_REACH_DEG);
+        let footprint = Footprint::from_name(name);
         let lit = match tokio::task::spawn_blocking(move || {
+            // Every tile the generator could read for this footprint.
             let recipes: HashMap<(i32, i32), Option<Arc<Recipe>>> = footprint
+                .expanded(FIELD_MARGIN_DEG)
                 .tiles()
                 .into_iter()
                 .map(|(lat, lon)| {
@@ -262,10 +260,8 @@ impl NightLitSource {
                     ((lat, lon), recipe)
                 })
                 .collect();
-            footprint.has_light(
-                |lat, lon| recipes.get(&(lat, lon)).cloned().flatten(),
-                |n| art.lit_terrain(n).is_some(),
-            )
+            let lookup = |lat: i32, lon: i32| recipes.get(&(lat, lon)).cloned().flatten();
+            RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some())
         })
         .await
         {
@@ -596,7 +592,7 @@ mod tests {
                 kind: TextureKind::Lit,
             };
             let f = crate::night::Footprint::from_name(&name);
-            assert!(f.west > -122.70 && f.west - -122.70 < LIGHT_REACH_DEG);
+            assert!(f.west > -122.70 && f.west - -122.70 < 1.0 / 1200.0);
             assert_eq!(source.size(&name).await, LitLayout::new(22, 4).total_len);
         }
 

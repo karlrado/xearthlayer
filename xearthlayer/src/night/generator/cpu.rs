@@ -302,6 +302,129 @@ mod tests {
         assert!(img.pixels().any(|p| p[0] > 0));
     }
 
+    /// What the service answers for a lit `stat` of `name`.
+    fn probe(
+        name: &DdsFilename,
+        recipes: &(dyn Fn(i32, i32) -> Option<Arc<Recipe>> + Sync),
+    ) -> bool {
+        RecipeField::new(&Footprint::from_name(name), recipes).has_light(|_| true)
+    }
+
+    /// Names at `zoom` whose footprints cover lat `lat0..lat1`, lon `lon0..lon1`.
+    fn names_over(zoom: u8, lat0: f64, lat1: f64, lon0: f64, lon1: f64) -> Vec<DdsFilename> {
+        let n = f64::from(1u32 << zoom);
+        let col = |lon: f64| ((lon + 180.0) / 360.0 * n) as u32 / 16 * 16;
+        let row = |lat: f64| {
+            let r = f64::to_radians(lat);
+            ((1.0 - (r.tan() + 1.0 / r.cos()).ln() / PI) / 2.0 * n) as u32 / 16 * 16
+        };
+        let mut out = Vec::new();
+        for r in (row(lat1)..=row(lat0)).step_by(16) {
+            for c in (col(lon0)..=col(lon1)).step_by(16) {
+                out.push(name(r, c, zoom));
+            }
+        }
+        out
+    }
+
+    /// The probe contract: wherever the generator lights a texel of a
+    /// footprint, the probe answers lit for it (over-approximating is fine,
+    /// it costs only a full-size black file).
+    fn assert_probe_covers(
+        label: &str,
+        recipes: impl Fn(i32, i32) -> Option<Arc<Recipe>> + Sync,
+        window: (f64, f64, f64, f64),
+    ) {
+        let (lat0, lat1, lon0, lon1) = window;
+        let (mut lit, mut dark, mut missed) = (0, 0, Vec::new());
+        for zoom in [14u8, 16, 17, 18] {
+            for n in names_over(zoom, lat0, lat1, lon0, lon1) {
+                let generated = lit_texels(&generate(&n, 64, &recipes, white, 1.0)) > 0;
+                let probed = probe(&n, &recipes);
+                lit += usize::from(generated);
+                dark += usize::from(!probed);
+                if generated && !probed {
+                    missed.push(format!("{}_{}_ZL{}", n.row, n.col, n.zoom));
+                }
+            }
+        }
+        assert!(lit > 0, "{label}: the sweep holds lit footprints");
+        assert!(
+            dark > 0,
+            "{label}: the probe still answers some footprints dark"
+        );
+        assert!(
+            missed.is_empty(),
+            "{label}: lit by the generator, dark by the probe: {missed:?}"
+        );
+    }
+
+    #[test]
+    fn the_probe_covers_light_spilling_off_a_lit_block() {
+        // Lit class west of lon -122.5, under brightness 0; the brightness
+        // cell east of it is 200, so bilinear brightness lights the block's
+        // east strip although no lit cell sits on a bright cell.
+        let r = synthetic(
+            37,
+            -123,
+            120,
+            |_, c| u8::from(c < 60),
+            4,
+            |_, c| if c >= 2 { 200 } else { 0 },
+        );
+        let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+        assert_probe_covers("block edge", recipes, (37.45, 37.55, -122.62, -122.38));
+    }
+
+    #[test]
+    fn the_probe_covers_light_across_a_degree_line() {
+        // West tile: lit class, no radiance. East tile: no class, bright.
+        let west = synthetic(37, -123, 120, |_, _| 1, 4, |_, _| 0);
+        let east = synthetic(37, -122, 120, |_, _| 0, 4, |_, _| 255);
+        let recipes = move |a: i32, b: i32| match (a, b) {
+            (37, -123) => Some(west.clone()),
+            (37, -122) => Some(east.clone()),
+            _ => None,
+        };
+        assert_probe_covers("longitude line", recipes, (37.45, 37.55, -122.3, -121.9));
+    }
+
+    #[test]
+    fn the_probe_covers_light_across_a_latitude_line() {
+        // South tile: lit class, no radiance. North tile: no class, bright.
+        let south = synthetic(37, -123, 120, |_, _| 1, 4, |_, _| 0);
+        let north = synthetic(38, -123, 120, |_, _| 0, 4, |_, _| 255);
+        let recipes = move |a: i32, b: i32| match (a, b) {
+            (37, -123) => Some(south.clone()),
+            (38, -123) => Some(north.clone()),
+            _ => None,
+        };
+        assert_probe_covers("latitude line", recipes, (37.8, 38.1, -122.55, -122.45));
+    }
+
+    #[test]
+    fn the_probe_covers_light_on_real_sized_grids() {
+        // 1200 class and 240 brightness cells per degree, as OXO writes them.
+        // A lit block (rows 600..660, cols 600..660) under zero brightness,
+        // with one bright brightness cell just past each of its corners.
+        let r = synthetic(
+            37,
+            -123,
+            1200,
+            |r, c| u8::from((600..660).contains(&r) && (600..660).contains(&c)),
+            240,
+            |r, c| {
+                if (r == 119 || r == 132) && (c == 119 || c == 132) {
+                    255
+                } else {
+                    0
+                }
+            },
+        );
+        let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+        assert_probe_covers("real grids", recipes, (37.40, 37.55, -122.55, -122.40));
+    }
+
     #[test]
     fn generation_is_deterministic() {
         let a = generate(&name_at(37.20, -122.725), 64, golden, red, 1.0);
