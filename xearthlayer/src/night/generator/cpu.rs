@@ -7,17 +7,19 @@
 //! Mercator metres. Nothing depends on the texture's zoom or on 1 degree
 //! tile borders, so neighbouring and nested textures agree on shared ground.
 
-use std::collections::HashMap;
 use std::f64::consts::PI;
 use std::sync::Arc;
 
 use image::{Rgba, RgbaImage};
 
 use super::field::RecipeField;
-use super::tiling::{mercator, sample};
+use super::tiling::{mercator, sample_cached, CornerCache};
 use super::{gain, LitGenerator, LitRequest};
 use crate::night::footprint::{Footprint, TILES_PER_TEXTURE};
 use crate::night::laminar::LitPattern;
+
+/// Palette indexes per tile: a class cell is one byte.
+const PALETTE_SLOTS: usize = 256;
 
 /// Generates lit pixels on the CPU.
 #[derive(Debug, Default, Clone, Copy)]
@@ -41,13 +43,20 @@ impl LitGenerator for CpuLitGenerator {
             })
             .collect();
 
+        // Web Mercator metres: x depends only on the column, y only on the row.
+        let xs: Vec<f64> = lons.iter().map(|&lon| mercator(0.0, lon).0).collect();
+        let ys: Vec<f64> = lats.iter().map(|&lat| mercator(lat, 0.0).1).collect();
+
         let field = RecipeField::new(&Footprint::from_name(name), request.recipes);
-        let mut patterns: HashMap<String, Option<Arc<LitPattern>>> = HashMap::new();
+        // Patterns by (tile slot, palette index), resolved on first use.
+        let mut patterns: Vec<Option<Option<Arc<LitPattern>>>> =
+            vec![None; field.slot_count() * PALETTE_SLOTS];
         let mut weights = Vec::with_capacity(4);
+        let mut corners = CornerCache::default();
         let mut img = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 255]));
 
-        for (i, &lat) in lats.iter().enumerate() {
-            for (j, &lon) in lons.iter().enumerate() {
+        for (i, (&lat, &y)) in lats.iter().zip(&ys).enumerate() {
+            for (j, (&lon, &x)) in lons.iter().zip(&xs).enumerate() {
                 field.class_weights(lat, lon, &mut weights);
                 if weights.is_empty() {
                     continue;
@@ -56,19 +65,18 @@ impl LitGenerator for CpuLitGenerator {
                 if g <= 0.0 {
                     continue;
                 }
-                let (x, y) = mercator(lat, lon);
                 let mut rgb = [0.0f32; 3];
                 for w in &weights {
-                    let Some(class) = field.palette_name(w.tile, w.index) else {
+                    let pattern = patterns[w.slot * PALETTE_SLOTS + usize::from(w.index)]
+                        .get_or_insert_with(|| {
+                            field
+                                .palette_name_in(w.slot, w.index)
+                                .and_then(|class| (request.patterns)(class))
+                        });
+                    let Some(p) = pattern else {
                         continue;
                     };
-                    if !patterns.contains_key(class) {
-                        patterns.insert(class.to_string(), (request.patterns)(class));
-                    }
-                    let Some(p) = &patterns[class] else {
-                        continue;
-                    };
-                    let c = sample(p, x, y);
+                    let c = sample_cached(p, x, y, &mut corners);
                     for ch in 0..3 {
                         rgb[ch] += w.weight as f32 * c[ch];
                     }
@@ -296,10 +304,31 @@ mod tests {
         let store = crate::night::RecipeStore::new(vec![pkg.into()]);
         let art = crate::night::LaminarArt::new(art.into());
         let n = name(25360, 10464, 16);
-        let started = std::time::Instant::now();
-        let img = generate(&n, 1024, |a, b| store.get(a, b), |c| art.pattern(c), 1.0);
-        println!("ZL16 1024 px: {} ms", started.elapsed().as_millis());
-        assert!(img.pixels().any(|p| p[0] > 0));
+        // Cold: the first call inflates the recipes and decodes the patterns.
+        // Warm: the second call finds them cached, as a flight usually does
+        // after the probe.
+        for pass in ["cold", "warm"] {
+            let started = std::time::Instant::now();
+            let img = generate(&n, 1024, |a, b| store.get(a, b), |c| art.pattern(c), 1.0);
+            let ms = started.elapsed().as_millis();
+            let digest = img.as_raw().iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+            println!("ZL16 1024 px, {pass}: {ms} ms, pixels {digest:016x}");
+            assert!(img.pixels().any(|p| p[0] > 0));
+        }
+        // The probe runs on every lit stat; time it warm at ZL16 and ZL12.
+        let lookup = |a: i32, b: i32| store.get(a, b);
+        for n in [
+            n.clone(),
+            name(n.row / 16 / 16 * 16, n.col / 16 / 16 * 16, 12),
+        ] {
+            let started = std::time::Instant::now();
+            let lit = RecipeField::new(&Footprint::from_name(&n), &lookup)
+                .has_light(|c| art.lit_terrain(c).is_some());
+            let us = started.elapsed().as_micros();
+            println!("probe ZL{}: {us} us, lit {lit}", n.zoom);
+        }
     }
 
     /// What the service answers for a lit `stat` of `name`.
