@@ -70,9 +70,15 @@ impl RecipeStore {
     /// Blocking file I/O on a cache miss: call from a blocking context.
     /// A transient I/O failure is not cached, so the next call retries.
     pub fn get(&self, lat: i32, lon: i32) -> Option<Arc<Recipe>> {
+        self.get_checked(lat, lon).unwrap_or(None)
+    }
+
+    /// The recipe, or the I/O error that stopped it being read. A transient
+    /// error is not cached, so calling again retries.
+    pub fn get_checked(&self, lat: i32, lon: i32) -> std::io::Result<Option<Arc<Recipe>>> {
         self.cache
             .try_get_with((lat, lon), || self.load(lat, lon))
-            .unwrap_or(None)
+            .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
 
     /// `Ok(None)` (cached) for an absent or rejected recipe; `Err` (not
@@ -142,6 +148,27 @@ mod tests {
 
     const URBAN: &[u8] = include_bytes!("../../tests/fixtures/night/urban.oxn");
     const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/night/empty.oxn");
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_recipe_is_an_error_and_not_cached() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        let path = recipe_path(temp.path(), 37, -123);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, URBAN).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        if std::fs::read(&path).is_ok() {
+            return; // running as root: permissions do not apply
+        }
+        assert!(store.get_checked(37, -123).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            store.get_checked(37, -123).unwrap().is_some(),
+            "retried, not cached"
+        );
+    }
 
     fn put(root: &Path, lat: i32, lon: i32, bytes: &[u8]) {
         let path = recipe_path(root, lat, lon);

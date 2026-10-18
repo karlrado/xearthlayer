@@ -4,8 +4,11 @@
 //! (requirement R8). `BlackLitSource` (phase 1) serves the minimal black DDS
 //! for every name; `NightLitSource` (phase 2a) serves full-size black
 //! textures where the recipe and the user's art say there is light, and the
-//! minimal DDS elsewhere.
+//! minimal DDS elsewhere. Phase 2b makes it generate the lit pixels: concurrent
+//! reads of one footprint share a single generation, and the number of
+//! concurrent generations follows the core count.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +19,7 @@ use tracing::{debug, warn};
 
 use super::generator::{CpuLitGenerator, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
-use super::{Footprint, LaminarArt, LitLayout, RecipeStore, TextureSettingSource};
+use super::{Footprint, LaminarArt, LitLayout, Recipe, RecipeStore, TextureSettingSource};
 use crate::fuse::DdsFilename;
 
 /// The source of lit DDS bytes for FUSE.
@@ -59,9 +62,50 @@ const LIT_PROBE_PERMITS: usize = 2;
 /// outside this range is dark without computing anything.
 const SUPPORTED_LIT_ZOOMS: std::ops::RangeInclusive<u8> = 12..=22;
 
-/// Concurrent lit generations (CPU: about a million texels plus a BC1 encode
-/// each). Kept small so lit work never crowds ortho generation (R17).
-const LIT_GENERATION_PERMITS: usize = 2;
+/// Fewest and most concurrent lit generations (CPU: about a million texels
+/// plus a BC1 encode each).
+const MIN_LIT_GENERATION_PERMITS: usize = 2;
+const MAX_LIT_GENERATION_PERMITS: usize = 4;
+
+// Lit work runs on the blocking pool inside its headroom (R17); keep it to a
+// quarter of that headroom so it cannot starve other blocking work.
+const _: () = assert!(
+    LIT_PROBE_PERMITS + MAX_LIT_GENERATION_PERMITS <= crate::executor::BLOCKING_POOL_HEADROOM / 4
+);
+
+/// Concurrent lit generations for a machine with `cores` cores: an eighth of
+/// them, 2 to 4.
+pub fn lit_generation_permits(cores: usize) -> usize {
+    (cores / 8).clamp(MIN_LIT_GENERATION_PERMITS, MAX_LIT_GENERATION_PERMITS)
+}
+
+/// Extra attempts at a recipe read that failed with an I/O error before a
+/// footprint is answered dark for the session.
+const PROBE_RETRIES: u32 = 2;
+const PROBE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// How far light can reach past the lit cells, in degrees: the class warp
+/// plus one bilinear cell at 3 arc-seconds, so a footprint next to lit ground
+/// is not answered dark while the generator would light its edge.
+const LIGHT_REACH_DEG: f64 = 2.0 / 1200.0;
+
+/// Calls `attempt` until it succeeds, at most `retries + 1` times.
+fn with_retries<T, E>(
+    retries: u32,
+    delay: std::time::Duration,
+    mut attempt: impl FnMut() -> Result<T, E>,
+) -> Result<T, E> {
+    let mut left = retries;
+    loop {
+        match attempt() {
+            Err(_) if left > 0 => {
+                left -= 1;
+                std::thread::sleep(delay);
+            }
+            result => return result,
+        }
+    }
+}
 
 /// Memory for generated visible levels (about 0.7 MB per urban ZL16 texture).
 const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -69,9 +113,10 @@ const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
 /// Default overall brightness (`night.brightness`).
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 
-/// Phase 2a's lit source: full-size, correctly laid out black textures where
-/// the recipe and the user's art say there is light; the minimal black DDS
-/// everywhere else.
+/// The night lit source: full-size, correctly laid out textures where the
+/// recipe and the user's art say there is light (generated on first read of
+/// the visible levels, coalesced across concurrent readers, with permits
+/// following the core count); the minimal black DDS everywhere else.
 pub struct NightLitSource {
     store: Arc<RecipeStore>,
     art: Arc<LaminarArt>,
@@ -84,7 +129,7 @@ pub struct NightLitSource {
     probes: tokio::sync::Semaphore,
     /// Generated visible levels by footprint. Evicting is safe: a payload
     /// regenerates to the same bytes (R13) and never changes the size.
-    payloads: moka::sync::Cache<(u32, u32, u8), Bytes>,
+    payloads: moka::future::Cache<(u32, u32, u8), Bytes>,
     generations: tokio::sync::Semaphore,
     brightness: f64,
     generator: Arc<dyn LitGenerator>,
@@ -102,11 +147,13 @@ impl NightLitSource {
             setting,
             lit: DashMap::new(),
             probes: tokio::sync::Semaphore::new(LIT_PROBE_PERMITS),
-            payloads: moka::sync::Cache::builder()
+            payloads: moka::future::Cache::builder()
                 .max_capacity(LIT_PAYLOAD_CACHE_BYTES)
                 .weigher(|_, v: &Bytes| v.len().try_into().unwrap_or(u32::MAX))
                 .build(),
-            generations: tokio::sync::Semaphore::new(LIT_GENERATION_PERMITS),
+            generations: tokio::sync::Semaphore::new(lit_generation_permits(
+                std::thread::available_parallelism().map_or(1, |n| n.get()),
+            )),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
         }
@@ -125,23 +172,24 @@ impl NightLitSource {
     }
 
     /// The generated visible levels of a lit footprint, or `None` (black)
-    /// when generation fails. Not cached on failure.
+    /// when generation fails. Concurrent callers for one key share one
+    /// generation; a failure is not cached.
     async fn payload(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
         let key = (name.row, name.col, name.zoom);
-        if let Some(hit) = self.payloads.get(&key) {
-            return Some(hit);
-        }
+        self.payloads
+            .optionally_get_with(key, self.generate(name.clone(), layout.first_visible))
+            .await
+    }
+
+    async fn generate(&self, name: DdsFilename, size: u32) -> Option<Bytes> {
         let _permit = self.generations.acquire().await.ok()?;
-        if let Some(hit) = self.payloads.get(&key) {
-            return Some(hit);
-        }
         let started = Instant::now();
         let (store, art, generator, owned, size, brightness) = (
             Arc::clone(&self.store),
             Arc::clone(&self.art),
             Arc::clone(&self.generator),
             name.clone(),
-            layout.first_visible,
+            size,
             self.brightness,
         );
         let generated = tokio::task::spawn_blocking(move || {
@@ -166,7 +214,6 @@ impl NightLitSource {
                     ms = started.elapsed().as_millis() as u64,
                     "Night lighting: lit texture generated"
                 );
-                self.payloads.insert(key, payload.clone());
                 Some(payload)
             }
             Ok(Err(e)) => {
@@ -197,14 +244,26 @@ impl NightLitSource {
         }
         let wait_ms = started.elapsed().as_millis() as u64;
         let probe_started = Instant::now();
-        let (store, art, footprint) = (
-            Arc::clone(&self.store),
-            Arc::clone(&self.art),
-            Footprint::from_name(name),
-        );
+        let (store, art) = (Arc::clone(&self.store), Arc::clone(&self.art));
+        let footprint = Footprint::from_name(name).expanded(LIGHT_REACH_DEG);
         let lit = match tokio::task::spawn_blocking(move || {
+            let recipes: HashMap<(i32, i32), Option<Arc<Recipe>>> = footprint
+                .tiles()
+                .into_iter()
+                .map(|(lat, lon)| {
+                    let recipe = with_retries(PROBE_RETRIES, PROBE_RETRY_DELAY, || {
+                        store.get_checked(lat, lon)
+                    })
+                    .unwrap_or_else(|e| {
+                        warn!(lat, lon, error = %e,
+                              "Night lighting: recipe unreadable after retries; footprint stays dark this session");
+                        None
+                    });
+                    ((lat, lon), recipe)
+                })
+                .collect();
             footprint.has_light(
-                |lat, lon| store.get(lat, lon),
+                |lat, lon| recipes.get(&(lat, lon)).cloned().flatten(),
                 |n| art.lit_terrain(n).is_some(),
             )
         })
@@ -283,6 +342,37 @@ mod tests {
             map_type: "BI".into(),
             kind: TextureKind::Lit,
         }
+    }
+
+    #[test]
+    fn retries_stop_at_the_first_success() {
+        let mut calls = 0;
+        let r: Result<u8, &str> = with_retries(2, std::time::Duration::ZERO, || {
+            calls += 1;
+            if calls < 2 {
+                Err("transient")
+            } else {
+                Ok(7)
+            }
+        });
+        assert_eq!((r, calls), (Ok(7), 2));
+    }
+
+    #[test]
+    fn retries_give_up_after_the_limit() {
+        let mut calls = 0;
+        let r: Result<u8, &str> = with_retries(2, std::time::Duration::ZERO, || {
+            calls += 1;
+            Err("down")
+        });
+        assert_eq!((r, calls), (Err("down"), 3));
+    }
+
+    #[test]
+    fn generation_permits_follow_the_core_count() {
+        assert_eq!(lit_generation_permits(4), 2);
+        assert_eq!(lit_generation_permits(24), 3);
+        assert_eq!(lit_generation_permits(64), 4);
     }
 
     #[tokio::test]
@@ -464,6 +554,50 @@ mod tests {
             let visible = source.read(&name, layout.payload_start(), 1 << 20).await;
             assert!(visible.iter().any(|&b| b != 0));
             assert_eq!(white.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// Like `White`, but slow enough that concurrent reads overlap.
+        #[derive(Default)]
+        struct Slow(std::sync::atomic::AtomicUsize);
+
+        impl crate::night::generator::LitGenerator for Slow {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        #[tokio::test]
+        async fn concurrent_reads_share_one_generation() {
+            let (_t, source) = fixture();
+            let white = Arc::new(Slow::default());
+            let source = source.with_generator(white.clone());
+            let name = name_at(37.20, -122.725);
+            let start = LitLayout::new(16, 4).payload_start();
+            let reads = (0..8).map(|_| source.read(&name, start, 4096));
+            let results = futures::future::join_all(reads).await;
+            assert!(results.iter().all(|r| r.iter().any(|&b| b != 0)));
+            assert_eq!(white.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn a_footprint_beside_lit_ground_is_lit() {
+            // The golden urban block's east edge is lon -122.70. A footprint
+            // whose west edge is a little east of it holds no lit cell, but
+            // the soft edge reaches into it, so it must not be answered dark.
+            // ZL22 texture 1629616_667600: west edge -122.69943.
+            let (_t, source) = fixture();
+            let name = DdsFilename {
+                row: 1_629_616,
+                col: 667_600,
+                zoom: 22,
+                map_type: "BI".into(),
+                kind: TextureKind::Lit,
+            };
+            let f = crate::night::Footprint::from_name(&name);
+            assert!(f.west > -122.70 && f.west - -122.70 < LIGHT_REACH_DEG);
+            assert_eq!(source.size(&name).await, LitLayout::new(22, 4).total_len);
         }
 
         #[tokio::test]
