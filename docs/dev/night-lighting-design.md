@@ -107,7 +107,7 @@ texture kind. Everything else is new code in `xearthlayer/src/night/`:
 | `night/laminar/library.rs` | Parse `library.txt`, resolve terrain names |
 | `night/laminar/ter.rs` | Read a Laminar `.ter`'s lit texture and pattern scale |
 | `night/laminar/art.rs` | `LaminarArt`: name to decoded lit pattern, cached |
-| `night/footprint.rs` | A lit texture's ground footprint and `has_light` |
+| `night/footprint.rs` | A lit texture's ground footprint |
 | `night/layout.rs` | The lit DDS layout: sizes, blank levels, zero regions |
 | `night/prefs.rs` | `XPlanePrefs`: the texture quality setting |
 | `night/generator/mod.rs` | The `LitGenerator` trait, `LitRequest`, and `encode_visible` |
@@ -183,9 +183,10 @@ footprint gives:
   latitude and longitude, north up, row 0 at the north edge;
 - the 1° tiles it touches. A footprint can straddle tile boundaries, and
   each texel is computed from the recipe of the tile containing it;
-- `has_light`: whether any class cell inside the footprint resolves to a
-  lit pattern and has non-zero brightness. It reads recipes only, never
-  generates pixels, and answers the file size before generation (R7).
+- `has_light` (`RecipeField::has_light`, beside the generator's sampling
+  so the two share one model): whether the generator may light any texel
+  of the footprint. It reads recipes only, never generates pixels, and
+  answers the file size before generation (R7). See the probe below.
 
 ### Lit DDS layout (`night/layout.rs`)
 
@@ -315,8 +316,13 @@ For each texel of the first visible level, the CPU implementation:
 level, as the ortho path does, and BC1-encodes them with the default ISPC
 encoder, whatever `texture.compressor` says. A lit payload is about a tenth
 of an ortho tile, so wiring the GPU channel worker into the lit path is not
-worth it now. A real ZL16 texture at 1024 px generates in 294 ms (release
-build, developer machine).
+worth it now. A real ZL16 texture at 1024 px generates in about 135 ms
+with its recipes and patterns already loaded, and about 150 ms cold
+(release build, developer machine). Three things keep it there: recipes
+sit in a small table of tile slots rather than a hash map, patterns
+resolve once per tile and palette index, and the tiling caches the
+lattice corners neighbouring texels share (with the same bits as without
+the cache).
 
 Determinism (R13): hashes use fixed seeds and integer inputs, and the
 generator holds no state between calls, so the same recipe, art and
@@ -336,18 +342,37 @@ phase 2a name is kept) behind the `LitTextureSource` trait. It answers
 
 Inside:
 
-- **Probe.** `has_light` reads the recipes of the footprint widened by
-  `LIGHT_REACH_DEG` (2/1200 degree: the class warp plus one bilinear cell at
-  3 arc-seconds), so a footprint next to lit ground is not answered dark
-  while the generator would light its edge. A recipe read that fails with
-  an I/O error is retried twice, 50 ms apart (`RecipeStore::get_checked`
-  does not cache a failure), before the footprint is answered dark for the
-  session. Probes are limited to 2 permits.
+- **Probe.** `has_light` builds the same `RecipeField` the generator uses
+  and follows its sampling model, conservatively. A texel is lit only when
+  a lit class gives it weight and its bilinear brightness gives a gain
+  above zero. So the probe visits every class cell whose centre is within
+  the class reach of the footprint (1.5 class cells: the warp's half cell
+  plus the bilinear neighbour), and for each one that resolves to lit art,
+  every brightness cell that can enter the bilinear brightness of the
+  texels it weights (one brightness cell further, 15 arc-seconds). It
+  answers lit when one of them has a radiance above the gain floor.
+  Bilinear brightness never exceeds its brightest corner, so the probe
+  never answers dark where the generator lights; it may answer lit where
+  the generator ends up black, which costs a full-size black file. Cells
+  are indexed globally, so both reaches cross 1° tile edges. A property
+  test checks the contract across block edges, both kinds of degree line
+  and zooms 14 to 18. Probes are limited to 2 permits.
+- **Recipe reads.** The probe and the generator read recipes through
+  `SessionRecipes`. A read that fails with an I/O error is retried twice,
+  50 ms apart (`RecipeStore::get_checked` does not cache a failure). Once
+  the retries run out the tile is given up on for the session: it reads
+  as dark for every later probe, without retries, delay or a new warning.
+- **Memo.** The first committed `has_light` answer for a footprint wins
+  (`entry().or_insert`), so two probes that finish differently cannot give
+  `size` and `read` different lengths.
 - **Coalescing.** Concurrent requests for one footprint share one
   generation through moka's `optionally_get_with` on the payload cache,
   which is the lit path's own (R8). The key is `(row, col, zoom)` with no
   settings fingerprint, because `night.brightness` and the texture setting
   are fixed for the session. A failed generation is not cached.
+  Generation reads all the recipes of its field first; if one cannot be
+  read it returns no payload (not cached) and the read serves full-size
+  black, so a payload is never built with a tile missing.
 - **CPU budget.** A semaphore of `(cores / 8).clamp(2, 4)` permits bounds
   concurrent generations, which run on the blocking pool. Generation and
   probe permits are not added to `LaneSizing::blocking_threads_required()`.
@@ -357,7 +382,8 @@ Inside:
   of a dependency on `night`.
 - **Cache.** Payloads live in a memory cache bounded by bytes (256 MB).
   Nothing is written to disk. Evicting is safe: a payload regenerates to
-  the same bytes and the size never changes.
+  the same bytes, or to full-size black once one of its recipes has been
+  given up on, and the size never changes.
 
 ### FUSE changes
 
@@ -421,7 +447,7 @@ degrades to black, at the narrowest scope it affects (R19):
 | No X-Plane installation found, or `library.txt` missing or unreadable | Every lit texture this session | Once |
 | A palette name that does not resolve, a `.ter` without a lit texture, a missing or undecodable lit file | That class only | Once per name |
 | A recipe rejected by the reading rules, or from a newer major version | That 1° tile | Once per file |
-| A recipe that cannot be read (transient I/O) | That tile, for the session once a size was answered | Once |
+| A recipe that cannot be read (I/O error after two retries, 50 ms apart) | That tile, for the session: probes treat it as having no light, and any lit footprint whose generation needs it is served full-size black, not cached | Once per tile, when it is given up on |
 | No recipe for a tile | That tile | Never (normal for countryside) |
 | Generation or encoding fails | That texture, not cached | Every time, as a warning |
 | `X-Plane.prf` unreadable | Nothing: the full setting is assumed | Once |
@@ -561,8 +587,11 @@ from the user's own X-Plane installation and never redistributed.
 - The ZL16/ZL18 edge at SFO: in the 2026-10-17 flight the ZL16 hill texture
   `25360_10464_GO216` looked unlit at an edge where ZL18 was lit. An
   offline run of the real generator on the real package lit that texture
-  (22% of texels), so the generator is ruled out. Serving or X-Plane's drawing remain the candidates; the next
-  flight with `--debug` decides between them.
+  (22% of texels), so the generator is ruled out. Serving or X-Plane's
+  drawing remain the candidates; the next flight with `--debug` decides
+  between them. One serving cause is now removed: the probe used to look
+  only at the brightness cell under each lit class cell, so it could
+  answer dark beside light the generator spreads bilinearly.
 - Whether X-Plane accepts a 32768 px header at texture setting 0 (see the
   layout's risk).
 - Whether X-Plane re-reads lit textures after a mid-session change to the
