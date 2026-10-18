@@ -7,6 +7,7 @@ pub mod cpu;
 pub mod field;
 pub mod gain;
 pub mod noise;
+pub mod tiling;
 
 use std::sync::Arc;
 
