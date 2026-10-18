@@ -4,7 +4,8 @@
 //! serves a minimal black texture for every lit name. Phase 2a answers lit
 //! `stat`/`open` with the real file size (footprints from recipes, lit art
 //! from the user's Laminar installation, texture setting from the preferences)
-//! but still serves black pixels. Phase 2b generates the light.
+//! but still serves black pixels. Phase 2b generates the light, in the
+//! `generator` module behind the `LitGenerator` trait.
 
 pub mod footprint;
 pub mod generator;
@@ -16,6 +17,7 @@ pub mod service;
 pub mod store;
 
 pub use footprint::Footprint;
+pub use generator::{CpuLitGenerator, LitGenerator, LitRequest};
 pub use laminar::{LaminarArt, LitPattern, LitTerrain};
 pub use layout::{minimal_black_dds, LitLayout};
 pub use prefs::{

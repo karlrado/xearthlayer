@@ -14,6 +14,7 @@ use dashmap::DashMap;
 use futures::future::BoxFuture;
 use tracing::{debug, warn};
 
+use super::generator::{CpuLitGenerator, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
 use super::{Footprint, LaminarArt, LitLayout, RecipeStore, TextureSettingSource};
 use crate::fuse::DdsFilename;
@@ -86,6 +87,7 @@ pub struct NightLitSource {
     payloads: moka::sync::Cache<(u32, u32, u8), Bytes>,
     generations: tokio::sync::Semaphore,
     brightness: f64,
+    generator: Arc<dyn LitGenerator>,
 }
 
 impl NightLitSource {
@@ -106,12 +108,19 @@ impl NightLitSource {
                 .build(),
             generations: tokio::sync::Semaphore::new(LIT_GENERATION_PERMITS),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
+            generator: Arc::new(CpuLitGenerator),
         }
     }
 
     /// Overall lit brightness (`night.brightness`, 0.5 to 1.5 in config).
     pub fn with_brightness(mut self, brightness: f64) -> Self {
         self.brightness = brightness;
+        self
+    }
+
+    /// Use `generator` for lit pixels (tests, or another implementation).
+    pub fn with_generator(mut self, generator: Arc<dyn LitGenerator>) -> Self {
+        self.generator = generator;
         self
     }
 
@@ -127,21 +136,24 @@ impl NightLitSource {
             return Some(hit);
         }
         let started = Instant::now();
-        let (store, art, owned, size, brightness) = (
+        let (store, art, generator, owned, size, brightness) = (
             Arc::clone(&self.store),
             Arc::clone(&self.art),
+            Arc::clone(&self.generator),
             name.clone(),
             layout.first_visible,
             self.brightness,
         );
         let generated = tokio::task::spawn_blocking(move || {
-            let image = super::generator::generate_visible(
-                &owned,
+            let recipes = |lat: i32, lon: i32| store.get(lat, lon);
+            let patterns = |n: &str| art.pattern(n);
+            let image = generator.generate(&LitRequest {
+                name: &owned,
                 size,
-                |lat, lon| store.get(lat, lon),
-                |n| art.pattern(n),
                 brightness,
-            );
+                recipes: &recipes,
+                patterns: &patterns,
+            });
             super::generator::encode_visible(image)
         })
         .await;
@@ -429,6 +441,29 @@ mod tests {
                 2_796_344,
                 "read agrees with the memoised size"
             );
+        }
+
+        /// A generator that lights every texel white, counting its calls.
+        #[derive(Default)]
+        struct White(std::sync::atomic::AtomicUsize);
+
+        impl crate::night::generator::LitGenerator for White {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        #[tokio::test]
+        async fn the_injected_generator_makes_the_payload() {
+            let (_t, source) = fixture();
+            let white = Arc::new(White::default());
+            let source = source.with_generator(white.clone());
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let visible = source.read(&name, layout.payload_start(), 1 << 20).await;
+            assert!(visible.iter().any(|&b| b != 0));
+            assert_eq!(white.0.load(std::sync::atomic::Ordering::SeqCst), 1);
         }
 
         #[tokio::test]
