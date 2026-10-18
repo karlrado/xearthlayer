@@ -4,6 +4,7 @@
 //! R17); `CpuLitGenerator` is the one in use.
 
 pub mod cpu;
+pub mod field;
 pub mod gain;
 
 use std::sync::Arc;

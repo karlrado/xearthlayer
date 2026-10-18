@@ -61,8 +61,13 @@ impl Default for BrightnessScale {
 impl BrightnessScale {
     /// `R = r0 * (exp(b / 255 * ln(1 + rmax / r0)) - 1)`.
     pub fn radiance(&self, b: u8) -> f64 {
+        self.radiance_at(f64::from(b))
+    }
+
+    /// `radiance` for a fractional byte, as bilinear sampling produces.
+    pub fn radiance_at(&self, b: f64) -> f64 {
         let span = (1.0 + self.rmax_nw / self.r0_nw).ln();
-        self.r0_nw * ((f64::from(b) / 255.0 * span).exp() - 1.0)
+        self.r0_nw * ((b / 255.0 * span).exp() - 1.0)
     }
 }
 
@@ -350,6 +355,14 @@ mod tests {
         assert_eq!(r.palette.len(), 3);
         assert_eq!((r.brightness.width, r.brightness.height), (240, 240));
         assert!(r.brightness.cells.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn radiance_at_matches_radiance_on_whole_bytes() {
+        let s = BrightnessScale::default();
+        for b in [0u8, 1, 97, 230, 255] {
+            assert!((s.radiance_at(f64::from(b)) - s.radiance(b)).abs() < 1e-12);
+        }
     }
 
     #[test]

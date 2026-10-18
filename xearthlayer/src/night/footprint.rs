@@ -36,6 +36,17 @@ impl Footprint {
         }
     }
 
+    /// The footprint grown by `degrees` on every side.
+    pub fn expanded(&self, degrees: f64) -> Self {
+        Self {
+            north: self.north + degrees,
+            south: self.south - degrees,
+            west: self.west - degrees,
+            east: self.east + degrees,
+            zoom: self.zoom,
+        }
+    }
+
     /// South-west corners of every 1 degree tile the footprint touches.
     pub fn tiles(&self) -> Vec<(i32, i32)> {
         let lats = (self.south.floor() as i32)..=(self.north.ceil() as i32 - 1);
@@ -123,6 +134,14 @@ mod tests {
 
     fn urban_only(name: &str) -> bool {
         name == "lib/g10/terrain10/urban_tmp_sdry3.ter"
+    }
+
+    #[test]
+    fn expanded_grows_every_edge() {
+        let f = fp(37.24, 37.16, -122.74, -122.71).expanded(0.01);
+        assert!((f.north - 37.25).abs() < 1e-12 && (f.south - 37.15).abs() < 1e-12);
+        assert!((f.west - -122.75).abs() < 1e-12 && (f.east - -122.70).abs() < 1e-12);
+        assert_eq!(f.zoom, 16);
     }
 
     fn fp(north: f64, south: f64, west: f64, east: f64) -> Footprint {
