@@ -194,6 +194,25 @@ mod tests {
     }
 
     #[test]
+    fn the_fade_distance_does_not_follow_the_texture_setting() {
+        // Where the lit layer cuts out is set by the texel size of the
+        // blank level X-Plane uploads first. Shrinking the visible level
+        // with the setting moved the cut-out 2x farther per notch (flown
+        // 2026-10-18), so the first visible level is fixed in metres.
+        for zoom in [15, 16, 18] {
+            let full = LitLayout::new(zoom, 4);
+            for t in 1..=3u8 {
+                let l = LitLayout::new(zoom, t);
+                if l.top == MAX_TOP_LEVEL {
+                    continue; // the cap trades visible resolution instead
+                }
+                assert_eq!(l.first_visible, full.first_visible, "ZL{zoom} t = {t}");
+                assert_eq!(l.blank_levels, u32::from(4 - t) + 1, "ZL{zoom} t = {t}");
+            }
+        }
+    }
+
+    #[test]
     fn first_visible_scales_with_zoom() {
         assert_eq!(LitLayout::new(17, 4).first_visible, 512);
         assert_eq!(LitLayout::new(18, 4).first_visible, 256);

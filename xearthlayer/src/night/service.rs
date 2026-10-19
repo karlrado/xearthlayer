@@ -374,15 +374,30 @@ impl LitTextureSource for NightLitSource {
                 let layout = self.layout(name);
                 // Header and blank levels need no pixels; only a read that
                 // reaches the visible levels generates them.
-                if offset >= layout.total_len
+                let (part, bytes) = if offset >= layout.total_len
                     || offset.saturating_add(u64::from(len)) <= layout.payload_start()
                 {
-                    return layout.read_black(offset, len);
-                }
-                match self.payload(name, &layout).await {
-                    Some(payload) => layout.read_lit(offset, len, &payload),
-                    None => layout.read_black(offset, len),
-                }
+                    ("blank", layout.read_black(offset, len))
+                } else {
+                    match self.payload(name, &layout).await {
+                        Some(payload) => ("lit", layout.read_lit(offset, len, &payload)),
+                        None => ("black", layout.read_black(offset, len)),
+                    }
+                };
+                // The order X-Plane reads a lit file in shows whether it
+                // loads the small levels (at the end) before the blank top.
+                debug!(
+                    row = name.row,
+                    col = name.col,
+                    zoom = name.zoom,
+                    offset,
+                    len,
+                    payload_start = layout.payload_start(),
+                    total = layout.total_len,
+                    part,
+                    "Night lighting: lit read"
+                );
+                bytes
             } else {
                 BlackLitSource.read(name, offset, len).await
             }

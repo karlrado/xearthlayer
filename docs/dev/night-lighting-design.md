@@ -47,7 +47,11 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
    black DDS is valid and draws nothing, because lit is added to the base
    colour.
 3. `LIT_FADE_PARAMS` has no effect on this terrain. A distance fade works by
-   making the top mip level(s) of the lit DDS black.
+   making the top mip level(s) of the lit DDS black. Re-tested 2026-10-18
+   with a control (a build without blank levels), on 111 tiles south of
+   KSFO, with `TEXTURE_LIT` and `TEXTURE_LIT_NOWRAP`: no effect. Laminar's
+   own `_FAR_LIT` art is equally bright at every mip level, so its fade is
+   done by the engine, most likely only for projected terrain.
 4. X-Plane's texture quality setting (`renopt_tex_res_04` in
    `Output/preferences/X-Plane.prf`, 4 = full down to 0) drops one top mip
    level per notch at load time. VR has its own setting.
@@ -58,6 +62,11 @@ Established in the simulator (X-Plane 12 beta, 2026-10-16), not inferred:
    `LIT_FADE_PARAMS` (3072, 4096 or 8192).
 6. Lit ground tints the cockpit's ambient light, so brightness must stay
    restrained.
+7. X-Plane pages a lit texture's mip levels in one at a time (seen in the
+   FUSE reads, 2026-10-18): the first load reads only the small levels at
+   the end of the file, and the first visible level and the blank levels
+   arrive tens of seconds later as the aircraft closes. The mip fade
+   therefore happens per texture, when its blank level is paged in.
 
 ## Decisions
 
@@ -206,6 +215,24 @@ With the texture quality setting `t` (0 to 4):
 | 4 | 1 | 2048 | 2.8 MB | 2.8 MB |
 | 3 | 2 | 4096 | 11.2 MB | 2.8 MB |
 | 2 | 3 | 8192 | 44.7 MB | 2.8 MB |
+
+The cut-out distance is set by the texel size of the blank level
+X-Plane uploads first, so the first visible level stays fixed in metres
+at every setting. This is why lit VRAM does not fall with the texture
+setting. A layout that shrank the visible level with the setting (the
+same file at every setting, VRAM quartered per notch) was flown on
+2026-10-18 and moved the cut-out 2x farther out per notch.
+
+**Fade ramp.** Because X-Plane pages levels in one at a time (fact 7), a
+texture would jump from full light straight to its blank level, and was
+seen to switch off as one visible square. The first visible level is
+dimmed to 2/3 of the light (`FADE_RAMP`, `(2/3)^(1/2.2)` in stored value,
+since X-Plane decodes sRGB), so each texture steps from full to 2/3 to
+off. The chain is downsampled from the undimmed image, so every coarser
+level is at full light, and the ramp costs no bytes. Two steps (2/3 and
+1/3 of the light) pushed the effective cut-out a level farther out, and
+scaling stored values instead of light (1/3 stored is about 9% of the
+light) read as black before the 3D lights were drawn.
 
 A footprint without light is a fixed **minimal black DDS**: 4 × 4, BC1,
 with its full chain (4, 2 and 1 px levels), all blocks zero, 152 bytes

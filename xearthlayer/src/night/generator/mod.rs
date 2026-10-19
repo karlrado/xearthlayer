@@ -44,10 +44,34 @@ pub trait LitGenerator: Send + Sync {
     fn generate(&self, request: &LitRequest<'_>) -> RgbaImage;
 }
 
+/// Gamma of the sRGB decode X-Plane applies to a texture's stored values.
+pub const SRGB_GAMMA: f32 = 2.2;
+
+/// Scale of the stored values of the first visible levels, nearest first;
+/// every level after them is full. X-Plane pages a lit texture's levels in
+/// one at a time as the aircraft closes, so without a ramp a texture jumps
+/// from full light to the blank level in one step. One step at 2/3 of the
+/// light, `(2/3) ^ (1/2.2)` in stored value, softens that without moving the
+/// cut-out. Two steps (2/3, 1/3) pushed it a whole level farther out, and
+/// stored-value scaling (1/3 read as 9% of the light) read as black before
+/// the 3D lights were drawn (both flown 2026-10-18).
+pub const FADE_RAMP: [f32; 1] = [0.8318];
+
 /// BC1-encode the first visible level and its mip chain down to 1 x 1, as
-/// the bytes that follow the blank levels in a lit DDS (no header).
+/// the bytes that follow the blank levels in a lit DDS (no header). The
+/// chain is downsampled from the undimmed image, then the levels named by
+/// [`FADE_RAMP`] are dimmed, so the levels below them stay at full light.
 pub fn encode_visible(image: RgbaImage) -> Result<bytes::Bytes, crate::dds::DdsError> {
-    let dds = crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode(image)?;
+    let mut chain = crate::dds::MipmapGenerator::generate_chain(&image);
+    for (level, &gain) in chain.iter_mut().zip(FADE_RAMP.iter()) {
+        for px in level.pixels_mut() {
+            for c in &mut px.0[..3] {
+                *c = (f32::from(*c) * gain).round() as u8;
+            }
+        }
+    }
+    let dds =
+        crate::dds::DdsEncoder::new(crate::dds::DdsFormat::BC1).encode_with_mipmaps(&chain)?;
     Ok(bytes::Bytes::from(dds).slice(DDS_HEADER_LEN..))
 }
 
@@ -106,5 +130,42 @@ mod tests {
         let payload = encode_visible(img).unwrap();
         assert_eq!(payload.len() as u64, layout.payload_len());
         assert!(payload.iter().any(|&b| b != 0), "light survives encoding");
+    }
+
+    /// The decoded red of the first texel of each level of a BC1 chain.
+    fn level_reds(payload: &[u8], top: u32) -> Vec<u8> {
+        let (mut at, mut size, mut reds) = (0, top, Vec::new());
+        while size >= 1 {
+            let mut rgba = [0u8; 4 * 4 * 4];
+            bcdec_rs::bc1(&payload[at..at + 8], &mut rgba, 16);
+            reds.push(rgba[0]);
+            at += (size.div_ceil(4) * size.div_ceil(4) * 8) as usize;
+            size /= 2;
+        }
+        reds
+    }
+
+    #[test]
+    fn the_first_visible_level_is_dimmed_and_the_rest_are_full() {
+        let img = RgbaImage::from_pixel(64, 64, image::Rgba([240, 240, 240, 255]));
+        let reds = level_reds(&encode_visible(img).unwrap(), 64);
+        assert_eq!(reds.len(), 7, "64 px down to 1 px");
+        let near = |got: u8, want: f32| (f32::from(got) - want).abs() <= 8.0;
+        assert!(
+            near(reds[0], 240.0 * FADE_RAMP[0]),
+            "first visible {reds:?}"
+        );
+        assert!(
+            reds[1..].iter().all(|&r| near(r, 240.0)),
+            "full below {reds:?}"
+        );
+    }
+
+    #[test]
+    fn the_dimmed_level_gives_two_thirds_of_the_light() {
+        // Stored values are sRGB: the light they give is value ^ 2.2.
+        let light = FADE_RAMP.map(|v| v.powf(SRGB_GAMMA));
+        assert_eq!(light.len(), 1);
+        assert!((light[0] - 2.0 / 3.0).abs() < 1e-3, "{light:?}");
     }
 }
