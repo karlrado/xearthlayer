@@ -65,6 +65,11 @@ impl LitTextureSource for BlackLitSource {
 /// sit inside the blocking pool's `BLOCKING_POOL_HEADROOM`.
 const LIT_PROBE_PERMITS: usize = 2;
 
+/// Concurrent lit disk tier work: fingerprinting (art walk and recipe stats)
+/// with the read of an entry, or the write-back of a generated one. The
+/// permits sit inside the blocking pool's `BLOCKING_POOL_HEADROOM`.
+const LIT_DISK_PERMITS: usize = 2;
+
 /// Zoom levels a lit footprint is computed for. `parse_dds_filename` accepts
 /// any two-digit zoom and `Footprint::from_name` shifts by it, so anything
 /// outside this range is dark without computing anything.
@@ -75,10 +80,12 @@ const SUPPORTED_LIT_ZOOMS: std::ops::RangeInclusive<u8> = 12..=22;
 const MIN_LIT_GENERATION_PERMITS: usize = 2;
 const MAX_LIT_GENERATION_PERMITS: usize = 4;
 
-// Lit work runs on the blocking pool inside its headroom (R17); keep it to a
-// quarter of that headroom so it cannot starve other blocking work.
+// Lit work (probes, generations, disk tier) runs on the blocking pool inside
+// its headroom (R17); keep it to a quarter of that headroom so it cannot
+// starve other blocking work.
 const _: () = assert!(
-    LIT_PROBE_PERMITS + MAX_LIT_GENERATION_PERMITS <= crate::executor::BLOCKING_POOL_HEADROOM / 4
+    LIT_PROBE_PERMITS + MAX_LIT_GENERATION_PERMITS + LIT_DISK_PERMITS
+        <= crate::executor::BLOCKING_POOL_HEADROOM / 4
 );
 
 /// Concurrent lit generations for a machine with `cores` cores: an eighth of
@@ -207,6 +214,8 @@ pub struct NightLitSource {
     generator: Arc<dyn LitGenerator>,
     /// Lit payloads on disk, from the cache layer; None when caching is off.
     disk: Option<Arc<dyn Cache>>,
+    /// Shared with the detached write-backs, which hold a permit too.
+    disk_io: Arc<tokio::sync::Semaphore>,
     /// Fingerprint of the session's inputs (generator, brightness, art),
     /// computed on the first payload, after the builders have run.
     session: tokio::sync::OnceCell<[u8; 32]>,
@@ -234,6 +243,7 @@ impl NightLitSource {
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
             disk: None,
+            disk_io: Arc::new(tokio::sync::Semaphore::new(LIT_DISK_PERMITS)),
             session: tokio::sync::OnceCell::new(),
         }
     }
@@ -273,25 +283,39 @@ impl NightLitSource {
         let Some(disk) = self.disk.clone() else {
             return self.generate(name, layout.first_visible).await;
         };
-        let Some(fp) = self.fingerprint(&name).await else {
+        let key = lit_cache_key(&name);
+        // The disk permit covers the fingerprint and the read, and is released
+        // before generating: a lit task never holds two permits at once.
+        let permit = self.disk_io.acquire().await.ok()?;
+        let fp = self.fingerprint(&name).await;
+        let stored = match &fp {
+            Some(fp) => match disk.get(&key).await {
+                Ok(Some(entry)) => decode_entry(entry, fp, layout.payload_len()),
+                _ => None,
+            },
+            None => None,
+        };
+        drop(permit);
+        if let Some(payload) = stored {
+            debug!(
+                row = name.row,
+                col = name.col,
+                zoom = name.zoom,
+                "Night lighting: lit texture read from disk"
+            );
+            return Some(payload);
+        }
+        let Some(fp) = fp else {
             // No fingerprint, no safe disk entry: generate and keep it in memory only.
             return self.generate(name, layout.first_visible).await;
         };
-        let key = lit_cache_key(&name);
-        if let Ok(Some(entry)) = disk.get(&key).await {
-            if let Some(payload) = decode_entry(entry, &fp, layout.payload_len()) {
-                debug!(
-                    row = name.row,
-                    col = name.col,
-                    zoom = name.zoom,
-                    "Night lighting: lit texture read from disk"
-                );
-                return Some(payload);
-            }
-        }
         let payload = self.generate(name, layout.first_visible).await?;
         let entry = encode_entry(&fp, &payload);
+        let disk_io = Arc::clone(&self.disk_io);
         tokio::spawn(async move {
+            let Ok(_permit) = disk_io.acquire().await else {
+                return;
+            };
             if let Err(e) = disk.set(&key, entry).await {
                 debug!(error = %e, key, "Night lighting: lit disk write failed");
             }
@@ -301,7 +325,7 @@ impl NightLitSource {
 
     /// Fingerprint of every input `name`'s payload is generated from, or
     /// `None` when computing it failed. The art walk and recipe stats run on
-    /// the blocking pool.
+    /// the blocking pool; the caller holds a disk permit.
     async fn fingerprint(&self, name: &DdsFilename) -> Option<LitFingerprint> {
         let session = *self
             .session
@@ -982,6 +1006,145 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none());
+        }
+
+        /// A disk tier that records the most calls it ever had in flight at
+        /// once, gets and sets together.
+        #[derive(Default)]
+        struct Counting {
+            inner: Option<crate::cache::MemoryCacheProvider>,
+            in_flight: std::sync::atomic::AtomicUsize,
+            most: std::sync::atomic::AtomicUsize,
+        }
+
+        impl Counting {
+            fn new() -> Self {
+                Self {
+                    inner: Some(crate::cache::MemoryCacheProvider::new(64 << 20, None)),
+                    ..Self::default()
+                }
+            }
+
+            fn inner(&self) -> &crate::cache::MemoryCacheProvider {
+                self.inner.as_ref().unwrap()
+            }
+
+            /// Runs `call` counted as in flight, held long enough to overlap.
+            async fn counted<T>(&self, call: impl std::future::Future<Output = T>) -> T {
+                use std::sync::atomic::Ordering::SeqCst;
+                let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+                self.most.fetch_max(now, SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                let out = call.await;
+                self.in_flight.fetch_sub(1, SeqCst);
+                out
+            }
+        }
+
+        impl crate::cache::Cache for Counting {
+            fn set(
+                &self,
+                key: &str,
+                value: Bytes,
+            ) -> futures::future::BoxFuture<'_, Result<(), crate::cache::ServiceCacheError>>
+            {
+                let key = key.to_owned();
+                Box::pin(async move { self.counted(self.inner().set(&key, value)).await })
+            }
+
+            fn get(
+                &self,
+                key: &str,
+            ) -> futures::future::BoxFuture<
+                '_,
+                Result<Option<Bytes>, crate::cache::ServiceCacheError>,
+            > {
+                let key = key.to_owned();
+                Box::pin(async move { self.counted(self.inner().get(&key)).await })
+            }
+
+            fn delete(
+                &self,
+                key: &str,
+            ) -> futures::future::BoxFuture<'_, Result<bool, crate::cache::ServiceCacheError>>
+            {
+                self.inner().delete(key)
+            }
+
+            fn contains(
+                &self,
+                key: &str,
+            ) -> futures::future::BoxFuture<'_, Result<bool, crate::cache::ServiceCacheError>>
+            {
+                self.inner().contains(key)
+            }
+
+            fn contains_sync(&self, key: &str) -> bool {
+                self.inner().contains_sync(key)
+            }
+
+            fn size_bytes(&self) -> u64 {
+                self.inner().size_bytes()
+            }
+
+            fn entry_count(&self) -> u64 {
+                self.inner().entry_count()
+            }
+
+            fn max_size_bytes(&self) -> u64 {
+                self.inner().max_size_bytes()
+            }
+
+            fn set_max_size(
+                &self,
+                size_bytes: u64,
+            ) -> futures::future::BoxFuture<'_, Result<(), crate::cache::ServiceCacheError>>
+            {
+                self.inner().set_max_size(size_bytes)
+            }
+
+            fn gc(
+                &self,
+            ) -> futures::future::BoxFuture<
+                '_,
+                Result<crate::cache::GcResult, crate::cache::ServiceCacheError>,
+            > {
+                self.inner().gc()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn lit_disk_work_stays_within_its_permits() {
+            // Disk reads and write-backs run on the blocking pool; they must
+            // stay inside the lit share of its headroom (R17) however many
+            // footprints miss memory at once.
+            let temp = TempDir::new().unwrap();
+            let counting = Arc::new(Counting::new());
+            let disk: Arc<dyn crate::cache::Cache> = counting.clone();
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            let layout = LitLayout::new(16, 4);
+            let names: Vec<_> = (0..8)
+                .map(|i| name_at(37.20, -122.725 + f64::from(i) * 0.02))
+                .collect();
+            futures::future::join_all(names.iter().map(|n| source.payload(n, &layout))).await;
+            // Wait for the write-backs through the uncounted inner cache.
+            for name in &names {
+                let key = crate::night::lit_cache_key(name);
+                for _ in 0..50 {
+                    if counting.inner().contains_sync(&key) {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                assert!(counting.inner().contains_sync(&key), "written back");
+            }
+            let most = counting.most.load(std::sync::atomic::Ordering::SeqCst);
+            assert!(
+                most <= LIT_DISK_PERMITS,
+                "{most} disk calls in flight at once"
+            );
         }
 
         #[tokio::test]

@@ -401,11 +401,12 @@ Inside:
   read it returns no payload (not cached) and the read serves full-size
   black, so a payload is never built with a tile missing.
 - **CPU budget.** A semaphore of `(cores / 8).clamp(2, 4)` permits bounds
-  concurrent generations, which run on the blocking pool. Generation and
-  probe permits are not added to `LaneSizing::blocking_threads_required()`.
+  concurrent generations, which run on the blocking pool. Generation,
+  probe and disk permits (2, for the lit disk tier's fingerprint, read and
+  write-back) are not added to `LaneSizing::blocking_threads_required()`.
   They sit inside `BLOCKING_POOL_HEADROOM` (32), held there by a
   compile-time assertion that probe permits plus the maximum generation
-  permits are at most a quarter of the headroom. This keeps `executor` free
+  permits plus disk permits are at most a quarter of the headroom. This keeps `executor` free
   of a dependency on `night`.
 - **Cache.** Payloads live in a memory cache bounded by bytes (256 MB).
   Nothing is written to disk. Evicting is safe: a payload regenerates to
