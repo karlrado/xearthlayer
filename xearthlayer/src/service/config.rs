@@ -49,6 +49,7 @@ pub struct ServiceConfig {
     generation_timeout: Option<u64>,
     /// Quiet mode - disables periodic stats logging (for TUI mode)
     quiet_mode: bool,
+    night_enabled: bool,
     /// Control plane configuration for job management and health monitoring
     control_plane: ControlPlaneSettings,
     /// HTTP request timeout in seconds for an individual chunk download.
@@ -133,6 +134,11 @@ impl ServiceConfig {
         self.cache_disk_size
     }
 
+    /// Whether night lighting is enabled (it then gets a lit disk cache tier).
+    pub fn night_enabled(&self) -> bool {
+        self.night_enabled
+    }
+
     /// Get the DDS disk ratio (fraction of disk allocated to DDS), if configured.
     pub fn cache_dds_disk_ratio(&self) -> Option<f64> {
         self.cache_dds_disk_ratio
@@ -184,6 +190,7 @@ impl Default for ServiceConfig {
             generation_threads: None,
             generation_timeout: None,
             quiet_mode: false,
+            night_enabled: false,
             control_plane: ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
@@ -213,6 +220,7 @@ pub struct ServiceConfigBuilder {
     generation_threads: Option<usize>,
     generation_timeout: Option<u64>,
     quiet_mode: Option<bool>,
+    night_enabled: Option<bool>,
     chunk_request_timeout_secs: Option<u64>,
     chunk_max_retries: Option<u32>,
     prefetch_capacity_share: Option<f64>,
@@ -274,6 +282,12 @@ impl ServiceConfigBuilder {
         self
     }
 
+    /// Enable night lighting, which gives it a share of the disk cache.
+    pub fn night_enabled(mut self, enabled: bool) -> Self {
+        self.night_enabled = Some(enabled);
+        self
+    }
+
     /// Set the DDS disk ratio (fraction of disk allocated to DDS tiles).
     pub fn cache_dds_disk_ratio(mut self, ratio: f64) -> Self {
         self.cache_dds_disk_ratio = Some(ratio);
@@ -332,6 +346,7 @@ impl ServiceConfigBuilder {
             generation_threads: self.generation_threads,
             generation_timeout: self.generation_timeout,
             quiet_mode: self.quiet_mode.unwrap_or(false),
+            night_enabled: self.night_enabled.unwrap_or(false),
             control_plane: self.control_plane.unwrap_or(ControlPlaneSettings {
                 max_concurrent_jobs: default_max_concurrent_jobs(),
                 stall_threshold_secs: DEFAULT_CONTROL_PLANE_STALL_THRESHOLD_SECS,
@@ -353,6 +368,16 @@ impl ServiceConfigBuilder {
 mod tests {
     use super::*;
     use crate::dds::DdsFormat;
+
+    #[test]
+    fn night_enabled_defaults_off_and_round_trips() {
+        assert!(!ServiceConfig::default().night_enabled());
+        assert!(!ServiceConfig::builder().build().night_enabled());
+        assert!(ServiceConfig::builder()
+            .night_enabled(true)
+            .build()
+            .night_enabled());
+    }
 
     #[test]
     fn test_default_config() {

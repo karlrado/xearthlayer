@@ -112,6 +112,7 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         .cache_memory_size(config.cache.memory_size)
         .cache_disk_size(config.cache.disk_size)
         .cache_dds_disk_ratio(config.cache.dds_disk_ratio)
+        .night_enabled(config.night.enabled)
         .generation_threads(config.generation.threads)
         .generation_timeout(config.generation.timeout)
         .control_plane(control_plane_settings)
