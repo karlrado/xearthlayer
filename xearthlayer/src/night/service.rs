@@ -158,10 +158,15 @@ impl SessionRecipes {
         })
     }
 
-    /// Identity of the tile's recipe file, or `None` when it has none.
-    /// Blocking stat.
-    fn identity(&self, lat: i32, lon: i32) -> Option<FileIdentity> {
-        self.store.identity(lat, lon)
+    /// Identity of the recipe file the tile's recipe was loaded from (`None`
+    /// for none), or `Unreadable` when it cannot be loaded. Not retried: a
+    /// failure only means no disk tier for this payload, and generation
+    /// retries. Blocking I/O on a cache miss.
+    fn identity(&self, lat: i32, lon: i32) -> Result<Option<FileIdentity>, Unreadable> {
+        if self.given_up.contains(&(lat, lon)) {
+            return Err(Unreadable);
+        }
+        self.store.identity(lat, lon).map_err(|_| Unreadable)
     }
 
     /// Every recipe the generator can read for `name`, or `Unreadable` when
@@ -324,8 +329,11 @@ impl NightLitSource {
     }
 
     /// Fingerprint of every input `name`'s payload is generated from, or
-    /// `None` when computing it failed. The art walk and recipe stats run on
-    /// the blocking pool; the caller holds a disk permit.
+    /// `None` when computing it failed (a recipe that cannot be loaded among
+    /// them). Recipe identities are those taken when each recipe was loaded,
+    /// so a file replaced mid-session does not lend the payload its identity.
+    /// The art walk and recipe loads run on the blocking pool; the caller
+    /// holds a disk permit.
     async fn fingerprint(&self, name: &DdsFilename) -> Option<LitFingerprint> {
         let session = *self
             .session
@@ -344,10 +352,11 @@ impl NightLitSource {
         let identities = tokio::task::spawn_blocking(move || {
             field_tiles(&owned)
                 .into_iter()
-                .map(|(lat, lon)| ((lat, lon), recipes.identity(lat, lon)))
-                .collect::<Vec<_>>()
+                .map(|(lat, lon)| Ok(((lat, lon), recipes.identity(lat, lon)?)))
+                .collect::<Result<Vec<_>, Unreadable>>()
         })
         .await
+        .ok()?
         .ok()?;
         Some(footprint_fingerprint(session, &identities))
     }
@@ -596,6 +605,7 @@ mod tests {
         use tempfile::TempDir;
 
         const URBAN: &[u8] = include_bytes!("../../tests/fixtures/night/urban.oxn");
+        const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/night/empty.oxn");
 
         /// A package with urban.oxn for +37-123 and an installation where
         /// urban_tmp_sdry3 is lit.
@@ -961,6 +971,46 @@ mod tests {
                 .with_disk_cache(disk.clone());
             b.read(&name, start, 4096).await;
             assert_eq!(calls(&second), 1, "regenerated");
+        }
+
+        #[tokio::test]
+        async fn a_recipe_replaced_mid_session_is_not_trusted_next_session() {
+            // The first session loads urban.oxn, then the file is replaced
+            // while it runs. Its payload is built from urban.oxn, so its
+            // entry must not match the replacement in the next session.
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let a = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            assert_eq!(a.size(&name).await, layout.total_len, "recipe loaded");
+
+            let path = crate::night::recipe_path(&temp.path().join("pkg"), 37, -123);
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            std::fs::write(&path, EMPTY).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime + std::time::Duration::from_secs(10))
+                .unwrap();
+
+            assert!(a.payload(&name, &layout).await.is_some());
+            settle(&disk, &name).await;
+            assert!(disk
+                .get(&crate::night::lit_cache_key(&name))
+                .await
+                .unwrap()
+                .is_some());
+
+            let second = Arc::new(White::default());
+            let b = source_in(&temp)
+                .with_generator(second.clone())
+                .with_disk_cache(disk.clone());
+            b.payload(&name, &layout).await;
+            assert_eq!(calls(&second), 1, "regenerated, not decoded");
         }
 
         #[tokio::test]

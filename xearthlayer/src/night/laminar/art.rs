@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 use super::library::LibraryIndex;
 use super::pattern::{load_pattern, LitPattern};
 use super::ter::{parse_lit_terrain, LitTerrain};
+use crate::night::FileIdentity;
 
 /// The lit art of one X-Plane installation (`1000 world terrain`).
 pub struct LaminarArt {
@@ -62,12 +63,8 @@ impl LaminarArt {
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .into_owned();
-                        let mtime = meta
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                            .map_or(0, |d| d.as_nanos());
-                        files.push((relative, meta.len(), mtime));
+                        let id = FileIdentity::from_metadata(&meta);
+                        files.push((relative, id.len, id.mtime_nanos));
                     }
                 }
             }

@@ -36,10 +36,32 @@ pub struct FileIdentity {
     pub mtime_nanos: u128,
 }
 
+impl FileIdentity {
+    /// The identity `meta` describes; an unknown mtime counts as zero.
+    pub fn from_metadata(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            mtime_nanos: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos()),
+        }
+    }
+}
+
+/// What a tile's load found: the recipe (`None` for absent or rejected) and
+/// the identity of the file it was read from (`None` when there was none).
+#[derive(Clone)]
+struct Loaded {
+    recipe: Option<Arc<Recipe>>,
+    identity: Option<FileIdentity>,
+}
+
 /// Recipes per tile, loaded lazily and evicted by size. Absence is cached.
 pub struct RecipeStore {
     roots: Vec<PathBuf>,
-    cache: Cache<(i32, i32), Option<Arc<Recipe>>>,
+    cache: Cache<(i32, i32), Loaded>,
     warned: DashSet<PathBuf>,
 }
 
@@ -48,7 +70,7 @@ impl RecipeStore {
     pub fn new(roots: Vec<PathBuf>) -> Self {
         let cache = Cache::builder()
             .max_capacity(RECIPE_CACHE_BYTES)
-            .weigher(|_, v: &Option<Arc<Recipe>>| match v {
+            .weigher(|_, v: &Loaded| match &v.recipe {
                 Some(r) => (r.class.cells.len() + r.brightness.cells.len())
                     .try_into()
                     .unwrap_or(u32::MAX),
@@ -84,6 +106,19 @@ impl RecipeStore {
     /// The recipe, or the I/O error that stopped it being read. A transient
     /// error is not cached, so calling again retries.
     pub fn get_checked(&self, lat: i32, lon: i32) -> std::io::Result<Option<Arc<Recipe>>> {
+        Ok(self.loaded(lat, lon)?.recipe)
+    }
+
+    /// Identity of the recipe file the cached recipe was read from, or `None`
+    /// when the tile has none. Loads through the cache when not yet loaded,
+    /// so it always describes the content `get` returns; a file replaced
+    /// after loading does not change it. `Err` (not cached) when the load
+    /// failed. Blocking file I/O on a cache miss.
+    pub fn identity(&self, lat: i32, lon: i32) -> std::io::Result<Option<FileIdentity>> {
+        Ok(self.loaded(lat, lon)?.identity)
+    }
+
+    fn loaded(&self, lat: i32, lon: i32) -> std::io::Result<Loaded> {
         self.cache
             .try_get_with((lat, lon), || self.load(lat, lon))
             .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
@@ -97,38 +132,33 @@ impl RecipeStore {
             .find(|p| p.is_file())
     }
 
-    /// Identity of the recipe file `get` would read, or `None` when the tile
-    /// has none. Blocking stat, bypasses the recipe cache.
-    pub fn identity(&self, lat: i32, lon: i32) -> Option<FileIdentity> {
-        let meta = std::fs::metadata(self.resolve(lat, lon)?).ok()?;
-        Some(FileIdentity {
-            len: meta.len(),
-            mtime_nanos: meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_nanos()),
-        })
-    }
-
-    /// `Ok(None)` (cached) for an absent or rejected recipe; `Err` (not
-    /// cached) when the file could not be read.
-    fn load(&self, lat: i32, lon: i32) -> Result<Option<Arc<Recipe>>, std::io::Error> {
+    /// No recipe (cached) for an absent or rejected file; `Err` (not cached)
+    /// when the file could not be read, or changed while it was read. The
+    /// identity is taken before and after the read, so it is the identity of
+    /// the bytes parsed.
+    fn load(&self, lat: i32, lon: i32) -> Result<Loaded, std::io::Error> {
         let Some(path) = self.resolve(lat, lon) else {
-            return Ok(None);
+            return Ok(Loaded {
+                recipe: None,
+                identity: None,
+            });
         };
-        let bytes = match read_bounded(&path) {
-            Ok(Some(bytes)) => bytes,
-            Ok(None) => {
-                self.warn_once(&path, "file exceeds the recipe size ceiling");
-                return Ok(None);
-            }
+        let (identity, read) = match identified_read(&path) {
+            Ok(read) => read,
             Err(e) => {
                 self.warn_once(&path, &e.to_string());
                 return Err(e);
             }
         };
-        match parse_recipe(&bytes) {
+        let rejected = Loaded {
+            recipe: None,
+            identity: Some(identity),
+        };
+        let Some(bytes) = read else {
+            self.warn_once(&path, "file exceeds the recipe size ceiling");
+            return Ok(rejected);
+        };
+        let recipe = match parse_recipe(&bytes) {
             Ok(recipe) if recipe.tile != tile_name(lat, lon) => {
                 self.warn_once(
                     &path,
@@ -138,14 +168,18 @@ impl RecipeStore {
                         tile_name(lat, lon)
                     ),
                 );
-                Ok(None)
+                return Ok(rejected);
             }
-            Ok(recipe) => Ok(Some(Arc::new(recipe))),
+            Ok(recipe) => recipe,
             Err(e) => {
                 self.warn_once(&path, &e.to_string());
-                Ok(None)
+                return Ok(rejected);
             }
-        }
+        };
+        Ok(Loaded {
+            recipe: Some(Arc::new(recipe)),
+            identity: Some(identity),
+        })
     }
 
     fn warn_once(&self, path: &Path, reason: &str) {
@@ -153,6 +187,21 @@ impl RecipeStore {
             warn!(path = %path.display(), %reason, "Night recipe unusable; tile stays dark");
         }
     }
+}
+
+/// The file's identity and `read_bounded` bytes, or an error when the file
+/// changed during the read (its identity before and after differ): a
+/// transient state, retried by the caller.
+fn identified_read(path: &Path) -> std::io::Result<(FileIdentity, Option<Vec<u8>>)> {
+    let before = FileIdentity::from_metadata(&std::fs::metadata(path)?);
+    let read = read_bounded(path)?;
+    let after = FileIdentity::from_metadata(&std::fs::metadata(path)?);
+    if before != after {
+        return Err(std::io::Error::other(
+            "recipe file changed while being read",
+        ));
+    }
+    Ok((after, read))
 }
 
 /// The file's bytes, or `None` when it is larger than the ceiling. Reads at
@@ -201,22 +250,29 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn identity_len(store: &RecipeStore) -> u64 {
+        store.identity(37, -123).unwrap().unwrap().len
+    }
+
     #[test]
     fn identity_is_none_without_a_recipe() {
         let temp = TempDir::new().unwrap();
         let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
-        assert_eq!(store.identity(37, -123), None);
+        assert_eq!(store.identity(37, -123).unwrap(), None);
     }
 
     #[test]
     fn identity_follows_the_first_source_with_the_file() {
         let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        let roots = vec![a.path().to_path_buf(), b.path().to_path_buf()];
         put(b.path(), 37, -123, URBAN);
-        let store = RecipeStore::new(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
-        assert_eq!(store.identity(37, -123).unwrap().len, URBAN.len() as u64);
+        assert_eq!(
+            identity_len(&RecipeStore::new(roots.clone())),
+            URBAN.len() as u64
+        );
         put(a.path(), 37, -123, EMPTY);
         assert_eq!(
-            store.identity(37, -123).unwrap().len,
+            identity_len(&RecipeStore::new(roots)),
             EMPTY.len() as u64,
             "the first source now has it"
         );
@@ -225,11 +281,49 @@ mod tests {
     #[test]
     fn identity_changes_when_the_file_is_rewritten() {
         let temp = TempDir::new().unwrap();
+        let roots = vec![temp.path().to_path_buf()];
+        put(temp.path(), 37, -123, URBAN);
+        let before = RecipeStore::new(roots.clone()).identity(37, -123).unwrap();
+        put(temp.path(), 37, -123, EMPTY);
+        assert_ne!(RecipeStore::new(roots).identity(37, -123).unwrap(), before);
+    }
+
+    #[test]
+    fn a_rejected_recipe_keeps_its_identity() {
+        let temp = TempDir::new().unwrap();
+        put(temp.path(), 37, -123, b"not a recipe");
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert!(store.get(37, -123).is_none());
+        assert_eq!(identity_len(&store), 12);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_recipe_has_no_identity() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TempDir::new().unwrap();
+        put(temp.path(), 37, -123, URBAN);
+        let path = recipe_path(temp.path(), 37, -123);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::File::open(&path).is_ok() {
+            return; // running as root: permissions are not enforced
+        }
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert!(store.identity(37, -123).is_err());
+    }
+
+    #[test]
+    fn identity_is_the_loaded_content_after_the_file_changes() {
+        let temp = TempDir::new().unwrap();
         put(temp.path(), 37, -123, URBAN);
         let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
-        let before = store.identity(37, -123).unwrap();
+        assert!(store.get(37, -123).is_some());
         put(temp.path(), 37, -123, EMPTY);
-        assert_ne!(store.identity(37, -123).unwrap(), before);
+        assert_eq!(
+            identity_len(&store),
+            URBAN.len() as u64,
+            "the recipe in use is still urban.oxn"
+        );
     }
 
     #[test]
