@@ -109,6 +109,7 @@ as `Empty`, never `BadMagic`), then magic, then length.
 ```rust
 pub fn dds_tile_validator() -> MagicAndSize   // b"DDS ", exact EXPECTED_DDS_SIZE
 pub fn raw_chunk_validator() -> MagicAndSize  // empty magic slice, no length check
+pub fn lit_payload_validator() -> MagicAndSize // b"XELL", night lighting tier (fingerprint checked by night/disk.rs)
 ```
 
 An empty `magic` slice makes `BadMagic` unreachable — every byte slice

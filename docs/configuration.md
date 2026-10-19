@@ -130,8 +130,8 @@ Controls tile caching behavior.
 |---------|------|---------|-------------|
 | `directory` | path | `~/.cache/xearthlayer` | Directory for storing cached tiles. Supports `~` expansion. |
 | `memory_size` | size | `512MB` | Maximum RAM for in-memory cache. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. Memory cache is a staging buffer; DDS disk cache is the retention layer. |
-| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
-| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. |
+| `disk_size` | size | `20GB` | Maximum disk space for persistent cache (shared between DDS tiles and raw chunks). With `night.enabled`, 5% goes to the night lighting texture cache first and the rest is split as below. Supports KB, MB, GB suffixes, decimal values (e.g. `2.6GB`), and a bare `B` suffix. |
+| `dds_disk_ratio` | float | `0.6` | Fraction of `disk_size` allocated to DDS tile cache (0.0-1.0). Remainder goes to raw chunk cache. With `night.enabled` it splits the 95% left after the night lighting share. |
 
 **Example:**
 ```ini
@@ -660,8 +660,8 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `provider.mapbox_access_token` | string | MapBox access token |
 | `cache.directory` | path | Cache directory |
 | `cache.memory_size` | size (e.g., `512MB`) | Memory cache size (staging buffer) |
-| `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks) |
-| `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0) |
+| `cache.disk_size` | size (e.g., `20GB`) | Total disk cache size (DDS + chunks, plus 5% for night lighting when enabled) |
+| `cache.dds_disk_ratio` | float (e.g., `0.6`) | Fraction of disk for DDS tiles (0.0-1.0), after any night lighting share |
 | `texture.format` | `bc1`, `bc3` | DDS compression format |
 | `texture.compressor` | `software`, `ispc`, `gpu` | Compression backend |
 | `texture.gpu_device` | `integrated`, `discrete`, or name | GPU adapter selection (used when compressor = gpu) |
