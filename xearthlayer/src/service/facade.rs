@@ -198,7 +198,7 @@ impl XEarthLayerService {
             let max_size = dds_provider.max_size_bytes();
 
             let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter)
-                .with_metrics(gc_metrics_client.clone());
+                .with_metrics(gc_metrics_client);
 
             let gc_shutdown_clone = gc_shutdown.clone();
             gc_scheduler_handles.push(runtime_handle.spawn(async move {
@@ -208,15 +208,16 @@ impl XEarthLayerService {
             tracing::info!("DDS disk GC scheduler daemon started");
         }
 
-        // Lit disk GC daemon (only with night lighting enabled)
+        // Lit disk GC daemon (only with night lighting enabled). No metrics
+        // client: its evictions are not ortho disk evictions and must not
+        // land in that metric.
         if let Some(lit_provider) = cache_layer.lit_disk_provider() {
             let job_submitter = xel_runtime.prefetch_lane().job_submitter();
             let lru_index = lit_provider.lru_index();
             let cache_dir = lit_provider.directory().to_path_buf();
             let max_size = lit_provider.max_size_bytes();
 
-            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter)
-                .with_metrics(gc_metrics_client);
+            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter);
 
             let gc_shutdown_clone = gc_shutdown.clone();
             gc_scheduler_handles.push(runtime_handle.spawn(async move {
