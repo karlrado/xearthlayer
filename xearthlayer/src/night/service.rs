@@ -6,7 +6,9 @@
 //! textures where the recipe and the user's art say there is light, and the
 //! minimal DDS elsewhere. Phase 2b makes it generate the lit pixels: concurrent
 //! reads of one footprint share a single generation, and the number of
-//! concurrent generations follows the core count.
+//! concurrent generations follows the core count. With the cache layer's lit
+//! disk tier, a payload is read from disk before generating and written back
+//! after.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +22,12 @@ use tracing::{debug, warn};
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
 use super::generator::{CpuLitGenerator, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
-use super::{Footprint, LaminarArt, LitLayout, Recipe, RecipeStore, TextureSettingSource};
+use super::{
+    decode_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
+    FileIdentity, Footprint, LaminarArt, LitFingerprint, LitLayout, Recipe, RecipeStore,
+    TextureSettingSource,
+};
+use crate::cache::Cache;
 use crate::fuse::DdsFilename;
 
 /// The source of lit DDS bytes for FUSE.
@@ -144,16 +151,27 @@ impl SessionRecipes {
         })
     }
 
-    /// Every recipe the generator can read for `footprint`, or `Unreadable`
-    /// when one of them cannot be read. Blocking I/O.
-    fn for_footprint(&self, footprint: &Footprint) -> Result<FootprintRecipes, Unreadable> {
-        footprint
-            .expanded(FIELD_MARGIN_DEG)
-            .tiles()
+    /// Identity of the tile's recipe file, or `None` when it has none.
+    /// Blocking stat.
+    fn identity(&self, lat: i32, lon: i32) -> Option<FileIdentity> {
+        self.store.identity(lat, lon)
+    }
+
+    /// Every recipe the generator can read for `name`, or `Unreadable` when
+    /// one of them cannot be read. Blocking I/O.
+    fn for_footprint(&self, name: &DdsFilename) -> Result<FootprintRecipes, Unreadable> {
+        field_tiles(name)
             .into_iter()
             .map(|(lat, lon)| Ok(((lat, lon), self.get(lat, lon)?)))
             .collect()
     }
+}
+
+/// The tiles whose recipes the generator can read for `name`.
+fn field_tiles(name: &DdsFilename) -> Vec<(i32, i32)> {
+    Footprint::from_name(name)
+        .expanded(FIELD_MARGIN_DEG)
+        .tiles()
 }
 
 /// The recipes of the tiles a footprint's field covers.
@@ -187,6 +205,11 @@ pub struct NightLitSource {
     generations: tokio::sync::Semaphore,
     brightness: f64,
     generator: Arc<dyn LitGenerator>,
+    /// Lit payloads on disk, from the cache layer; None when caching is off.
+    disk: Option<Arc<dyn Cache>>,
+    /// Fingerprint of the session's inputs (generator, brightness, art),
+    /// computed on the first payload, after the builders have run.
+    session: tokio::sync::OnceCell<[u8; 32]>,
 }
 
 impl NightLitSource {
@@ -210,6 +233,8 @@ impl NightLitSource {
             )),
             brightness: DEFAULT_NIGHT_BRIGHTNESS,
             generator: Arc::new(CpuLitGenerator),
+            disk: None,
+            session: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -225,14 +250,82 @@ impl NightLitSource {
         self
     }
 
+    /// Read lit payloads from `disk` before generating, and write generated
+    /// ones back to it.
+    pub fn with_disk_cache(mut self, disk: Arc<dyn Cache>) -> Self {
+        self.disk = Some(disk);
+        self
+    }
+
     /// The generated visible levels of a lit footprint, or `None` (black)
     /// when generation fails or a recipe cannot be read. Concurrent callers
-    /// for one key share one generation; a failure is not cached.
+    /// for one key share one load or generation; a failure is not cached.
     async fn payload(&self, name: &DdsFilename, layout: &LitLayout) -> Option<Bytes> {
         let key = (name.row, name.col, name.zoom);
         self.payloads
-            .optionally_get_with(key, self.generate(name.clone(), layout.first_visible))
+            .optionally_get_with(key, self.load_or_generate(name.clone(), layout.clone()))
             .await
+    }
+
+    /// Disk first, then generation; a generated payload is written back
+    /// without waiting. Without a disk tier this is `generate`.
+    async fn load_or_generate(&self, name: DdsFilename, layout: LitLayout) -> Option<Bytes> {
+        let Some(disk) = self.disk.clone() else {
+            return self.generate(name, layout.first_visible).await;
+        };
+        let Some(fp) = self.fingerprint(&name).await else {
+            // No fingerprint, no safe disk entry: generate and keep it in memory only.
+            return self.generate(name, layout.first_visible).await;
+        };
+        let key = lit_cache_key(&name);
+        if let Ok(Some(entry)) = disk.get(&key).await {
+            if let Some(payload) = decode_entry(entry, &fp, layout.payload_len()) {
+                debug!(
+                    row = name.row,
+                    col = name.col,
+                    zoom = name.zoom,
+                    "Night lighting: lit texture read from disk"
+                );
+                return Some(payload);
+            }
+        }
+        let payload = self.generate(name, layout.first_visible).await?;
+        let entry = encode_entry(&fp, &payload);
+        tokio::spawn(async move {
+            if let Err(e) = disk.set(&key, entry).await {
+                debug!(error = %e, key, "Night lighting: lit disk write failed");
+            }
+        });
+        Some(payload)
+    }
+
+    /// Fingerprint of every input `name`'s payload is generated from, or
+    /// `None` when computing it failed. The art walk and recipe stats run on
+    /// the blocking pool.
+    async fn fingerprint(&self, name: &DdsFilename) -> Option<LitFingerprint> {
+        let session = *self
+            .session
+            .get_or_try_init(|| {
+                let (art, brightness) = (Arc::clone(&self.art), self.brightness);
+                async move {
+                    tokio::task::spawn_blocking(move || {
+                        session_fingerprint(brightness, art.fingerprint())
+                    })
+                    .await
+                }
+            })
+            .await
+            .ok()?;
+        let (recipes, owned) = (Arc::clone(&self.recipes), name.clone());
+        let identities = tokio::task::spawn_blocking(move || {
+            field_tiles(&owned)
+                .into_iter()
+                .map(|(lat, lon)| ((lat, lon), recipes.identity(lat, lon)))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .ok()?;
+        Some(footprint_fingerprint(session, &identities))
     }
 
     async fn generate(&self, name: DdsFilename, size: u32) -> Option<Bytes> {
@@ -249,7 +342,7 @@ impl NightLitSource {
         let generated = tokio::task::spawn_blocking(move || {
             // All recipes first: a payload missing one would be cached and
             // differ from its regeneration (R13).
-            let Ok(fetched) = recipes.for_footprint(&Footprint::from_name(&owned)) else {
+            let Ok(fetched) = recipes.for_footprint(&owned) else {
                 return None;
             };
             let lookup = |lat: i32, lon: i32| fetched.get(&(lat, lon)).cloned().flatten();
@@ -484,6 +577,26 @@ mod tests {
         /// urban_tmp_sdry3 is lit.
         fn fixture() -> (TempDir, NightLitSource) {
             let temp = TempDir::new().unwrap();
+            let source = source_in(&temp);
+            (temp, source)
+        }
+
+        /// A fresh source over the fixture tree in `temp`, writing the tree
+        /// first when it is absent, so two sessions can share one tree.
+        fn source_in(temp: &TempDir) -> NightLitSource {
+            let pkg = temp.path().join("pkg");
+            let art = temp.path().join("art");
+            if !art.exists() {
+                write_tree(temp);
+            }
+            NightLitSource::new(
+                Arc::new(RecipeStore::new(vec![pkg])),
+                Arc::new(LaminarArt::new(art)),
+                Arc::new(FixedTextureSetting(4)),
+            )
+        }
+
+        fn write_tree(temp: &TempDir) {
             let pkg = temp.path().join("pkg");
             let recipe = crate::night::recipe_path(&pkg, 37, -123);
             std::fs::create_dir_all(recipe.parent().unwrap()).unwrap();
@@ -507,13 +620,6 @@ mod tests {
                 crate::dds::DdsHeader::new(4, 4, 1, crate::dds::DdsFormat::BC1).to_bytes();
             dds.extend_from_slice(&[0x00, 0xF8, 0, 0, 0, 0, 0, 0]);
             std::fs::write(art.join("textures12/urban_FAR/uw5_FAR_LIT.dds"), dds).unwrap();
-
-            let source = NightLitSource::new(
-                Arc::new(RecipeStore::new(vec![pkg])),
-                Arc::new(LaminarArt::new(art)),
-                Arc::new(FixedTextureSetting(4)),
-            );
-            (temp, source)
         }
 
         /// The ZL16 texture name whose footprint contains (lat, lon).
@@ -721,6 +827,161 @@ mod tests {
             let results = futures::future::join_all(reads).await;
             assert!(results.iter().all(|r| r.iter().any(|&b| b != 0)));
             assert_eq!(white.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+
+        /// A memory cache standing in for the lit disk tier.
+        fn disk() -> Arc<dyn crate::cache::Cache> {
+            Arc::new(crate::cache::MemoryCacheProvider::new(64 << 20, None))
+        }
+
+        /// Waits for the fire-and-forget disk write of `name` to land.
+        async fn settle(disk: &Arc<dyn crate::cache::Cache>, name: &DdsFilename) {
+            for _ in 0..50 {
+                if let Ok(Some(_)) = disk.get(&crate::night::lit_cache_key(name)).await {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+
+        fn calls(generator: &White) -> usize {
+            generator.0.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        #[tokio::test]
+        async fn a_second_session_reads_the_payload_from_disk() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let start = LitLayout::new(16, 4).payload_start();
+            let first = Arc::new(White::default());
+            let a = source_in(&temp)
+                .with_generator(first.clone())
+                .with_disk_cache(disk.clone());
+            let bytes = a.read(&name, start, 4096).await;
+            assert!(bytes.iter().any(|&b| b != 0));
+            settle(&disk, &name).await;
+
+            let second = Arc::new(White::default());
+            let b = source_in(&temp)
+                .with_generator(second.clone())
+                .with_disk_cache(disk.clone());
+            assert_eq!(b.read(&name, start, 4096).await, bytes);
+            assert_eq!(calls(&second), 0, "served from disk");
+        }
+
+        #[tokio::test]
+        async fn another_brightness_regenerates_and_overwrites() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let layout = LitLayout::new(16, 4);
+            let a = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            a.read(&name, layout.payload_start(), 4096).await;
+            settle(&disk, &name).await;
+            let a_fp = a.fingerprint(&name).await.unwrap();
+
+            let second = Arc::new(White::default());
+            let b = source_in(&temp)
+                .with_brightness(1.25)
+                .with_generator(second.clone())
+                .with_disk_cache(disk.clone());
+            b.read(&name, layout.payload_start(), 4096).await;
+            assert_eq!(calls(&second), 1, "regenerated");
+            let b_fp = b.fingerprint(&name).await.unwrap();
+            assert_ne!(a_fp, b_fp);
+
+            let key = crate::night::lit_cache_key(&name);
+            let mut overwritten = false;
+            for _ in 0..50 {
+                let entry = disk.get(&key).await.unwrap().unwrap();
+                if crate::night::decode_entry(entry, &b_fp, layout.payload_len()).is_some() {
+                    overwritten = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(overwritten, "the entry carries the new fingerprint");
+            let entry = disk.get(&key).await.unwrap().unwrap();
+            assert!(crate::night::decode_entry(entry, &a_fp, layout.payload_len()).is_none());
+        }
+
+        #[tokio::test]
+        async fn a_changed_recipe_regenerates() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let start = LitLayout::new(16, 4).payload_start();
+            let a = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            a.read(&name, start, 4096).await;
+            settle(&disk, &name).await;
+
+            // The same bytes, rewritten 10 s later.
+            let path = crate::night::recipe_path(&temp.path().join("pkg"), 37, -123);
+            let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+            std::fs::write(&path, URBAN).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(mtime + std::time::Duration::from_secs(10))
+                .unwrap();
+
+            let second = Arc::new(White::default());
+            let b = source_in(&temp)
+                .with_generator(second.clone())
+                .with_disk_cache(disk.clone());
+            b.read(&name, start, 4096).await;
+            assert_eq!(calls(&second), 1, "regenerated");
+        }
+
+        #[tokio::test]
+        async fn a_corrupt_entry_regenerates() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            disk.set(
+                &crate::night::lit_cache_key(&name),
+                Bytes::from_static(b"XELLgarbage"),
+            )
+            .await
+            .unwrap();
+            let white = Arc::new(White::default());
+            let source = source_in(&temp)
+                .with_generator(white.clone())
+                .with_disk_cache(disk.clone());
+            let start = LitLayout::new(16, 4).payload_start();
+            let bytes = source.read(&name, start, 4096).await;
+            assert_eq!(calls(&white), 1, "regenerated");
+            assert!(bytes.iter().any(|&b| b != 0));
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn an_unreadable_recipe_writes_nothing() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let source = source_in(&temp)
+                .with_generator(Arc::new(White::default()))
+                .with_disk_cache(disk.clone());
+            if !set_recipe_readable(&temp, false) {
+                return;
+            }
+            // Straight to the payload: a read would answer dark at the probe
+            // and never reach generation.
+            let layout = LitLayout::new(16, 4);
+            assert_eq!(source.payload(&name, &layout).await, None, "served black");
+            settle(&disk, &name).await;
+            assert!(disk
+                .get(&crate::night::lit_cache_key(&name))
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]

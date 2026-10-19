@@ -230,10 +230,12 @@ impl MountManager {
     }
 
     /// The lit source for this installation, or `None` (black) when the
-    /// X-Plane installation behind the scenery path cannot be found.
+    /// X-Plane installation behind the scenery path cannot be found. `disk`
+    /// is the lit disk tier, `None` when caching is off.
     fn night_lit_source(
         &self,
         index: &OrthoUnionIndex,
+        disk: Option<Arc<dyn crate::cache::Cache>>,
     ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
         let scenery = self.scenery_path.as_ref()?;
         let env = match crate::xplane::XPlaneEnvironment::from_custom_scenery_path(scenery) {
@@ -252,14 +254,16 @@ impl MountManager {
             .join("Output")
             .join("preferences")
             .join("X-Plane.prf");
-        Some(Arc::new(
-            crate::night::NightLitSource::new(
-                Arc::new(crate::night::RecipeStore::from_index(index)),
-                Arc::new(crate::night::LaminarArt::new(art_root)),
-                Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
-            )
-            .with_brightness(self.night_brightness),
-        ))
+        let mut source = crate::night::NightLitSource::new(
+            Arc::new(crate::night::RecipeStore::from_index(index)),
+            Arc::new(crate::night::LaminarArt::new(art_root)),
+            Arc::new(crate::night::StartupTextureSetting::read(&prefs)),
+        )
+        .with_brightness(self.night_brightness);
+        if let Some(disk) = disk {
+            source = source.with_disk_cache(disk);
+        }
+        Some(Arc::new(source))
     }
 
     /// Set the upper bound for a single DDS generation behind a FUSE read.
@@ -572,7 +576,9 @@ impl MountManager {
         }
 
         if self.night_enabled {
-            if let Some(source) = self.night_lit_source(&index_for_prefetch) {
+            if let Some(source) =
+                self.night_lit_source(&index_for_prefetch, service.lit_disk_cache())
+            {
                 ortho_union_fs = ortho_union_fs.with_lit_source(source);
             }
         }
