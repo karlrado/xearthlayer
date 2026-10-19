@@ -1,6 +1,7 @@
 //! Palette names to the user's Laminar lit terrain.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
@@ -20,6 +21,9 @@ pub struct LaminarArt {
     /// Decoded patterns by `texture|ground scale`; Laminar has nine textures.
     patterns: DashMap<String, Option<Arc<LitPattern>>>,
     fingerprint: OnceLock<[u8; 32]>,
+    /// Set when a file could not be read or decoded, so the session's
+    /// answers depend on more than the fingerprinted tree.
+    failed: AtomicBool,
 }
 
 impl LaminarArt {
@@ -31,6 +35,7 @@ impl LaminarArt {
             resolved: DashMap::new(),
             patterns: DashMap::new(),
             fingerprint: OnceLock::new(),
+            failed: AtomicBool::new(false),
         }
     }
 
@@ -80,6 +85,18 @@ impl LaminarArt {
         })
     }
 
+    /// Whether reading or decoding an art file has failed this session (the
+    /// library, a `.ter` or a lit texture). A class that is simply not lit
+    /// is not a failure. Answers given after a failure may differ from a
+    /// later session's, so they must not be persisted.
+    pub fn had_failure(&self) -> bool {
+        self.failed.load(Ordering::Relaxed)
+    }
+
+    fn record_failure(&self) {
+        self.failed.store(true, Ordering::Relaxed);
+    }
+
     /// The decoded lit pattern a palette name stands for, or `None` (dark).
     ///
     /// Blocking file I/O and decoding on first use of a texture.
@@ -91,6 +108,7 @@ impl LaminarArt {
         }
         let pattern = load_pattern(&lit.texture, lit.ground_scale_m).map(Arc::new);
         if pattern.is_none() {
+            self.record_failure();
             warn!(texture = %lit.texture.display(),
                   "Night lighting: lit texture is not a readable DXT1 DDS; this class stays dark");
         }
@@ -118,6 +136,7 @@ impl LaminarArt {
                 match std::fs::read_to_string(&path) {
                     Ok(text) => Some(LibraryIndex::parse(&text)),
                     Err(e) => {
+                        self.record_failure();
                         warn!(path = %path.display(), error = %e,
                               "Night lighting: Laminar library unavailable; every lit texture stays dark");
                         None
@@ -139,6 +158,7 @@ impl LaminarArt {
         let text = match std::fs::read_to_string(&ter_path) {
             Ok(text) => text,
             Err(e) => {
+                self.record_failure();
                 warn!(name = palette_name, path = %ter_path.display(), error = %e,
                       "Night lighting: lit terrain unreadable; this class stays dark");
                 return None;
@@ -362,6 +382,43 @@ mod tests {
         assert!(art
             .pattern("lib/g10/terrain10/urban_tmp_sdry3.ter")
             .is_none());
+    }
+
+    #[test]
+    fn only_a_read_failure_counts_as_a_failure() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true); // the lit texture does not decode
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert!(art
+            .lit_terrain("lib/g10/terrain10/urban_tmp_sdry_prk.ter")
+            .is_none());
+        assert!(art.lit_terrain("lib/g10/terrain10/nope.ter").is_none());
+        assert!(!art.had_failure(), "unlit classes are not failures");
+        assert!(art
+            .pattern("lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .is_none());
+        assert!(art.had_failure(), "an undecodable lit texture is");
+    }
+
+    #[test]
+    fn an_unreadable_ter_is_a_failure() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        std::fs::remove_file(temp.path().join("terrain12/urban_tmp_sdry3.ter")).unwrap();
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert!(art
+            .lit_terrain("lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .is_none());
+        assert!(art.had_failure());
+    }
+
+    #[test]
+    fn a_missing_library_is_a_failure() {
+        let art = LaminarArt::new(PathBuf::from("/nonexistent/1000 world terrain"));
+        assert!(art
+            .lit_terrain("lib/g10/terrain10/urban_tmp_sdry3.ter")
+            .is_none());
+        assert!(art.had_failure());
     }
 
     #[test]

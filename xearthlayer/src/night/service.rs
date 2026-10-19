@@ -283,7 +283,8 @@ impl NightLitSource {
     }
 
     /// Disk first, then generation; a generated payload is written back
-    /// without waiting. Without a disk tier this is `generate`.
+    /// without waiting, unless an art file failed to read this session.
+    /// Without a disk tier this is `generate`.
     async fn load_or_generate(&self, name: DdsFilename, layout: LitLayout) -> Option<Bytes> {
         let Some(disk) = self.disk.clone() else {
             return self.generate(name, layout.first_visible).await;
@@ -315,6 +316,12 @@ impl NightLitSource {
             return self.generate(name, layout.first_visible).await;
         };
         let payload = self.generate(name, layout.first_visible).await?;
+        if self.art.had_failure() {
+            // An art file failed to read this session: the payload may differ
+            // from a later session's under the same fingerprint, so it stays
+            // in memory only.
+            return Some(payload);
+        }
         let entry = encode_entry(&fp, &payload);
         let disk_io = Arc::clone(&self.disk_io);
         tokio::spawn(async move {
@@ -1011,6 +1018,31 @@ mod tests {
                 .with_disk_cache(disk.clone());
             b.payload(&name, &layout).await;
             assert_eq!(calls(&second), 1, "regenerated, not decoded");
+        }
+
+        #[tokio::test]
+        async fn an_art_read_failure_writes_nothing() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let source = source_in(&temp).with_disk_cache(disk.clone());
+            // The lit texture exists but does not decode.
+            std::fs::write(
+                temp.path().join("art/textures12/urban_FAR/uw5_FAR_LIT.dds"),
+                b"DDS ",
+            )
+            .unwrap();
+            let layout = LitLayout::new(16, 4);
+            assert!(
+                source.payload(&name, &layout).await.is_some(),
+                "still served from memory"
+            );
+            settle(&disk, &name).await;
+            assert!(disk
+                .get(&crate::night::lit_cache_key(&name))
+                .await
+                .unwrap()
+                .is_none());
         }
 
         #[tokio::test]
