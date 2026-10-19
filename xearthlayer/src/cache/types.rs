@@ -100,6 +100,7 @@ impl Default for DiskCacheConfig {
 /// Chunk-tier writes are small and frequent (~14 KB, thousands per second);
 /// DDS-tier writes are large and rare (11.17 MB, a few per second). Attributing
 /// bytes to a tier keeps `chunk_disk_bytes_written` honest — see issue #216.
+/// The lit tier (night lighting only) holds generated lit payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiskTier {
     /// The chunk disk cache.
@@ -115,7 +116,7 @@ impl DiskTier {
     ///
     /// These exact strings already appear in disk cache log output; changing
     /// them would break existing log greps. Note the asymmetry — the chunk
-    /// label is plural, the DDS label is not.
+    /// label is plural, the DDS and lit labels are not.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Chunk => "chunks",

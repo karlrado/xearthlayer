@@ -48,7 +48,8 @@ use crate::metrics::MetricsClient;
 ///
 /// This is the one place tier maps to a validator, keeping
 /// `DiskCacheProvider` itself ignorant of what it stores — the same struct
-/// backs both the DDS tile tier and the raw chunk tier (#253).
+/// backs all three tiers: DDS tiles, raw chunks (#253) and, with night
+/// lighting on, lit payloads.
 fn validator_for_tier(tier: DiskTier) -> Arc<dyn CacheEntryValidator> {
     match tier {
         DiskTier::Dds => Arc::new(dds_tile_validator()),

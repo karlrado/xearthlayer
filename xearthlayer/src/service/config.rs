@@ -49,6 +49,7 @@ pub struct ServiceConfig {
     generation_timeout: Option<u64>,
     /// Quiet mode - disables periodic stats logging (for TUI mode)
     quiet_mode: bool,
+    /// Whether night lighting is on (`night.enabled`); adds the lit disk tier
     night_enabled: bool,
     /// Control plane configuration for job management and health monitoring
     control_plane: ControlPlaneSettings,

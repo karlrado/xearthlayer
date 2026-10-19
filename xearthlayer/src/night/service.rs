@@ -82,7 +82,8 @@ const MAX_LIT_GENERATION_PERMITS: usize = 4;
 
 // Lit work (probes, generations, disk tier) runs on the blocking pool inside
 // its headroom (R17); keep it to a quarter of that headroom so it cannot
-// starve other blocking work.
+// starve other blocking work. The lit share is fully used (8 of 8): a new lit
+// permit needs a smaller one elsewhere or a larger headroom.
 const _: () = assert!(
     LIT_PROBE_PERMITS + MAX_LIT_GENERATION_PERMITS + LIT_DISK_PERMITS
         <= crate::executor::BLOCKING_POOL_HEADROOM / 4

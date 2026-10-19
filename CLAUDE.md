@@ -62,11 +62,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      - Structured tracing on buffer lifecycle and error paths
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
-   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network
-   - `CacheLayer` - Service-owned three-tier cache lifecycle with budget management
+   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network, plus a separate lit disk tier when night lighting is on
+   - `CacheLayer` - Service-owned cache lifecycle with budget management: the three tiers, plus the lit disk tier when night lighting is on
    - `CacheService` - Self-contained cache with internal GC daemons
    - `MemoryCacheProvider`: moka-based LRU eviction (default 512MB, staging buffer)
-   - `DiskCacheProvider`: Two instances — DDS tiles and raw chunks, each with own GC
+   - `DiskCacheProvider`: Two instances (DDS tiles and raw chunks), three with night lighting on (plus lit payloads), each with own GC
    - DDS disk cache: Encoded DDS tiles on disk, avoids re-encoding on memory eviction (~3.5ms NVMe read vs ~50-200ms re-encode)
    - Lit tier (night lighting only, `night.enabled`): generated lit payloads on disk at `{cache_dir}/night/`, read path memory → disk → generate (`night/disk.rs`, `lit_payload_validator`), 5% of `cache.disk_size` taken first with `dds_disk_ratio` splitting the other 95%, own GC daemon on the prefetch lane; entries carry a SHA-256 fingerprint (generator version, brightness, Laminar art and recipe file size+mtime) so a mismatch regenerates. Off means no tier, directory or daemon
    - Shared disk budget: `cache.disk_size` split by `cache.dds_disk_ratio` (default 0.6 = 60% DDS, 40% chunks)
@@ -80,7 +80,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
-   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk disk tiers) — bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
+   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk/lit disk tiers): bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
@@ -461,7 +461,7 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/aircraft_position/web_api/datarefs.rs` | X-Plane dataref definitions |
 | `xearthlayer/src/aircraft_position/web_api/sim_state.rs` | SimState - sim state detection (paused, loading, etc.) |
 | `xearthlayer/src/aircraft_position/web_api/config.rs` | Web API connection configuration |
-| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - three-tier cache lifecycle (memory + DDS disk + chunk disk) |
+| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - cache lifecycle (memory + DDS disk + chunk disk, plus lit disk with night lighting on) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
 | `xearthlayer/src/cache/integrity/` | Canonical cache integrity model (`length_ceiling`, `write_atomic`, `discard`, `CacheEntryValidator`) |
