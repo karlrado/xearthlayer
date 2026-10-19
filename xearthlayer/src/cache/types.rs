@@ -106,6 +106,8 @@ pub enum DiskTier {
     Chunk,
     /// The DDS tile disk cache.
     Dds,
+    /// The night lit payload disk cache.
+    Lit,
 }
 
 impl DiskTier {
@@ -118,6 +120,7 @@ impl DiskTier {
         match self {
             Self::Chunk => "chunks",
             Self::Dds => "dds",
+            Self::Lit => "lit",
         }
     }
 }
