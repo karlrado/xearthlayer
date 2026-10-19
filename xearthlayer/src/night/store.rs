@@ -28,6 +28,14 @@ pub fn recipe_path(root: &Path, lat: i32, lon: i32) -> PathBuf {
         .join(xearthlayer_package::night::recipe_relative_path(lat, lon))
 }
 
+/// Size and modification time of a recipe file: what changes when a recipe
+/// is replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileIdentity {
+    pub len: u64,
+    pub mtime_nanos: u128,
+}
+
 /// Recipes per tile, loaded lazily and evicted by size. Absence is cached.
 pub struct RecipeStore {
     roots: Vec<PathBuf>,
@@ -81,15 +89,32 @@ impl RecipeStore {
             .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
 
-    /// `Ok(None)` (cached) for an absent or rejected recipe; `Err` (not
-    /// cached) when the file could not be read.
-    fn load(&self, lat: i32, lon: i32) -> Result<Option<Arc<Recipe>>, std::io::Error> {
-        let Some(path) = self
-            .roots
+    /// The file a tile's recipe is read from: the first source that has one.
+    fn resolve(&self, lat: i32, lon: i32) -> Option<PathBuf> {
+        self.roots
             .iter()
             .map(|root| recipe_path(root, lat, lon))
             .find(|p| p.is_file())
-        else {
+    }
+
+    /// Identity of the recipe file `get` would read, or `None` when the tile
+    /// has none. Blocking stat, bypasses the recipe cache.
+    pub fn identity(&self, lat: i32, lon: i32) -> Option<FileIdentity> {
+        let meta = std::fs::metadata(self.resolve(lat, lon)?).ok()?;
+        Some(FileIdentity {
+            len: meta.len(),
+            mtime_nanos: meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos()),
+        })
+    }
+
+    /// `Ok(None)` (cached) for an absent or rejected recipe; `Err` (not
+    /// cached) when the file could not be read.
+    fn load(&self, lat: i32, lon: i32) -> Result<Option<Arc<Recipe>>, std::io::Error> {
+        let Some(path) = self.resolve(lat, lon) else {
             return Ok(None);
         };
         let bytes = match read_bounded(&path) {
@@ -174,6 +199,37 @@ mod tests {
         let path = recipe_path(root, lat, lon);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn identity_is_none_without_a_recipe() {
+        let temp = TempDir::new().unwrap();
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert_eq!(store.identity(37, -123), None);
+    }
+
+    #[test]
+    fn identity_follows_the_first_source_with_the_file() {
+        let (a, b) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        put(b.path(), 37, -123, URBAN);
+        let store = RecipeStore::new(vec![a.path().to_path_buf(), b.path().to_path_buf()]);
+        assert_eq!(store.identity(37, -123).unwrap().len, URBAN.len() as u64);
+        put(a.path(), 37, -123, EMPTY);
+        assert_eq!(
+            store.identity(37, -123).unwrap().len,
+            EMPTY.len() as u64,
+            "the first source now has it"
+        );
+    }
+
+    #[test]
+    fn identity_changes_when_the_file_is_rewritten() {
+        let temp = TempDir::new().unwrap();
+        put(temp.path(), 37, -123, URBAN);
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        let before = store.identity(37, -123).unwrap();
+        put(temp.path(), 37, -123, EMPTY);
+        assert_ne!(store.identity(37, -123).unwrap(), before);
     }
 
     #[test]

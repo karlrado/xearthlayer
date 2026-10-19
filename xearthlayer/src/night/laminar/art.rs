@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use super::library::LibraryIndex;
@@ -17,6 +18,7 @@ pub struct LaminarArt {
     resolved: DashMap<String, Option<Arc<LitTerrain>>>,
     /// Decoded patterns by `texture|ground scale`; Laminar has nine textures.
     patterns: DashMap<String, Option<Arc<LitPattern>>>,
+    fingerprint: OnceLock<[u8; 32]>,
 }
 
 impl LaminarArt {
@@ -27,7 +29,58 @@ impl LaminarArt {
             library: OnceLock::new(),
             resolved: DashMap::new(),
             patterns: DashMap::new(),
+            fingerprint: OnceLock::new(),
         }
+    }
+
+    /// Digest of the art a lit texture can draw on: the library, every
+    /// `.ter` and every `_LIT.dds` under the terrain root, by relative path,
+    /// size and modification time. A missing root has a fingerprint too.
+    ///
+    /// Blocking directory walk (~30 ms on a real install), done once per
+    /// session.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        *self.fingerprint.get_or_init(|| {
+            let mut files = Vec::new();
+            let mut dirs = vec![self.terrain_root.clone()];
+            while let Some(dir) = dirs.pop() {
+                let Ok(entries) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if meta.is_dir() {
+                        dirs.push(path);
+                        continue;
+                    }
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name == "library.txt" || name.ends_with(".ter") || name.ends_with("_LIT.dds")
+                    {
+                        let relative = path
+                            .strip_prefix(&self.terrain_root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .into_owned();
+                        let mtime = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map_or(0, |d| d.as_nanos());
+                        files.push((relative, meta.len(), mtime));
+                    }
+                }
+            }
+            files.sort();
+            let mut hasher = Sha256::new();
+            for (relative, len, mtime) in files {
+                hasher.update(relative.as_bytes());
+                hasher.update([0u8]);
+                hasher.update(len.to_le_bytes());
+                hasher.update(mtime.to_le_bytes());
+            }
+            hasher.finalize().into()
+        })
     }
 
     /// The decoded lit pattern a palette name stands for, or `None` (dark).
@@ -142,6 +195,40 @@ mod tests {
         if with_lit_file {
             std::fs::write(root.join("textures12/urban_FAR/uw5_FAR_LIT.dds"), b"DDS ").unwrap();
         }
+    }
+
+    #[test]
+    fn the_fingerprint_is_stable_for_one_tree() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        let art = LaminarArt::new(temp.path().to_path_buf());
+        assert_eq!(art.fingerprint(), art.fingerprint());
+        assert_eq!(
+            art.fingerprint(),
+            LaminarArt::new(temp.path().to_path_buf()).fingerprint()
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_moves_when_a_lit_file_changes() {
+        let temp = TempDir::new().unwrap();
+        install(temp.path(), true);
+        let before = LaminarArt::new(temp.path().to_path_buf()).fingerprint();
+        std::fs::write(
+            temp.path().join("textures12/urban_FAR/uw5_FAR_LIT.dds"),
+            b"DDS longer",
+        )
+        .unwrap();
+        assert_ne!(
+            LaminarArt::new(temp.path().to_path_buf()).fingerprint(),
+            before
+        );
+    }
+
+    #[test]
+    fn a_missing_root_still_has_a_fingerprint() {
+        let art = LaminarArt::new(PathBuf::from("/nonexistent/1000 world terrain"));
+        assert_eq!(art.fingerprint(), art.fingerprint());
     }
 
     #[test]
