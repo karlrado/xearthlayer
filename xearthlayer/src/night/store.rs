@@ -11,8 +11,9 @@ use dashmap::DashSet;
 use moka::sync::Cache;
 use tracing::warn;
 
+use super::generator::LedRegion;
 use super::recipe::{parse_recipe, Recipe};
-use crate::ortho_union::OrthoUnionIndex;
+use crate::ortho_union::{OrthoSource, OrthoUnionIndex};
 
 /// Byte budget for decoded recipes (about 1.5 MB each).
 const RECIPE_CACHE_BYTES: u64 = 64 * 1024 * 1024;
@@ -50,17 +51,30 @@ impl FileIdentity {
     }
 }
 
-/// What a tile's load found: the recipe (`None` for absent or rejected) and
-/// the identity of the file it was read from (`None` when there was none).
+/// What a tile's load found: the recipe (`None` for absent or rejected),
+/// the identity of the file it was read from (`None` when there was none),
+/// and the region of the source that file came from (`Unknown` when there
+/// was none).
 #[derive(Clone)]
 struct Loaded {
     recipe: Option<Arc<Recipe>>,
     identity: Option<FileIdentity>,
+    region: LedRegion,
+}
+
+/// The LED region of an ortho source: a regional package's code, or
+/// `Unknown` for a patch.
+fn source_region(source: &OrthoSource) -> LedRegion {
+    if source.source_type.is_regional_package() {
+        LedRegion::from_code(&source.sort_key)
+    } else {
+        LedRegion::Unknown
+    }
 }
 
 /// Recipes per tile, loaded lazily and evicted by size. Absence is cached.
 pub struct RecipeStore {
-    roots: Vec<PathBuf>,
+    roots: Vec<(PathBuf, LedRegion)>,
     cache: Cache<(i32, i32), Loaded>,
     warned: DashSet<PathBuf>,
 }
@@ -68,6 +82,16 @@ pub struct RecipeStore {
 impl RecipeStore {
     /// `roots` in priority order: the first source with a recipe wins.
     pub fn new(roots: Vec<PathBuf>) -> Self {
+        Self::with_regions(
+            roots
+                .into_iter()
+                .map(|root| (root, LedRegion::Unknown))
+                .collect(),
+        )
+    }
+
+    /// Like `new`, with the LED region of each root.
+    pub fn with_regions(roots: Vec<(PathBuf, LedRegion)>) -> Self {
         let cache = Cache::builder()
             .max_capacity(RECIPE_CACHE_BYTES)
             .weigher(|_, v: &Loaded| match &v.recipe {
@@ -86,11 +110,11 @@ impl RecipeStore {
 
     /// Every source of the union index, in its priority order.
     pub fn from_index(index: &OrthoUnionIndex) -> Self {
-        Self::new(
+        Self::with_regions(
             index
                 .sources()
                 .iter()
-                .map(|s| s.source_path.clone())
+                .map(|s| (s.source_path.clone(), source_region(s)))
                 .collect(),
         )
     }
@@ -118,18 +142,40 @@ impl RecipeStore {
         Ok(self.loaded(lat, lon)?.identity)
     }
 
+    /// The recipe and the region of the source it was read from, from one
+    /// cached load, so the two always describe the same file.
+    pub fn get_with_region(
+        &self,
+        lat: i32,
+        lon: i32,
+    ) -> std::io::Result<(Option<Arc<Recipe>>, LedRegion)> {
+        let l = self.loaded(lat, lon)?;
+        Ok((l.recipe, l.region))
+    }
+
+    /// `identity` with the region, from one cached load.
+    pub fn identity_with_region(
+        &self,
+        lat: i32,
+        lon: i32,
+    ) -> std::io::Result<(Option<FileIdentity>, LedRegion)> {
+        let l = self.loaded(lat, lon)?;
+        Ok((l.identity, l.region))
+    }
+
     fn loaded(&self, lat: i32, lon: i32) -> std::io::Result<Loaded> {
         self.cache
             .try_get_with((lat, lon), || self.load(lat, lon))
             .map_err(|e| std::io::Error::new(e.kind(), e.to_string()))
     }
 
-    /// The file a tile's recipe is read from: the first source that has one.
-    fn resolve(&self, lat: i32, lon: i32) -> Option<PathBuf> {
+    /// The file a tile's recipe is read from, and its source's region: the
+    /// first source that has one.
+    fn resolve(&self, lat: i32, lon: i32) -> Option<(PathBuf, LedRegion)> {
         self.roots
             .iter()
-            .map(|root| recipe_path(root, lat, lon))
-            .find(|p| p.is_file())
+            .map(|(root, region)| (recipe_path(root, lat, lon), *region))
+            .find(|(p, _)| p.is_file())
     }
 
     /// No recipe (cached) for an absent or rejected file; `Err` (not cached)
@@ -137,10 +183,11 @@ impl RecipeStore {
     /// identity is taken before and after the read, so it is the identity of
     /// the bytes parsed.
     fn load(&self, lat: i32, lon: i32) -> Result<Loaded, std::io::Error> {
-        let Some(path) = self.resolve(lat, lon) else {
+        let Some((path, region)) = self.resolve(lat, lon) else {
             return Ok(Loaded {
                 recipe: None,
                 identity: None,
+                region: LedRegion::Unknown,
             });
         };
         let (identity, read) = match identified_read(&path) {
@@ -153,6 +200,7 @@ impl RecipeStore {
         let rejected = Loaded {
             recipe: None,
             identity: Some(identity),
+            region,
         };
         let Some(bytes) = read else {
             self.warn_once(&path, "file exceeds the recipe size ceiling");
@@ -179,6 +227,7 @@ impl RecipeStore {
         Ok(Loaded {
             recipe: Some(Arc::new(recipe)),
             identity: Some(identity),
+            region,
         })
     }
 
@@ -222,6 +271,56 @@ mod tests {
 
     const URBAN: &[u8] = include_bytes!("../../tests/fixtures/night/urban.oxn");
     const EMPTY: &[u8] = include_bytes!("../../tests/fixtures/night/empty.oxn");
+
+    #[test]
+    fn a_recipe_carries_the_region_of_the_root_it_was_read_from() {
+        let (na, eu) = (TempDir::new().unwrap(), TempDir::new().unwrap());
+        for root in [&na, &eu] {
+            let p = recipe_path(root.path(), 37, -123);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, URBAN).unwrap();
+        }
+        let store = RecipeStore::with_regions(vec![
+            (na.path().to_path_buf(), LedRegion::Na),
+            (eu.path().to_path_buf(), LedRegion::Eu),
+        ]);
+        let (recipe, region) = store.get_with_region(37, -123).unwrap();
+        assert!(recipe.is_some());
+        assert_eq!(region, LedRegion::Na, "the first root wins");
+        let (identity, region) = store.identity_with_region(37, -123).unwrap();
+        assert!(identity.is_some());
+        assert_eq!(region, LedRegion::Na);
+    }
+
+    #[test]
+    fn no_recipe_has_no_region() {
+        let temp = TempDir::new().unwrap();
+        let store = RecipeStore::with_regions(vec![(temp.path().to_path_buf(), LedRegion::Eu)]);
+        let (recipe, region) = store.get_with_region(37, -123).unwrap();
+        assert!(recipe.is_none());
+        assert_eq!(region, LedRegion::Unknown);
+    }
+
+    #[test]
+    fn plain_roots_are_unknown() {
+        let temp = TempDir::new().unwrap();
+        let p = recipe_path(temp.path(), 37, -123);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, URBAN).unwrap();
+        let store = RecipeStore::new(vec![temp.path().to_path_buf()]);
+        assert_eq!(
+            store.get_with_region(37, -123).unwrap().1,
+            LedRegion::Unknown
+        );
+    }
+
+    #[test]
+    fn packages_give_their_code_and_patches_none() {
+        let pkg = OrthoSource::new_package("NA-USA-MX-CENTRAL", "/p/na");
+        let patch = OrthoSource::new_patch("KLAX_Mesh", "/p/klax");
+        assert_eq!(source_region(&pkg), LedRegion::Na);
+        assert_eq!(source_region(&patch), LedRegion::Unknown);
+    }
 
     #[cfg(unix)]
     #[test]

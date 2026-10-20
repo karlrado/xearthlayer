@@ -142,13 +142,14 @@ impl SessionRecipes {
         }
     }
 
-    /// The tile's recipe (`None` for none), or `Unreadable`. Blocking I/O.
-    fn get(&self, lat: i32, lon: i32) -> Result<Option<Arc<Recipe>>, Unreadable> {
+    /// The tile's recipe (`None` for none) and the region of the package it
+    /// came from, or `Unreadable`. Blocking I/O.
+    fn get(&self, lat: i32, lon: i32) -> Result<(Option<Arc<Recipe>>, LedRegion), Unreadable> {
         if self.given_up.contains(&(lat, lon)) {
             return Err(Unreadable);
         }
         with_retries(RECIPE_RETRIES, RECIPE_RETRY_DELAY, || {
-            self.store.get_checked(lat, lon)
+            self.store.get_with_region(lat, lon)
         })
         .map_err(|e| {
             if self.given_up.insert((lat, lon)) {
@@ -160,14 +161,20 @@ impl SessionRecipes {
     }
 
     /// Identity of the recipe file the tile's recipe was loaded from (`None`
-    /// for none), or `Unreadable` when it cannot be loaded. Not retried: a
+    /// for none) and the region of its package, or `Unreadable` when it cannot be loaded. Not retried: a
     /// failure only means no disk tier for this payload, and generation
     /// retries. Blocking I/O on a cache miss.
-    fn identity(&self, lat: i32, lon: i32) -> Result<Option<FileIdentity>, Unreadable> {
+    fn identity(
+        &self,
+        lat: i32,
+        lon: i32,
+    ) -> Result<(Option<FileIdentity>, LedRegion), Unreadable> {
         if self.given_up.contains(&(lat, lon)) {
             return Err(Unreadable);
         }
-        self.store.identity(lat, lon).map_err(|_| Unreadable)
+        self.store
+            .identity_with_region(lat, lon)
+            .map_err(|_| Unreadable)
     }
 
     /// Every recipe the generator can read for `name`, or `Unreadable` when
@@ -187,8 +194,9 @@ fn field_tiles(name: &DdsFilename) -> Vec<(i32, i32)> {
         .tiles()
 }
 
-/// The recipes of the tiles a footprint's field covers.
-type FootprintRecipes = HashMap<(i32, i32), Option<Arc<Recipe>>>;
+/// The recipes of the tiles a footprint's field covers, each with the region
+/// of the package it came from.
+type FootprintRecipes = HashMap<(i32, i32), (Option<Arc<Recipe>>, LedRegion)>;
 
 /// Memory for generated visible levels (about 0.7 MB per urban ZL16 texture).
 const LIT_PAYLOAD_CACHE_BYTES: u64 = 256 * 1024 * 1024;
@@ -360,7 +368,10 @@ impl NightLitSource {
         let identities = tokio::task::spawn_blocking(move || {
             field_tiles(&owned)
                 .into_iter()
-                .map(|(lat, lon)| Ok(((lat, lon), recipes.identity(lat, lon)?)))
+                .map(|(lat, lon)| {
+                    let (identity, region) = recipes.identity(lat, lon)?;
+                    Ok(((lat, lon), identity, region))
+                })
                 .collect::<Result<Vec<_>, Unreadable>>()
         })
         .await
@@ -386,7 +397,12 @@ impl NightLitSource {
             let Ok(fetched) = recipes.for_footprint(&owned) else {
                 return None;
             };
-            let lookup = |lat: i32, lon: i32| fetched.get(&(lat, lon)).cloned().flatten();
+            let lookup = |lat: i32, lon: i32| fetched.get(&(lat, lon)).and_then(|(r, _)| r.clone());
+            let regions = |lat: i32, lon: i32| {
+                fetched
+                    .get(&(lat, lon))
+                    .map_or(LedRegion::Unknown, |(_, g)| *g)
+            };
             let patterns = |n: &str| art.pattern(n);
             let image = generator.generate(&LitRequest {
                 name: &owned,
@@ -394,8 +410,8 @@ impl NightLitSource {
                 brightness,
                 recipes: &lookup,
                 patterns: &patterns,
-                regions: &|_, _| LedRegion::Unknown,
-                led: &LedModel::OFF,
+                regions: &regions,
+                led: &LedModel::DEFAULT,
             });
             Some(super::generator::encode_visible(image))
         })
@@ -454,7 +470,7 @@ impl NightLitSource {
         let lit = match tokio::task::spawn_blocking(move || {
             // The field reads every tile the generator could read for this
             // footprint, once each; an unreadable one counts as dark.
-            let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().flatten();
+            let lookup = |lat: i32, lon: i32| recipes.get(lat, lon).ok().and_then(|(r, _)| r);
             RecipeField::new(&footprint, &lookup).has_light(|n| art.lit_terrain(n).is_some())
         })
         .await
@@ -834,6 +850,39 @@ mod tests {
                 self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
             }
+        }
+
+        /// Records the region and LED model the generator is handed.
+        #[derive(Default)]
+        struct Recording(std::sync::Mutex<Option<(LedRegion, bool)>>);
+
+        impl crate::night::generator::LitGenerator for Recording {
+            fn generate(&self, r: &crate::night::generator::LitRequest<'_>) -> image::RgbaImage {
+                *self.0.lock().unwrap() =
+                    Some(((r.regions)(37, -123), *r.led == LedModel::DEFAULT));
+                image::RgbaImage::from_pixel(r.size, r.size, image::Rgba([255, 255, 255, 255]))
+            }
+        }
+
+        #[tokio::test]
+        async fn the_generator_gets_the_package_region_and_the_default_model() {
+            let temp = TempDir::new().unwrap();
+            write_tree(&temp);
+            let recording = Arc::new(Recording::default());
+            let source = NightLitSource::new(
+                Arc::new(RecipeStore::with_regions(vec![(
+                    temp.path().join("pkg"),
+                    LedRegion::Na,
+                )])),
+                Arc::new(LaminarArt::new(temp.path().join("art"))),
+                Arc::new(FixedTextureSetting(4)),
+            )
+            .with_generator(recording.clone());
+            let name = name_at(37.20, -122.725);
+            source
+                .read(&name, LitLayout::new(16, 4).payload_start(), 1 << 20)
+                .await;
+            assert_eq!(*recording.0.lock().unwrap(), Some((LedRegion::Na, true)));
         }
 
         #[tokio::test]

@@ -8,7 +8,7 @@
 use bytes::{BufMut, Bytes, BytesMut};
 use sha2::{Digest, Sha256};
 
-use super::generator::LIT_GENERATOR_VERSION;
+use super::generator::{LedRegion, LIT_GENERATOR_VERSION};
 use super::store::FileIdentity;
 use crate::cache::integrity::LIT_ENTRY_MAGIC;
 use crate::fuse::DdsFilename;
@@ -30,17 +30,18 @@ pub fn session_fingerprint(brightness: f64, art: [u8; 32]) -> [u8; 32] {
     hasher.finalize().into()
 }
 
-/// The session inputs plus the identity of each recipe the texture's
-/// footprint covers (`None` for a tile without one). Order does not matter.
+/// The session inputs plus the identity and region of each recipe the
+/// texture's footprint covers (`None` identity for a tile without one).
+/// Order does not matter.
 pub fn footprint_fingerprint(
     session: [u8; 32],
-    recipes: &[((i32, i32), Option<FileIdentity>)],
+    recipes: &[((i32, i32), Option<FileIdentity>, LedRegion)],
 ) -> LitFingerprint {
     let mut sorted = recipes.to_vec();
-    sorted.sort_by_key(|(tile, _)| *tile);
+    sorted.sort_by_key(|(tile, _, _)| *tile);
     let mut hasher = Sha256::new();
     hasher.update(session);
-    for ((lat, lon), identity) in sorted {
+    for ((lat, lon), identity, region) in sorted {
         hasher.update(lat.to_le_bytes());
         hasher.update(lon.to_le_bytes());
         match identity {
@@ -51,6 +52,7 @@ pub fn footprint_fingerprint(
                 hasher.update(id.mtime_nanos.to_le_bytes());
             }
         }
+        hasher.update([region.tag()]);
     }
     LitFingerprint(hasher.finalize().into())
 }
@@ -135,20 +137,26 @@ mod tests {
             })
         };
         let s = session_fingerprint(1.0, [0; 32]);
-        let base = footprint_fingerprint(s, &[((37, -123), id(10))]);
+        let base = footprint_fingerprint(s, &[((37, -123), id(10), LedRegion::Unknown)]);
         assert_ne!(
             base,
-            footprint_fingerprint(session_fingerprint(1.25, [0; 32]), &[((37, -123), id(10))]),
+            footprint_fingerprint(
+                session_fingerprint(1.25, [0; 32]),
+                &[((37, -123), id(10), LedRegion::Unknown)]
+            ),
             "brightness"
         );
         assert_ne!(
             base,
-            footprint_fingerprint(session_fingerprint(1.0, [1; 32]), &[((37, -123), id(10))]),
+            footprint_fingerprint(
+                session_fingerprint(1.0, [1; 32]),
+                &[((37, -123), id(10), LedRegion::Unknown)]
+            ),
             "art"
         );
         assert_ne!(
             base,
-            footprint_fingerprint(s, &[((37, -123), id(11))]),
+            footprint_fingerprint(s, &[((37, -123), id(11), LedRegion::Unknown)]),
             "recipe size"
         );
         assert_ne!(
@@ -160,38 +168,59 @@ mod tests {
                     Some(FileIdentity {
                         len: 10,
                         mtime_nanos: 6
-                    })
+                    }),
+                    LedRegion::Unknown
                 )]
             ),
             "recipe mtime"
         );
         assert_ne!(
             base,
-            footprint_fingerprint(s, &[((37, -123), None)]),
+            footprint_fingerprint(s, &[((37, -123), None, LedRegion::Unknown)]),
             "recipe removed"
         );
         assert_ne!(
             base,
-            footprint_fingerprint(s, &[((37, -123), id(10)), ((37, -122), None)]),
+            footprint_fingerprint(
+                s,
+                &[
+                    ((37, -123), id(10), LedRegion::Unknown),
+                    ((37, -122), None, LedRegion::Unknown)
+                ]
+            ),
             "another tile"
         );
         assert_eq!(
             base,
-            footprint_fingerprint(s, &[((37, -123), id(10))]),
+            footprint_fingerprint(s, &[((37, -123), id(10), LedRegion::Unknown)]),
             "stable"
+        );
+    }
+
+    #[test]
+    fn the_region_moves_the_fingerprint() {
+        let id = Some(FileIdentity {
+            len: 10,
+            mtime_nanos: 5,
+        });
+        let s = session_fingerprint(1.0, [0; 32]);
+        assert_ne!(
+            footprint_fingerprint(s, &[((37, -123), id, LedRegion::Na)]),
+            footprint_fingerprint(s, &[((37, -123), id, LedRegion::Eu)]),
         );
     }
 
     #[test]
     fn the_tile_order_does_not_matter() {
         let s = session_fingerprint(1.0, [0; 32]);
-        let a = ((37, -123), None);
+        let a = ((37, -123), None, LedRegion::Unknown);
         let b = (
             (38, -123),
             Some(FileIdentity {
                 len: 1,
                 mtime_nanos: 2,
             }),
+            LedRegion::Eu,
         );
         assert_eq!(
             footprint_fingerprint(s, &[a, b]),
