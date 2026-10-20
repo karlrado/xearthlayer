@@ -161,9 +161,9 @@ impl SessionRecipes {
     }
 
     /// Identity of the recipe file the tile's recipe was loaded from (`None`
-    /// for none) and the region of its package, or `Unreadable` when it cannot be loaded. Not retried: a
-    /// failure only means no disk tier for this payload, and generation
-    /// retries. Blocking I/O on a cache miss.
+    /// for none) and the region of its package, or `Unreadable` when it
+    /// cannot be loaded. Not retried: a failure only means no disk tier for
+    /// this payload, and generation retries. Blocking I/O on a cache miss.
     fn identity(
         &self,
         lat: i32,
@@ -961,6 +961,64 @@ mod tests {
                 .with_disk_cache(disk.clone());
             assert_eq!(b.read(&name, start, 4096).await, bytes);
             assert_eq!(calls(&second), 0, "served from disk");
+        }
+
+        /// Like `source_in`, with the package tagged as in `region`.
+        fn source_in_region(temp: &TempDir, region: LedRegion) -> NightLitSource {
+            let pkg = temp.path().join("pkg");
+            let art = temp.path().join("art");
+            if !art.exists() {
+                write_tree(temp);
+            }
+            NightLitSource::new(
+                Arc::new(RecipeStore::with_regions(vec![(pkg, region)])),
+                Arc::new(LaminarArt::new(art)),
+                Arc::new(FixedTextureSetting(4)),
+            )
+        }
+
+        #[tokio::test]
+        async fn the_package_region_invalidates_lit_disk_entries() {
+            let temp = TempDir::new().unwrap();
+            let disk = disk();
+            let name = name_at(37.20, -122.725);
+            let start = LitLayout::new(16, 4).payload_start();
+
+            let na = Arc::new(White::default());
+            let a = source_in_region(&temp, LedRegion::Na)
+                .with_generator(na.clone())
+                .with_disk_cache(disk.clone());
+            a.read(&name, start, 4096).await;
+            assert_eq!(calls(&na), 1);
+            settle(&disk, &name).await;
+
+            let eu = Arc::new(White::default());
+            let b = source_in_region(&temp, LedRegion::Eu)
+                .with_generator(eu.clone())
+                .with_disk_cache(disk.clone());
+            b.read(&name, start, 4096).await;
+            assert_eq!(calls(&eu), 1, "another region regenerates");
+            // Wait until the Eu entry has replaced the Na one.
+            let b_fp = b.fingerprint(&name).await.unwrap();
+            let key = crate::night::lit_cache_key(&name);
+            for _ in 0..50 {
+                let entry = disk.get(&key).await.unwrap().unwrap();
+                if crate::night::decode_entry(entry, &b_fp, LitLayout::new(16, 4).payload_len())
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            // The Eu entry now sits on disk: a source over Eu is served from
+            // it, so the generator count above cannot be a missing cache.
+            let again_eu = Arc::new(White::default());
+            let d = source_in_region(&temp, LedRegion::Eu)
+                .with_generator(again_eu.clone())
+                .with_disk_cache(disk.clone());
+            d.read(&name, start, 4096).await;
+            assert_eq!(calls(&again_eu), 0, "the same region is served from disk");
         }
 
         #[tokio::test]
