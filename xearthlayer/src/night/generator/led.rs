@@ -13,15 +13,20 @@ use super::SRGB_GAMMA;
 /// Where LED adoption and colour temperature come from: the continent prefix
 /// of the package region code the recipe was read from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+///
+/// The discriminants are load-bearing: `index` selects the row of
+/// `LedModel::regions` and `tag` goes into the disk fingerprint, so they are
+/// explicit and pinned by tests.
+#[repr(u8)]
 pub enum LedRegion {
-    Na,
-    Sa,
-    Eu,
-    Af,
-    As,
-    Oc,
+    Na = 0,
+    Sa = 1,
+    Eu = 2,
+    Af = 3,
+    As = 4,
+    Oc = 5,
     /// A patch, a code without a known continent, or no recipe.
-    Unknown,
+    Unknown = 6,
 }
 
 impl LedRegion {
@@ -279,6 +284,35 @@ fn luminance(c: [f32; 3]) -> f32 {
     0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
 }
 
+/// The luminance of written bytes: sRGB decoded, Rec.709 weights.
+fn byte_luminance(c: [u8; 3]) -> f32 {
+    luminance(c.map(|v| (f32::from(v) / 255.0).powf(SRGB_GAMMA)))
+}
+
+/// The bytes of a texel after the gain `s`. A sodium texel is `sodium * s`
+/// rounded to nearest. An LED texel is `led * s`, which must not read dimmer
+/// than those sodium bytes: rounding to nearest can lose a little luminance
+/// (near black, or where the colour sits at full scale), so it falls back to
+/// rounding up, then to the sodium bytes themselves.
+pub fn texel_bytes(sodium: [f32; 3], led: Option<[f32; 3]>, s: f32) -> [u8; 3] {
+    let quantise = |c: [f32; 3], f: fn(f32) -> f32| c.map(|v| f(v * s).clamp(0.0, 255.0) as u8);
+    let base = quantise(sodium, f32::round);
+    let Some(led) = led else {
+        return base;
+    };
+    let floor = byte_luminance(base);
+    let nearest = quantise(led, f32::round);
+    if byte_luminance(nearest) >= floor {
+        return nearest;
+    }
+    let up = quantise(led, f32::ceil);
+    if byte_luminance(up) >= floor {
+        up
+    } else {
+        base
+    }
+}
+
 /// A sodium texel (stored values, 0..255) as LED white at `kelvin`: its
 /// luminance times `energy`. A channel past full scales the colour down
 /// with its hue kept; if that leaves it dimmer than the input, it is mixed
@@ -345,6 +379,67 @@ mod tests {
         let tags: std::collections::HashSet<u8> = all.iter().map(|r| r.tag()).collect();
         assert_eq!(tags.len(), LedRegion::COUNT);
         assert!(all.iter().all(|r| r.index() < LedRegion::COUNT));
+    }
+
+    #[test]
+    fn region_tags_and_indexes_are_pinned() {
+        let all = [
+            (LedRegion::Na, 0),
+            (LedRegion::Sa, 1),
+            (LedRegion::Eu, 2),
+            (LedRegion::Af, 3),
+            (LedRegion::As, 4),
+            (LedRegion::Oc, 5),
+            (LedRegion::Unknown, 6),
+        ];
+        for (region, n) in all {
+            assert_eq!(region.tag(), n, "{region:?}");
+            assert_eq!(region.index(), usize::from(n), "{region:?}");
+        }
+    }
+
+    #[test]
+    fn every_region_row_follows_the_spec_table() {
+        // (region, share scale, kelvin shift), from the spec.
+        let table = [
+            (LedRegion::Na, 1.0, 400.0),
+            (LedRegion::Sa, 0.7, 400.0),
+            (LedRegion::Eu, 0.9, -400.0),
+            (LedRegion::Af, 0.5, 400.0),
+            (LedRegion::As, 0.8, -400.0),
+            (LedRegion::Oc, 0.9, -400.0),
+            (LedRegion::Unknown, 0.75, 0.0),
+        ];
+        let m = LedModel::DEFAULT;
+        for (region, scale, shift) in table {
+            // Urban bright: share 0.75, kelvin 4000.
+            let t = m.tone(false, 1.0, region);
+            assert!((t.share - 0.75 * scale).abs() < 1e-12, "{region:?} share");
+            assert!(
+                (t.kelvin - (4000.0 + shift)).abs() < 1e-9,
+                "{region:?} kelvin"
+            );
+        }
+    }
+
+    #[test]
+    fn texel_bytes_keep_led_at_least_as_bright_as_sodium() {
+        let lum_b = |c: [u8; 3]| byte_luminance(c);
+        // Near black: nearest rounding would give (0, 0, 0) for LED.
+        let sodium = [200.0, 120.0, 50.0];
+        let led = Some(recolour(sodium, 4000.0, 1.25));
+        let s = 0.0025;
+        let base = texel_bytes(sodium, None, s);
+        assert_eq!(base, [1, 0, 0]);
+        assert!(lum_b(texel_bytes(sodium, led, s)) >= lum_b(base));
+        // Clip branch: equal luminance by construction.
+        let sodium = [255.0, 195.0, 0.0];
+        let led = Some(recolour(sodium, 3200.0, 1.25));
+        let s = 0.995;
+        let base = texel_bytes(sodium, None, s);
+        assert!(lum_b(texel_bytes(sodium, led, s)) >= lum_b(base));
+        // No LED: exactly the rounded sodium bytes.
+        assert_eq!(texel_bytes([10.4, 10.6, 0.0], None, 1.0), [10, 11, 0]);
     }
 
     #[test]

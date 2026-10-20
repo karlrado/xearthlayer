@@ -90,6 +90,8 @@ impl LitGenerator for CpuLitGenerator {
                     for ch in 0..3 {
                         rgb[ch] += w.weight as f32 * c[ch];
                     }
+                    // Skipped for weights without a pattern (above), so wsum
+                    // covers only the lit weights, as the pattern sum does.
                     let ind = *industrial[at].get_or_insert_with(|| {
                         field
                             .palette_name_in(w.slot, w.index)
@@ -102,20 +104,17 @@ impl LitGenerator for CpuLitGenerator {
                     share += w.weight * tone.share;
                     kelvin += w.weight * tone.kelvin;
                 }
+                let sodium = rgb;
+                let mut led_rgb = None;
                 if wsum > 0.0 && share > 0.0 {
                     let patch = led::patch_at(x, y);
                     if patch.u < share / wsum {
                         let k = led::patch_kelvin(kelvin / wsum, &patch);
-                        rgb = led::recolour(rgb, k, request.led.energy);
+                        led_rgb = Some(led::recolour(sodium, k, request.led.energy));
                     }
                 }
-                let s = g as f32;
-                let byte = |v: f32| (v * s).round().clamp(0.0, 255.0) as u8;
-                img.put_pixel(
-                    j as u32,
-                    i as u32,
-                    Rgba([byte(rgb[0]), byte(rgb[1]), byte(rgb[2]), 255]),
-                );
+                let [tr, tg, tb] = led::texel_bytes(sodium, led_rgb, g as f32);
+                img.put_pixel(j as u32, i as u32, Rgba([tr, tg, tb, 255]));
             }
         }
         img
@@ -127,7 +126,7 @@ mod tests {
     use super::*;
     use crate::fuse::{DdsFilename, TextureKind};
     use crate::night::generator::field::tests_support::synthetic;
-    use crate::night::generator::led::{LedModel, LedRegion, Tone};
+    use crate::night::generator::led::{LedModel, LedRegion, RegionTone, Tone};
     use crate::night::generator::noise::{hash2, unit};
     use crate::night::parse_recipe;
     use crate::night::recipe::Recipe;
@@ -455,6 +454,73 @@ mod tests {
             }
         }
         assert!(changed > 0, "some patches are LED");
+    }
+
+    /// Every texel the LED stage changes is at least as bright as the
+    /// sodium texel it replaced, measured on the bytes that are written,
+    /// from the gain floor up and at every brightness setting.
+    #[test]
+    fn led_is_never_dimmer_after_rounding_to_bytes() {
+        let name = name_at(37.5, -122.5);
+        let colours: [[u8; 3]; 5] = [
+            [200, 120, 50],
+            [255, 195, 0],
+            [255, 160, 60],
+            [255, 255, 255],
+            [90, 40, 10],
+        ];
+        let mut changed = 0;
+        for kelvin in [3200.0, 4000.0, 5700.0] {
+            let tone = Tone { share: 1.0, kelvin };
+            let all = LedModel {
+                industrial: tone,
+                urban_bright: tone,
+                urban_dim: tone,
+                regions: [RegionTone {
+                    share_scale: 1.0,
+                    kelvin_shift: 0.0,
+                }; LedRegion::COUNT],
+                ..LedModel::DEFAULT
+            };
+            for rgb in colours {
+                let pattern = move |_: &str| {
+                    Some(Arc::new(LitPattern {
+                        size: 4,
+                        rgb: vec![rgb; 16],
+                        ground_scale_m: 4096.0,
+                    }))
+                };
+                for byte in (1u8..=255).step_by(2).chain([255]) {
+                    let r = synthetic(37, -123, 120, |_, _| 1, 4, move |_, _| byte);
+                    let recipes = move |a: i32, b: i32| ((a, b) == (37, -123)).then(|| r.clone());
+                    for brightness in [0.5, 1.0, 1.5] {
+                        let run = |m: &LedModel| {
+                            generate_led(
+                                &name,
+                                16,
+                                recipes.clone(),
+                                pattern,
+                                brightness,
+                                m,
+                                LedRegion::Na,
+                            )
+                        };
+                        let (sodium, led) = (run(&LedModel::OFF), run(&all));
+                        for (s, l) in sodium.pixels().zip(led.pixels()) {
+                            if s != l {
+                                changed += 1;
+                                assert!(
+                                    lum(l) >= lum(s),
+                                    "{rgb:?} at {kelvin} K, byte {byte}, brightness \
+                                     {brightness}: LED {l:?} dimmer than sodium {s:?}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed > 0, "the sweep reaches LED texels");
     }
 
     #[test]
