@@ -6,6 +6,7 @@
 pub mod cpu;
 pub mod field;
 pub mod gain;
+pub mod led;
 pub mod noise;
 pub mod tiling;
 
@@ -19,6 +20,7 @@ use crate::fuse::DdsFilename;
 
 pub use cpu::CpuLitGenerator;
 pub use gain::{gain, GAIN_CEILING_NW, GAIN_FLOOR_NW, GAIN_GAMMA};
+pub use led::{LedModel, LedRegion};
 
 /// The recipe of the 1 degree tile whose south-west corner is `(lat, lon)`.
 pub type RecipeLookup<'a> = &'a (dyn Fn(i32, i32) -> Option<Arc<Recipe>> + Sync);

@@ -22,7 +22,9 @@ pub use disk::{
     LitFingerprint,
 };
 pub use footprint::Footprint;
-pub use generator::{CpuLitGenerator, LitGenerator, LitRequest, LIT_GENERATOR_VERSION};
+pub use generator::{
+    CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest, LIT_GENERATOR_VERSION,
+};
 pub use laminar::{LaminarArt, LitPattern, LitTerrain};
 pub use layout::{minimal_black_dds, LitLayout};
 pub use prefs::{
