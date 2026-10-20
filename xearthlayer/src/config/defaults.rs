@@ -162,6 +162,13 @@ pub const DEFAULT_FUSE_MAX_BACKGROUND: u16 = 256;
 /// Set to 75% of `max_background` as per kernel convention.
 pub const DEFAULT_FUSE_CONGESTION_THRESHOLD: u16 = DEFAULT_FUSE_MAX_BACKGROUND * 3 / 4; // 192
 
+/// Night lighting is on by default; it only acts when the installed packages
+/// carry night recipes and the X-Plane installation is found.
+pub const DEFAULT_NIGHT_ENABLED: bool = true;
+
+/// Default night lighting brightness multiplier.
+pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
+
 // =============================================================================
 // Control plane defaults
 // =============================================================================
@@ -298,6 +305,10 @@ impl Default for ConfigFile {
             fuse: FuseSettings {
                 max_background: DEFAULT_FUSE_MAX_BACKGROUND,
                 congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
+            },
+            night: NightSettings {
+                enabled: DEFAULT_NIGHT_ENABLED,
+                brightness: DEFAULT_NIGHT_BRIGHTNESS,
             },
         }
     }

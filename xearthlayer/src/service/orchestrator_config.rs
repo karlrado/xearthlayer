@@ -64,6 +64,9 @@ pub struct OrchestratorConfig {
     /// FUSE kernel configuration.
     pub fuse: FuseConfig,
 
+    /// Overall lit brightness multiplier (`night.brightness`).
+    pub night_brightness: f64,
+
     /// Whether TUI mode is active (affects logging behavior).
     pub tui_mode: bool,
 }
@@ -209,6 +212,7 @@ impl OrchestratorConfig {
             prefetch,
             prewarm,
             fuse,
+            night_brightness: config.night.brightness,
             tui_mode,
         }
     }

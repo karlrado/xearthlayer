@@ -37,6 +37,8 @@ pub struct ConfigFile {
     pub executor: ExecutorSettings,
     /// FUSE filesystem settings
     pub fuse: FuseSettings,
+    /// Night lighting settings
+    pub night: NightSettings,
 }
 
 /// General application settings.
@@ -263,6 +265,17 @@ pub struct ExecutorSettings {
     /// Maximum retry attempts per failed chunk download.
     /// Default: 3
     pub max_retries: u32,
+}
+
+/// Night lighting settings.
+#[derive(Debug, Clone)]
+pub struct NightSettings {
+    /// Generate lit textures from OXO night recipes (default: true).
+    /// When false, every lit texture is the minimal black texture.
+    pub enabled: bool,
+    /// Overall lit brightness multiplier, 0.5 to 1.5 (default: 1.0).
+    /// A development setting while the gain curve is tuned.
+    pub brightness: f64,
 }
 
 /// FUSE filesystem settings for kernel background request limits.

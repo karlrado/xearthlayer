@@ -42,8 +42,9 @@ use super::types::{Fuse3Error, Fuse3Result};
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename};
+use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use crate::geo_index::GeoIndex;
+use crate::night::{BlackLitSource, LitTextureSource};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
@@ -161,6 +162,10 @@ pub struct Fuse3OrthoUnionFS {
     tile_request_callback: Option<TileRequestCallback>,
     /// Request coalescer for deduplicating concurrent requests
     request_coalescer: Arc<RequestCoalescer>,
+    /// Source of lit textures (`<stem>_LIT.dds`). Lit inodes never reach the
+    /// DDS client, coalescer or caches above (night lighting, R8). Defaults
+    /// to [`BlackLitSource`], which serves the minimal black DDS.
+    lit_source: Arc<dyn LitTextureSource>,
     /// Per-open state for virtual DDS files, keyed by file handle.
     ///
     /// The kernel caps each FUSE read at 1 MiB, so X-Plane reading one 11.17 MB
@@ -249,6 +254,7 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
+            lit_source: Arc::new(BlackLitSource),
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             pinned: Arc::new(PinnedTileBudget::new()),
@@ -285,6 +291,7 @@ impl Fuse3OrthoUnionFS {
             disk_io_limiter,
             tile_request_callback: None,
             request_coalescer,
+            lit_source: Arc::new(BlackLitSource),
             dds_handles: DashMap::new(),
             next_fh: AtomicU64::new(1),
             pinned: Arc::new(PinnedTileBudget::new()),
@@ -306,6 +313,28 @@ impl Fuse3OrthoUnionFS {
     pub fn with_pinned_budget(mut self, budget: Arc<PinnedTileBudget>) -> Self {
         self.pinned = budget;
         self
+    }
+
+    /// Serve lit textures from `source` instead of the black default.
+    pub fn with_lit_source(mut self, source: Arc<dyn LitTextureSource>) -> Self {
+        self.lit_source = source;
+        self
+    }
+
+    /// Attributes for a lit texture: a virtual DDS with the lit source's size.
+    fn lit_dds_attr(&self, ino: u64, size: u64) -> FileAttr {
+        let mut attr = self.virtual_dds_attr(ino);
+        attr.size = size;
+        attr.blocks = size.div_ceil(u64::from(attr.blksize));
+        attr
+    }
+
+    /// Attributes for any virtual DDS, by kind.
+    async fn virtual_attr_for(&self, ino: u64, coords: &DdsFilename) -> FileAttr {
+        match coords.kind {
+            TextureKind::Ortho => self.virtual_dds_attr(ino),
+            TextureKind::Lit => self.lit_dds_attr(ino, self.lit_source.size(coords).await),
+        }
     }
 
     /// Set the timeout for DDS generation.
@@ -758,8 +787,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             }
 
             if let Ok(coords) = parse_dds_filename(&name_str) {
-                let inode = self.inode_manager.create_virtual_inode(coords);
-                let attr = self.virtual_dds_attr(inode);
+                let inode = self.inode_manager.create_virtual_inode(coords.clone());
+                let attr = self.virtual_attr_for(inode, &coords).await;
                 return Ok(ReplyEntry {
                     ttl: TTL,
                     attr,
@@ -790,8 +819,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Virtual DDS inode
         if InodeManager::is_virtual_inode(ino) {
-            if self.inode_manager.get_virtual_dds(ino).is_some() {
-                let attr = self.virtual_dds_attr(ino);
+            if let Some(coords) = self.inode_manager.get_virtual_dds(ino) {
+                let attr = self.virtual_attr_for(ino, &coords).await;
                 return Ok(ReplyAttr { ttl: TTL, attr });
             }
             return Err(Errno::from(libc::ENOENT));
@@ -855,6 +884,13 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 .inode_manager
                 .get_virtual_dds(ino)
                 .ok_or(Errno::from(libc::ENOENT))?;
+
+            // Lit textures come from the lit source alone: no executor, no
+            // memoising handle, no DDS read metrics.
+            if coords.kind == TextureKind::Lit {
+                let data = self.lit_source.read(&coords, offset, size).await;
+                return Ok(ReplyData { data });
+            }
 
             let fuse_read_span = tracing::debug_span!(target: "profiling", "fuse_read", ino = ino, offset = offset, size = size,);
 
@@ -1174,6 +1210,16 @@ impl Filesystem for Fuse3OrthoUnionFS {
             });
         };
 
+        // Lit textures are small or served by range from their source; they
+        // pin nothing and need no handle. Same flags, so Linux reads bypass
+        // the page cache and a size change can never be served stale.
+        if coords.kind == TextureKind::Lit {
+            return Ok(ReplyOpen {
+                fh: 0,
+                flags: VIRTUAL_DDS_OPEN_FLAGS,
+            });
+        }
+
         // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
         // resolve per call, which is slower but correct.
         let expected = self.virtual_dds_config.size();
@@ -1473,6 +1519,7 @@ mod tests {
             col: 84000,
             zoom: 20,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
 
         let tile = chunk_to_tile_coords(&coords);
@@ -1691,7 +1738,173 @@ mod tests {
                 col: 5279,
                 zoom: 16,
                 map_type: "BI".to_string(),
+                kind: crate::fuse::TextureKind::Ortho,
             })
+    }
+
+    fn lit_name() -> &'static std::ffi::OsStr {
+        std::ffi::OsStr::new("25712_12960_BI16_LIT.dds")
+    }
+
+    fn textures_inode(fs: &Fuse3OrthoUnionFS) -> u64 {
+        fs.inode_manager
+            .get_or_create_inode(std::path::Path::new("textures"))
+    }
+
+    #[tokio::test]
+    async fn test_lit_lookup_reports_the_minimal_black_size_and_its_own_inode() {
+        use fuse3::raw::Filesystem;
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let parent = textures_inode(&fs);
+
+        let lit = fs.lookup(test_request(), parent, lit_name()).await.unwrap();
+        assert_eq!(lit.attr.size, 152);
+
+        let ortho = fs
+            .lookup(
+                test_request(),
+                parent,
+                std::ffi::OsStr::new("25712_12960_BI16.dds"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            ortho.attr.size,
+            crate::fuse::EXPECTED_DDS_SIZE as u64,
+            "ortho unchanged"
+        );
+        assert_ne!(lit.attr.ino, ortho.attr.ino);
+    }
+
+    #[tokio::test]
+    async fn test_lit_getattr_matches_lookup() {
+        use fuse3::raw::Filesystem;
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+        let attr = fs
+            .getattr(test_request(), entry.attr.ino, None, 0)
+            .await
+            .unwrap();
+        assert_eq!(attr.attr.size, 152);
+    }
+
+    #[tokio::test]
+    async fn test_lit_read_serves_black_without_touching_the_executor() {
+        use fuse3::raw::Filesystem;
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let ino = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap()
+            .attr
+            .ino;
+
+        let opened = fs.open(test_request(), ino, 0).await.unwrap();
+        assert_eq!(opened.fh, 0, "lit files hold no memoising handle");
+        assert!(fs.dds_handles.is_empty());
+
+        let data = fs
+            .read(test_request(), ino, opened.fh, 0, 1 << 20)
+            .await
+            .unwrap()
+            .data;
+        assert_eq!(data, crate::night::minimal_black_dds());
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no DDS request"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_dds_impl_serves_black_for_a_lit_name_without_a_request() {
+        let (fs, requests, _temp) = virtual_dds_fixture();
+        let coords = crate::fuse::DdsFilename {
+            row: 25712,
+            col: 12960,
+            zoom: 16,
+            map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Lit,
+        };
+
+        let data = fs.request_dds_impl(&coords).await;
+
+        assert_eq!(data, crate::night::minimal_black_dds());
+        assert_eq!(data.len(), 152);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a lit name must never reach the DDS client"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_real_lit_file_on_disk_wins_over_the_virtual_lit_texture() {
+        use fuse3::raw::Filesystem;
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        std::fs::write(pkg_dir.join("textures/25712_12960_BI16_LIT.dds"), [7u8; 10]).unwrap();
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+        let (client, _requests) = CountingDdsClient::new();
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE);
+
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+
+        assert_eq!(entry.attr.size, 10, "the real file, not the 152-byte black");
+        assert!(
+            entry.attr.ino < crate::fuse::support::inode::VIRTUAL_INODE_BASE,
+            "a real file has a real inode"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_lit_source_is_injectable() {
+        use fuse3::raw::Filesystem;
+        struct Fixed;
+        impl crate::night::LitTextureSource for Fixed {
+            fn size<'a>(
+                &'a self,
+                _n: &'a crate::fuse::DdsFilename,
+            ) -> futures::future::BoxFuture<'a, u64> {
+                Box::pin(async { 1000 })
+            }
+            fn read<'a>(
+                &'a self,
+                _n: &'a crate::fuse::DdsFilename,
+                _o: u64,
+                _l: u32,
+            ) -> futures::future::BoxFuture<'a, Bytes> {
+                Box::pin(async { Bytes::from_static(b"lit") })
+            }
+        }
+        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let fs = fs.with_lit_source(Arc::new(Fixed));
+        let entry = fs
+            .lookup(test_request(), textures_inode(&fs), lit_name())
+            .await
+            .unwrap();
+        assert_eq!(entry.attr.size, 1000);
+        let data = fs
+            .read(test_request(), entry.attr.ino, 0, 0, 16)
+            .await
+            .unwrap()
+            .data;
+        assert_eq!(&data[..], b"lit");
     }
 
     /// Fixture wired to an observable metrics channel.
@@ -1921,6 +2134,7 @@ mod tests {
                     col: 5279 + col,
                     zoom: 16,
                     map_type: "BI".to_string(),
+                    kind: crate::fuse::TextureKind::Ortho,
                 });
             let reply = fs.open(test_request(), ino, 0).await.unwrap();
             fs.read(test_request(), ino, reply.fh, 0, 4096)
@@ -2977,6 +3191,7 @@ mod tests {
             col: tile.col * 16,
             zoom: tile.zoom + 4,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let _ = fs.request_dds_impl(&coords).await;
         responder.await.unwrap();

@@ -12,6 +12,9 @@ name = "xearthlayer"
 path = "src/lib.rs"
 
 [dependencies]
+ciborium = "0.2"
+ddsfile = "0.6"
+bcdec_rs = "0.2"
 xearthlayer-package = { path = "../xearthlayer-package" }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "fs", "macros"] }
 reqwest.workspace = true
@@ -39,7 +42,7 @@ bytes = "1.11.0"
 dashmap = "6.1"
 tokio-util = "0.7"
 parking_lot = "0.12"
-moka = { version = "0.12", features = ["future"] }
+moka = { version = "0.12", features = ["future", "sync"] }
 glob = "0.3"
 flate2.workspace = true
 tar.workspace = true

@@ -55,6 +55,10 @@ impl DdsTileCoord {
     /// `None` if the filename doesn't match the expected format.
     pub fn from_dds_filename(filename: &str) -> Option<Self> {
         let parsed = parse_dds_filename(filename).ok()?;
+        // A lit texture is not a scene access; its ortho texture already is.
+        if parsed.kind == crate::fuse::TextureKind::Lit {
+            return None;
+        }
         Some(Self {
             row: parsed.row,
             col: parsed.col,
@@ -307,6 +311,11 @@ mod tests {
 
     mod dds_tile_coord {
         use super::*;
+
+        #[test]
+        fn test_from_dds_filename_ignores_lit_textures() {
+            assert!(DdsTileCoord::from_dds_filename("25712_12960_BI16_LIT.dds").is_none());
+        }
 
         #[test]
         fn test_from_dds_filename_bing() {

@@ -87,6 +87,9 @@ pub fn print_process_summary(out: &dyn Output, summary: &ProcessSummary) {
     }
     out.println(&format!("TER files:       {}", summary.ter_count));
     out.println(&format!("Mask files:      {}", summary.mask_count));
+    if summary.night_recipe_count > 0 {
+        out.println(&format!("Night recipes:   {}", summary.night_recipe_count));
+    }
     out.println(&format!("DDS skipped:     {}", summary.dds_skipped));
 }
 

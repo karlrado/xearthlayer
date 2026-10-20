@@ -34,6 +34,7 @@ pub mod jobs;
 pub mod logging;
 pub mod manager;
 pub mod metrics;
+pub mod night;
 pub mod ortho_union;
 pub mod panic;
 pub mod patches;

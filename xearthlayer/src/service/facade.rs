@@ -208,6 +208,25 @@ impl XEarthLayerService {
             tracing::info!("DDS disk GC scheduler daemon started");
         }
 
+        // Lit disk GC daemon (only with night lighting enabled). No metrics
+        // client: its evictions are not ortho disk evictions and must not
+        // land in that metric.
+        if let Some(lit_provider) = cache_layer.lit_disk_provider() {
+            let job_submitter = xel_runtime.prefetch_lane().job_submitter();
+            let lru_index = lit_provider.lru_index();
+            let cache_dir = lit_provider.directory().to_path_buf();
+            let max_size = lit_provider.max_size_bytes();
+
+            let gc_daemon = GcSchedulerDaemon::new(lru_index, cache_dir, max_size, job_submitter);
+
+            let gc_shutdown_clone = gc_shutdown.clone();
+            gc_scheduler_handles.push(runtime_handle.spawn(async move {
+                gc_daemon.run(gc_shutdown_clone).await;
+            }));
+
+            tracing::info!("Lit disk GC scheduler daemon started");
+        }
+
         let gc_scheduler_shutdown = if gc_scheduler_handles.is_empty() {
             tracing::warn!("No disk providers available, GC schedulers not started");
             None
@@ -367,6 +386,13 @@ impl XEarthLayerService {
         self.cache_layer.as_ref().map(|cl| {
             Arc::clone(&cl.dds_disk_bridge()) as Arc<dyn crate::executor::DdsDiskCacheChecker>
         })
+    }
+
+    /// The lit disk cache (generated night lighting payloads).
+    ///
+    /// `None` when caching or night lighting is off.
+    pub fn lit_disk_cache(&self) -> Option<Arc<dyn crate::cache::Cache>> {
+        self.cache_layer.as_ref().and_then(|cl| cl.lit_disk_cache())
     }
 
     /// Shutdown the cache layer gracefully.

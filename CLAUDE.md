@@ -62,12 +62,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
      - Structured tracing on buffer lifecycle and error paths
 
 5. **Cache System** (`xearthlayer/src/cache/`, `xearthlayer/src/service/cache_layer.rs`)
-   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network
-   - `CacheLayer` - Service-owned three-tier cache lifecycle with budget management
+   - Three-tier cache hierarchy: Memory → DDS Disk → Chunk Disk → Network, plus a separate lit disk tier when night lighting is on
+   - `CacheLayer` - Service-owned cache lifecycle with budget management: the three tiers, plus the lit disk tier when night lighting is on
    - `CacheService` - Self-contained cache with internal GC daemons
    - `MemoryCacheProvider`: moka-based LRU eviction (default 512MB, staging buffer)
-   - `DiskCacheProvider`: Two instances — DDS tiles and raw chunks, each with own GC
+   - `DiskCacheProvider`: Two instances (DDS tiles and raw chunks), three with night lighting on (plus lit payloads), each with own GC
    - DDS disk cache: Encoded DDS tiles on disk, avoids re-encoding on memory eviction (~3.5ms NVMe read vs ~50-200ms re-encode)
+   - Lit tier (night lighting only, `night.enabled`): generated lit payloads on disk at `{cache_dir}/night/`, read path memory → disk → generate (`night/disk.rs`, `lit_payload_validator`), 5% of `cache.disk_size` taken first with `dds_disk_ratio` splitting the other 95%, own GC daemon on the prefetch lane; entries carry a SHA-256 fingerprint (generator version, brightness, Laminar art and recipe file size+mtime, and the package region each recipe was read from) so a mismatch regenerates. Off means no tier, directory or daemon
    - Shared disk budget: `cache.disk_size` split by `cache.dds_disk_ratio` (default 0.6 = 60% DDS, 40% chunks)
    - DDS disk directory: `{cache_dir}/{provider}/dds/`, chunks keep existing provider directory
    - Region-based disk layout: files in 1°×1° DSF subdirs (e.g., `+33-119/tile_15_12754_5279.cache`)
@@ -79,7 +80,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `migrate_cache()` for migrating flat-layout caches to region layout
    - Bridge adapters for executor integration (MemoryCacheBridge, DdsDiskCacheBridge, DiskCacheBridge)
    - Per-provider cache directories
-   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk disk tiers) — bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
+   - `cache/integrity`: canonical corruption-handling model shared by every on-disk cache (index cache, scenery index cache, DDS/chunk/lit disk tiers): bounded reads (`length_ceiling`), atomic durable writes (`write_atomic`, which also creates the parent directory), and invariant-3 satisfied per cache: explicit `discard()` on the disk tiers, unconditional overwrite-on-rebuild for the index caches; see `docs/dev/cache-integrity-design.md`
    - `XEarthLayerService::start()` creates `CacheLayer` with proper metrics ordering
 
 6. **Configuration** (`xearthlayer/src/config/`)
@@ -215,6 +216,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `populate()` provides atomic bulk loading (builds outside lock, swaps in)
     - Used by FUSE (`is_geo_filtered`), prewarm, and prefetch for patch region exclusion and prefetch state tracking
     - See `docs/dev/geo-index-design.md` for design details
+
+19. **Night Lighting** (`xearthlayer/src/night/`)
+    - Recipe reader (`recipe.rs`): OXO `.oxn` format 1
+    - `RecipeStore` (`store.rs`): recipes found via each ortho source path, `night/<block>/<tile>.oxn`
+    - `LitTextureSource` / `BlackLitSource` (`service.rs`) and the 152-byte minimal black DDS (`layout.rs`)
+    - FUSE routes `_LIT.dds` names (`TextureKind::Lit`, `LIT_INODE_FLAG`) to the lit source, never the executor
+    - Phase 2a: `NightLitSource` (`service.rs`) answers lit `stat`/`open` with the real file size for the player's texture setting; `LaminarArt` (`laminar/`) reads the installed lit art, `StartupTextureSetting` (`prefs.rs`) reads the setting once at start, and `footprint.rs` gives a texture's ground footprint (whether it has light is `RecipeField::has_light`, phase 2b) and `layout.rs` (`LitLayout`) sizes the file. Wired by `MountManager::set_night_lighting` from `night.enabled` (default true); when the X-Plane installation is not found the black default stays
+    - Generator (`generator/`): `LitGenerator::generate(&LitRequest) -> RgbaImage` is infallible and `encode_visible` BC1-encodes with the default ISPC encoder, dimming the first visible level to 2/3 of the light (`FADE_RAMP`, sRGB-corrected) so X-Plane's level-by-level page-in fades a texture out in two steps; the first visible level stays fixed in metres at every texture setting because the blank level's texel size sets the cut-out distance; every lit read is logged at debug (`Night lighting: lit read`) with its offset. `CpuLitGenerator` (`cpu.rs`) computes each texel from its ground position alone: `RecipeField` (`field.rs`) gives bilinear brightness and class weights from globally indexed cells (warped by value noise, `noise.rs`, so class edges are soft and cross 1 degree tiles), `gain.rs` maps VIIRS radiance and `night.brightness` (0.5 to 1.5) to a gain, and `tiling.rs` samples the Laminar pattern decoded by `laminar/pattern.rs` with hex stochastic tiling in Web Mercator metres; the LED stage (`led.rs`) turns neighbourhood patches LED white by class, VIIRS brightness and package region, keeping luminance times `LedModel::energy`, and sodium texels keep their bytes. `NightLitSource` serves the result after the blank levels via `LitLayout::read_lit`: payloads cached in memory (256 MB) keyed `(row, col, zoom)` and on disk (the lit tier, see Cache System), concurrent reads of one footprint coalesced (moka `optionally_get_with`), generation permits `(cores / 8).clamp(2, 4)`, 2 probe permits and 2 lit disk permits held inside `BLOCKING_POOL_HEADROOM` by a compile-time assertion, recipe reads retried twice then given up on per tile for the session (`SessionRecipes`), a generation missing a recipe served full-size black and not cached in memory or on disk, first committed probe answer wins. `has_light` is `RecipeField::has_light`, which follows the generator's sampling model (class reach and bilinear brightness reach, gain above zero) so it never answers dark where the generator lights. Tuning continues by flight
+    - Publisher copies `yOrtho4XP_Night/` recipes into the package's `night/` folder
+    - See `docs/dev/night-lighting-design.md`
 
 ### Module Dependencies
 
@@ -421,6 +432,16 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer-cli/src/preflight/` | The concrete startup checks and the registry |
 | `xearthlayer/src/geo_index/` | GeoIndex geospatial reference database |
 | `xearthlayer/src/ortho_union/` | Ortho union index module |
+| `xearthlayer/src/night/recipe.rs` | OXO `.oxn` recipe reader and validation |
+| `xearthlayer/src/night/store.rs` | RecipeStore - finds and caches recipes per ortho source |
+| `xearthlayer/src/night/service.rs` | LitTextureSource trait, BlackLitSource and NightLitSource |
+| `xearthlayer/src/night/layout.rs` | Lit DDS layout, `minimal_black_dds()` |
+| `xearthlayer/src/night/laminar/` | Laminar lit art reader (`art.rs`, `library.rs`, `ter.rs`) |
+| `xearthlayer/src/night/prefs.rs` | StartupTextureSetting - texture setting read once from `X-Plane.prf` |
+| `xearthlayer/src/night/footprint.rs` | Footprint geometry (`RecipeField::has_light` decides full-size vs minimal) |
+| `xearthlayer/src/night/generator/cpu.rs` | CpuLitGenerator: per-texel lit generation from ground position |
+| `xearthlayer/src/night/generator/tiling.rs` | Hex stochastic tiling of the Laminar pattern in Web Mercator metres |
+| `xearthlayer/src/night/generator/led.rs` | LED lighting model: regions, patches, colour temperature, recolour |
 | `xearthlayer/src/ortho_union/index.rs` | OrthoUnionIndex implementation |
 | `xearthlayer/src/ortho_union/builder.rs` | OrthoUnionIndexBuilder (with progress + caching) |
 | `xearthlayer/src/update/mod.rs` | Version update checking (VersionManifest, UpdateInfo) |
@@ -441,7 +462,7 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/aircraft_position/web_api/datarefs.rs` | X-Plane dataref definitions |
 | `xearthlayer/src/aircraft_position/web_api/sim_state.rs` | SimState - sim state detection (paused, loading, etc.) |
 | `xearthlayer/src/aircraft_position/web_api/config.rs` | Web API connection configuration |
-| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - three-tier cache lifecycle (memory + DDS disk + chunk disk) |
+| `xearthlayer/src/service/cache_layer.rs` | CacheLayer - cache lifecycle (memory + DDS disk + chunk disk, plus lit disk with night lighting on) |
 | `xearthlayer/src/cache/providers/disk.rs` | DiskCacheProvider with internal GC daemon |
 | `xearthlayer/src/cache/adapters/` | Bridge adapters for backward compatibility |
 | `xearthlayer/src/cache/integrity/` | Canonical cache integrity model (`length_ceiling`, `write_atomic`, `discard`, `CacheEntryValidator`) |
@@ -460,6 +481,7 @@ Key sections:
 - `[prewarm]` - Cold-start cache warming (grid_rows/grid_cols for DSF tile grid around airport)
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
+- `[night]` - Night lighting (enabled, default true)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 
 See `docs/configuration.md` for full reference.
@@ -556,6 +578,7 @@ matrix jobs are renamed.
 - **GeoIndex design**: `docs/dev/geo-index-design.md` (geospatial reference database, patch region ownership)
 - **Memory telemetry**: `docs/dev/memory-telemetry.md` (periodic memory sampling, trace interpretation, confounders)
 - **Cache integrity model**: `docs/dev/cache-integrity-design.md` (bounded reads, atomic durable writes, discard-on-reject, shared by every on-disk cache)
+- **Night lighting**: `docs/dev/night-lighting-design.md` (phases 1, 2a and 2b implemented (packaging, black serving, real lit sizes, generated lit textures), plus the lit disk cache and LED lighting: lit textures served through FUSE, generated from OXO `.oxn` recipes and the user's Laminar lit art; a separate lit path beside the ortho executor)
 - **CI/CD pipeline**: `docs/dev/cicd.md` (branch model, release job graph, platform tiers, version propagation)
 - **Publisher separation**: `docs/dev/publisher-separation-design.md` (#284: `xearthlayer-package` is the format contract both sides depend on, `xearthlayer-publisher` holds the publishing domain, and `xearthlayer-publish` is its binary; the runtime links none of the publisher's dependencies)
 - memorize review allow(dead_code) macros at major checkpoints. Refactor aggresively to remove them when appropriate.

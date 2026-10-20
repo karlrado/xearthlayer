@@ -314,6 +314,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "bcdec_rs"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f09c37bc0e9f0924b7dae9988265ef3c76c88538f41a3b06caf4bed07cee5226"
+
+[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -496,6 +502,33 @@ dependencies = [
  "iana-time-zone",
  "num-traits",
  "windows-link",
+]
+
+[[package]]
+name = "ciborium"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42e69ffd6f0917f5c029256a24d0161db17cea3997d185db0d35926308770f0e"
+dependencies = [
+ "ciborium-io",
+ "ciborium-ll",
+ "serde",
+]
+
+[[package]]
+name = "ciborium-io"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05afea1e0a06c9be33d539b876f1ce3692f4afea2cb41f740e7743225ed1c757"
+
+[[package]]
+name = "ciborium-ll"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57663b653d948a338bfb3eeba9bb2fd5fcfaecb9e199e87e1eda4d9e8b240fd9"
+dependencies = [
+ "ciborium-io",
+ "half",
 ]
 
 [[package]]
@@ -824,6 +857,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7a1e2f27636f116493b8b860f5546edb47c8d8f8ea73e1d2a20be88e28d1fea"
 
 [[package]]
+name = "ddsfile"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8be425797f9962624aba78dee473dad28c15999e6ee6feb28ad3ee7928a3bc5b"
+dependencies = [
+ "bitflags 2.11.0",
+ "byteorder",
+ "enum-primitive-derive",
+ "num-traits",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -928,6 +973,17 @@ name = "encode_unicode"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
+
+[[package]]
+name = "enum-primitive-derive"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ba7795da175654fe16979af73f81f26a8ea27638d8d9823d317016888a63dc4c"
+dependencies = [
+ "num-traits",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "equator"
@@ -4720,14 +4776,17 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer"
-version = "0.5.0-dev.1"
+version = "0.5.0-dev.2"
 dependencies = [
  "axum",
+ "bcdec_rs",
  "bincode",
  "block_compression",
  "bytes",
  "chrono",
+ "ciborium",
  "dashmap",
+ "ddsfile",
  "dirs",
  "filetime",
  "flate2",
@@ -4771,7 +4830,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-cli"
-version = "0.5.0-dev.1"
+version = "0.5.0-dev.2"
 dependencies = [
  "atty",
  "chrono",
@@ -4797,7 +4856,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-package"
-version = "0.5.0-dev.1"
+version = "0.5.0-dev.2"
 dependencies = [
  "chrono",
  "semver",
@@ -4805,7 +4864,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-publish"
-version = "0.5.0-dev.1"
+version = "0.5.0-dev.2"
 dependencies = [
  "chrono",
  "clap",
@@ -4817,7 +4876,7 @@ dependencies = [
 
 [[package]]
 name = "xearthlayer-publisher"
-version = "0.5.0-dev.1"
+version = "0.5.0-dev.2"
 dependencies = [
  "chrono",
  "csscolorparser",

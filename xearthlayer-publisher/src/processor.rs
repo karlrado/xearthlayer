@@ -216,6 +216,7 @@ mod tests {
             ter_files: vec![],
             mask_files: vec![],
             dds_files: vec![],
+            night_recipe: None,
         };
         let result = SceneryScanResult::new(vec![tile]);
         assert!(result.has_tiles());

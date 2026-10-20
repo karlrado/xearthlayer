@@ -155,6 +155,7 @@ pub use context::{SpawnedChildJob, TaskContext};
 pub use handle::{JobHandle, JobStatus, Signal};
 
 // Resource pools
+pub use resource_pool::BLOCKING_POOL_HEADROOM;
 pub use resource_pool::{
     ResourcePermit, ResourcePool, ResourcePoolConfig, ResourcePools, ResourceType,
     DEFAULT_CPU_CAPACITY_MULTIPLIER, DEFAULT_DISK_IO_CAPACITY, DEFAULT_NETWORK_CAPACITY_MULTIPLIER,

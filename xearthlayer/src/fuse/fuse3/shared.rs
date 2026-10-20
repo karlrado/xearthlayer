@@ -360,6 +360,13 @@ pub trait DdsRequestor: FileAttrBuilder {
     ///
     /// Generated DDS data, or placeholder on error/timeout
     async fn request_dds_impl(&self, coords: &DdsFilename) -> Bytes {
+        // Defence in depth (R8): lit names are routed to the lit source before
+        // they get here. If one arrives anyway, it must never reach the
+        // coalescer or the client, whose keys would collide with the ortho tile.
+        if coords.kind == crate::fuse::TextureKind::Lit {
+            return crate::night::minimal_black_dds();
+        }
+
         let tile = chunk_to_tile_coords(coords);
         let context_label = self.context_label();
         let timeout = self.generation_timeout();
@@ -555,6 +562,7 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.row, 100000 / 16);
@@ -569,6 +577,7 @@ mod tests {
             col: 10368,
             zoom: 16,
             map_type: "GO2".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.row, 25264 / 16);
@@ -584,6 +593,7 @@ mod tests {
             col: 200,
             zoom: 2,
             map_type: "BI".to_string(),
+            kind: crate::fuse::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.zoom, 0); // saturating_sub prevents underflow

@@ -223,6 +223,8 @@ impl MetricsDaemon {
                 match tier {
                     DiskTier::Chunk => self.state.chunk_disk_bytes_written += bytes,
                     DiskTier::Dds => self.state.dds_disk_bytes_written += bytes,
+                    // Nothing emits a lit write event yet.
+                    DiskTier::Lit => {}
                 }
             }
             MetricEvent::DiskCacheInitialSize { bytes } => {

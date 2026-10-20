@@ -246,6 +246,13 @@ max_background = {}
 ; Congestion threshold for background FUSE requests (default: 192, range: 1-1024)
 ; Kernel starts throttling when pending requests exceed this. Convention: 75% of max_background.
 congestion_threshold = {}
+
+[night]
+; Night lighting from OXO night recipes in installed packages.
+; Lit textures are generated from your own X-Plane lit art. false = always dark.
+enabled = {}
+; Overall lit brightness, 0.5 to 1.5. A development setting.
+brightness = {}
 "#,
         update_check,
         config.general.layout_version,
@@ -299,6 +306,9 @@ congestion_threshold = {}
         // FUSE settings
         config.fuse.max_background,
         config.fuse.congestion_threshold,
+        // Night lighting settings
+        config.night.enabled,
+        config.night.brightness,
         packages_default = path_to_string(&crate::paths::packages_dir()),
         temp_default = path_to_string(&crate::paths::temp_dir()),
         log_default = path_to_string(&crate::paths::log_file()),
