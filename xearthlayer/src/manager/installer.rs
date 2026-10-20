@@ -454,10 +454,12 @@ fn validate_file_name(name: &str) -> ManagerResult<()> {
 }
 
 /// Move extracted contents to the install path.
+///
+/// The archive should contain a single top-level directory, the package
+/// folder, named like the install path. A directory of that name is the
+/// package whatever else sits beside it: Finder writes a `.DS_Store` into
+/// any folder it displays, including `extracted/` mid-install (#303).
 fn move_extracted_contents(extract_dir: &Path, install_path: &Path) -> ManagerResult<()> {
-    // The archive should contain a single top-level directory (the package folder)
-    // We need to move its contents to the install path
-
     let entries: Vec<_> = fs::read_dir(extract_dir)
         .map_err(|e| ManagerError::ReadFailed {
             path: extract_dir.to_path_buf(),
@@ -466,9 +468,17 @@ fn move_extracted_contents(extract_dir: &Path, install_path: &Path) -> ManagerRe
         .filter_map(|e| e.ok())
         .collect();
 
-    if entries.len() == 1 && entries[0].path().is_dir() {
-        // Single directory - this is the package folder, rename it
-        let source = entries[0].path();
+    let named_package = entries
+        .iter()
+        .find(|e| Some(e.file_name().as_os_str()) == install_path.file_name() && e.path().is_dir());
+    let package_folder = match named_package {
+        Some(entry) => Some(entry),
+        None if entries.len() == 1 && entries[0].path().is_dir() => Some(&entries[0]),
+        None => None,
+    };
+
+    if let Some(package_folder) = package_folder {
+        let source = package_folder.path();
 
         // Create parent directory
         if let Some(parent) = install_path.parent() {
@@ -987,6 +997,37 @@ mod tests {
         );
         assert!(downloaded.lock().unwrap().is_empty());
         assert!(!target.exists());
+    }
+
+    /// #303: Finder writes a `.DS_Store` into any folder it displays, so a
+    /// Finder window on the temp directory during an install puts one beside
+    /// the package folder in `extracted/`. The package must still land at the
+    /// install path, not nested inside a folder of its own name, where nothing
+    /// finds it. macOS's own files, but nothing here needs macOS to reproduce.
+    #[test]
+    fn a_finder_ds_store_beside_the_package_folder_does_not_nest_the_package() {
+        let temp = TempDir::new().unwrap();
+        let mountpoint = "zzXEL_af-north_ortho";
+        let extract_dir = temp.path().join("extracted");
+        let package_dir = extract_dir.join(mountpoint);
+        fs::create_dir_all(package_dir.join("terrain")).unwrap();
+        fs::write(package_dir.join("xearthlayer_scenery_package.txt"), "meta").unwrap();
+        fs::write(package_dir.join("terrain/tile.ter"), "terrain").unwrap();
+        fs::write(extract_dir.join(".DS_Store"), "finder").unwrap();
+        fs::write(extract_dir.join(format!("._{mountpoint}")), "appledouble").unwrap();
+        let install_path = temp.path().join("Custom Scenery").join(mountpoint);
+
+        move_extracted_contents(&extract_dir, &install_path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(install_path.join("xearthlayer_scenery_package.txt")).unwrap(),
+            "meta"
+        );
+        assert!(install_path.join("terrain/tile.ter").exists());
+        assert!(
+            !install_path.join(mountpoint).exists(),
+            "package was nested"
+        );
     }
 
     #[test]
