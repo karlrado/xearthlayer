@@ -488,7 +488,7 @@ Controls night lighting. Packages built with OXO night recipes carry `night/` fo
 
 Lit textures are built from the X-Plane installation behind your Custom Scenery path. If that installation cannot be found, lit textures stay dark whatever this setting says. The texture quality setting is read once when XEarthLayer starts, so a change to it takes effect on the next start.
 
-Lit urban ground glows where your X-Plane art and NASA VIIRS night lights say a city is. This release uses a first, simpler generator: the street pattern may repeat every few kilometres and city edges follow a coarse grid. Smoother lighting arrives in a later phase.
+Lit urban ground glows where your X-Plane art and NASA VIIRS night lights say a city is, with soft edges between neighbourhoods and no visible repeat in the street pattern. Some neighbourhoods are lit with white LED street lighting instead of sodium orange, more often in bright downtown and industrial areas than in suburbs, at a share and colour temperature that depend on the package's region. The lit layer switches off close to the aircraft, where X-Plane's own 3D lights take over. Generated lit textures are kept in the disk cache (see `disk_size` above), so a revisited area does not need to generate them again.
 
 The brightness of the night lights comes from NASA Black Marble VNP46A4/VJ146A4 annual nighttime lights.
 

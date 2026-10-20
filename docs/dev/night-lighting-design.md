@@ -1,8 +1,8 @@
 # Night Lighting Design
 
-**Status**: Phase 1, phase 2a and phase 2b implemented (packaging, black serving, real lit sizes, the `LitGenerator` trait with its CPU implementation, bilinear world fields, warped soft class edges, hex stochastic tiling, and a coalesced service); tuning continues by flight
+**Status**: Phase 1, phase 2a and phase 2b implemented (packaging, black serving, real lit sizes, the `LitGenerator` trait with its CPU implementation, bilinear world fields, warped soft class edges, hex stochastic tiling, and a coalesced service), plus the lit disk cache and LED lighting; tuning continues by flight
 **Created**: 2026-10-17
-**Branch**: `blackmarble` (local until 0.5.0 release preparation)
+**Branch**: `blackmarble`, proposed for `develop/0.5.0` so others can test it
 
 ## Overview
 
