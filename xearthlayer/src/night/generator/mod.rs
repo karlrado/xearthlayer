@@ -25,6 +25,9 @@ pub use led::{LedModel, LedRegion};
 /// The recipe of the 1 degree tile whose south-west corner is `(lat, lon)`.
 pub type RecipeLookup<'a> = &'a (dyn Fn(i32, i32) -> Option<Arc<Recipe>> + Sync);
 
+/// The LED region of the 1 degree tile whose south-west corner is `(lat, lon)`.
+pub type RegionLookup<'a> = &'a (dyn Fn(i32, i32) -> LedRegion + Sync);
+
 /// The lit pattern a recipe palette name stands for, or `None` (dark).
 pub type PatternLookup<'a> = &'a (dyn Fn(&str) -> Option<Arc<LitPattern>> + Sync);
 
@@ -38,6 +41,10 @@ pub struct LitRequest<'a> {
     pub brightness: f64,
     pub recipes: RecipeLookup<'a>,
     pub patterns: PatternLookup<'a>,
+    /// The region each tile's recipe came from.
+    pub regions: RegionLookup<'a>,
+    /// The LED model; `LedModel::OFF` for sodium only.
+    pub led: &'a LedModel,
 }
 
 /// Produces the first visible level of a lit texture.
@@ -127,6 +134,8 @@ mod tests {
             brightness: 1.0,
             recipes: &recipes,
             patterns: &patterns,
+            regions: &|_, _| LedRegion::Unknown,
+            led: &LedModel::OFF,
         })
     }
 

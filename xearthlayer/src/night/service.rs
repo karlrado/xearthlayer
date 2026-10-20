@@ -20,7 +20,7 @@ use futures::future::BoxFuture;
 use tracing::{debug, warn};
 
 use super::generator::field::{RecipeField, FIELD_MARGIN_DEG};
-use super::generator::{CpuLitGenerator, LitGenerator, LitRequest};
+use super::generator::{CpuLitGenerator, LedModel, LedRegion, LitGenerator, LitRequest};
 use super::layout::minimal_black_dds;
 use super::{
     decode_entry, encode_entry, footprint_fingerprint, lit_cache_key, session_fingerprint,
@@ -394,6 +394,8 @@ impl NightLitSource {
                 brightness,
                 recipes: &lookup,
                 patterns: &patterns,
+                regions: &|_, _| LedRegion::Unknown,
+                led: &LedModel::OFF,
             });
             Some(super::generator::encode_visible(image))
         })
