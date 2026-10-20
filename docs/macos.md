@@ -74,6 +74,15 @@ for aircraft position. The Web API connection is automatic and requires no
 configuration — just make sure X-Plane's Web API is not disabled. Prefetching
 and adaptive scenery loading work normally through it.
 
+### The mount's name in Finder
+
+Finder shows a mounted volume's name in place of the folder it is mounted on.
+XEarthLayer names the macFUSE volume after its mount point, so the ortho mount
+appears in Custom Scenery as `zzXEL_ortho`, the same name X-Plane and the
+terminal see. Versions before 0.5.0 gave no volume name, and Finder showed
+macFUSE's default, `macFUSE Volume 0 (xearthlayer)`, although the folder on
+disk was always `zzXEL_ortho` ([#305](https://github.com/samsoir/xearthlayer/issues/305)).
+
 ### Stale mount recovery
 
 If XEarthLayer is killed without unmounting (crash, force-quit), macFUSE leaves
