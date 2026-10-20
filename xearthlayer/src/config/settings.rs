@@ -135,6 +135,10 @@ pub struct PackagesSettings {
     /// `xearthlayer run` starts. Useful when running third-party overlay scenery
     /// (e.g., SimHeaven) that would otherwise conflict with XEL overlays.
     pub disable_overlays: bool,
+    /// Give SimHeaven X-World Pro priority over XEarthLayer overlays: on every
+    /// `run`, overlays are left out of `yzXEL_overlay/` for the continents
+    /// X-World Pro covers, and the scenery order and setup are checked.
+    pub xworld_pro: bool,
     /// Temporary directory for downloads (default: ~/.xearthlayer/tmp).
     pub temp_dir: Option<PathBuf>,
     /// Number of concurrent part downloads (1-10, default: 5).

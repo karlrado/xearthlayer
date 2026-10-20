@@ -193,6 +193,9 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         if let Some(v) = section.get("disable_overlays") {
             config.packages.disable_overlays = parse_bool(v);
         }
+        if let Some(v) = section.get("xworld_pro") {
+            config.packages.xworld_pro = parse_bool(v);
+        }
         if let Some(v) = section.get("temp_dir") {
             let v = v.trim();
             if !v.is_empty() {

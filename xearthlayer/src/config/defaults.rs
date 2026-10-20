@@ -262,6 +262,7 @@ impl Default for ConfigFile {
                 custom_scenery_path: None,
                 auto_install_overlays: false,
                 disable_overlays: false,
+                xworld_pro: false,
                 temp_dir: None,
                 concurrent_downloads: 5,
             },

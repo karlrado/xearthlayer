@@ -410,6 +410,7 @@ Controls package manager behavior.
 | `custom_scenery_path` | path | (auto-detect) | X-Plane Custom Scenery directory for overlay symlinks |
 | `auto_install_overlays` | bool | `false` | Automatically install matching overlay when installing ortho |
 | `disable_overlays` | bool | `false` | Suppress XEL overlays at runtime (see notes below) |
+| `xworld_pro` | bool | `false` | Give SimHeaven X-World Pro priority over XEarthLayer overlays (see [X-World Pro](x-world-pro.md)) |
 | `temp_dir` | path | `~/.cache/xearthlayer/tmp` | Temporary directory for package downloads |
 | `concurrent_downloads` | Integer | `5` | Number of concurrent part downloads (1-10) |
 
@@ -421,6 +422,7 @@ install_location = ~/.local/share/xearthlayer/packages
 custom_scenery_path = /home/user/X-Plane 12/Custom Scenery
 auto_install_overlays = true
 disable_overlays = false
+xworld_pro = false
 temp_dir = ~/Downloads/xearthlayer-temp
 ```
 
@@ -429,6 +431,7 @@ temp_dir = ~/Downloads/xearthlayer-temp
 - The `temp_dir` is used for downloading archives before extraction; files are cleaned up after installation. The default avoids the system temp directory which is often RAM-backed (tmpfs) on Linux
 - When `auto_install_overlays` is enabled, installing an ortho package will automatically install the matching overlay package for the same region (if available)
 - `disable_overlays` is a **runtime** control. When set to `true`, `xearthlayer run` removes the consolidated `yzXEL_overlay/` symlink folder from Custom Scenery on startup so X-Plane does not load XEarthLayer overlays. Overlay packages remain downloaded and stored locally — flipping the setting back to `false` and restarting reinstates them with no re-download. Use this when running third-party overlay scenery (e.g. SimHeaven, Prefab Objects) that conflicts with XEL overlays. Distinct from `auto_install_overlays`, which controls whether overlays are *downloaded* alongside ortho packages.
+- `xworld_pro` is set by `xearthlayer setup` when SimHeaven X-World Pro is detected. With `true`, every `xearthlayer run` leaves XEarthLayer's overlays out for the continents X-World Pro covers (all of them when the whole planet is installed) and checks the scenery order and X-World Pro setup. `disable_overlays = true` still turns every overlay off. See [X-World Pro](x-world-pro.md).
 - If `custom_scenery_path` is not set, it falls back to `[xplane] scenery_dir` or auto-detects from X-Plane installation
 
 ---
@@ -563,6 +566,7 @@ file = ~/.local/state/xearthlayer/xearthlayer.log
 ; custom_scenery_path = /path/to/X-Plane 12/Custom Scenery
 ; auto_install_overlays = true
 ; disable_overlays = false
+; xworld_pro = false
 ; temp_dir = ~/Downloads/xearthlayer-temp
 
 [patches]
@@ -691,6 +695,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `packages.custom_scenery_path` | path | Custom Scenery for overlays |
 | `packages.auto_install_overlays` | `true`, `false` | Auto-install matching overlays |
 | `packages.disable_overlays` | `true`, `false` | Suppress XEL overlays at runtime |
+| `packages.xworld_pro` | `true`, `false` | Give X-World Pro priority over XEL overlays |
 | `packages.temp_dir` | path | Temporary download directory |
 | `logging.file` | path | Log file location |
 | `night.enabled` | `true`, `false` | Serve generated night lighting textures |
