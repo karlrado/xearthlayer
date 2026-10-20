@@ -341,7 +341,9 @@ For each texel of the first visible level, the CPU implementation:
 5. **Recolours LED neighbourhoods** (`led.rs`, see LED lighting): where a
    texel's patch is LED, the pattern sum is replaced by white of the patch's
    colour temperature before the gain applies.
-6. **Outputs** the weighted sum of class patterns × gain, as RGB.
+6. **Outputs** the (possibly recoloured) weighted sum of class patterns ×
+   gain, as RGB. An LED texel is held to at least the byte luminance of the
+   sodium bytes it replaces (see LED lighting).
 
 `encode_visible` then box-filters the lower levels from the first visible
 level, as the ortho path does, and BC1-encodes them with the default ISPC
@@ -349,11 +351,11 @@ encoder, whatever `texture.compressor` says. A lit payload is about a tenth
 of an ortho tile, so wiring the GPU channel worker into the lit path is not
 worth it now. A real ZL16 texture at 1024 px generated in about 130 ms
 warm and 147 ms cold before the LED stage, and generates in about 153 ms
-warm and 168 ms cold with it (release build, developer machine). Three things keep it there: recipes
-sit in a small table of tile slots rather than a hash map, patterns
-resolve once per tile and palette index, and the tiling caches the
-lattice corners neighbouring texels share (with the same bits as without
-the cache).
+warm and 168 ms cold with it (release build, developer machine). Three
+things keep it there: recipes sit in a small table of tile slots rather
+than a hash map, patterns resolve once per tile and palette index, and
+the tiling caches the lattice corners neighbouring texels share (with the
+same bits as without the cache).
 
 Determinism (R13): hashes use fixed seeds and integer inputs, and the
 generator holds no state between calls, so the same recipe, art and
@@ -425,11 +427,11 @@ Inside:
   `night.brightness`, the size and mtime of the Laminar lit art
   (`library.txt`, `.ter`, `_LIT.dds`) and of the recipe files the
   footprint's field reads, each with the package region it was read from
-  (the LED stage depends on it). Recipe identities are taken when each recipe is
-  loaded, so a recipe replaced while XEL runs does not lend its new identity
-  to a payload built from the old one. A mismatch is a miss: the payload is
-  regenerated and overwrites the entry, so package updates, X-Plane updates
-  and brightness changes need no cache clear. Write-back is fire-and-forget,
+  (the LED stage depends on it). Recipe identities are taken when each
+  recipe is loaded, so a recipe replaced while XEL runs does not lend its
+  new identity to a payload built from the old one. A mismatch is a miss:
+  the payload is regenerated and overwrites the entry, so package updates,
+  X-Plane updates and brightness changes need no cache clear. Write-back is fire-and-forget,
   only for payloads built from a complete set of recipes (black is never
   written), and never after an art file failed to read or decode this
   session (`LaminarArt::had_failure`), since that failure is invisible to
@@ -541,7 +543,10 @@ white at the patch temperature, from a table every 100 K. If a channel
 would exceed full scale, all three scale down together so the hue holds; if
 that leaves the texel dimmer than its sodium input, it is mixed towards
 white until it is not. LED is therefore never dimmer than the sodium it
-replaces. A sodium texel keeps its bytes exactly, and `LedModel::OFF`
+replaces, and this holds after rounding to bytes: the generator compares
+the decoded luminance of the LED bytes with that of the sodium bytes for
+the same gain, and rounds the LED channels up, then falls back to the
+sodium bytes, when rounding to nearest would lose any. A sodium texel keeps its bytes exactly, and `LedModel::OFF`
 reproduces the sodium-only output.
 
 **Regions.** The region is the first segment of the code of the package a
@@ -594,6 +599,8 @@ name, and they draw nothing.
 **Phase 2: the generator.** `LaminarArt`, `XPlanePrefs`, the layout's
 blank levels, `LitGenerator` and its CPU implementation, the lit cache, and
 the tuning flight that sets the gain constants and confirms `LUMINANCE 150`.
+The LED stage (`led.rs`) is the last generator step: neighbourhood patches
+turn LED white by class, brightness and package region.
 
 ## Testing
 
@@ -615,6 +622,16 @@ the tuning flight that sets the gain constants and confirms `LUMINANCE 150`.
   degree line, where two tiles' recipes meet; an empty footprint gives
   the minimal black DDS; blank levels are all zero and the next level is
   not.
+- **LED.** Share: the fraction of lit texels that are LED matches the
+  model, and a region moves it. Coherence: patches are contiguous, not
+  per-texel. Zoom agreement: the LED decision for the same ground agrees at
+  ZL15 and ZL16. OFF digest: `LedModel::OFF` reproduces the pinned
+  sodium-only output byte for byte. Byte-level never-dimmer: across
+  radiance down to the gain floor, brightness 0.5 to 1.5 and several
+  patterns and temperatures, every changed texel is at least as bright as
+  its sodium bytes. Region tags and every `DEFAULT` region row are pinned,
+  and a different package region invalidates a lit disk entry while the
+  same one is served from disk.
 - **FUSE integration.** `stat` and a full read agree on size; a lit
   texture and the ortho texture with the same row, column and zoom have
   different inodes and different bytes; `night/` does not appear in a
@@ -666,6 +683,13 @@ Feature: Night lighting on ortho scenery
     When X-Plane reads any _LIT.dds
     Then it receives a black texture
     And XEL logs the cause once
+
+  Scenario: LED and sodium mix
+    Given a night flight over the SF Bay Area
+    Then white and orange patches are mixed
+    And downtown reads whiter than the suburbs
+    And no LED patch reads dimmer than the sodium next to it
+    And LED_ENERGY is tuned by eye
 
   Scenario: In the simulator
     Given a night flight over a lit city on generated textures
