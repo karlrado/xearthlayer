@@ -62,7 +62,7 @@ use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -560,13 +560,8 @@ impl Fuse3OrthoUnionFS {
     /// This is a blocking operation that runs until the filesystem is unmounted.
     /// For non-blocking usage, see [`mount_spawned`](Self::mount_spawned).
     pub async fn mount(self, mountpoint: &str) -> Fuse3Result<super::types::MountHandle> {
-        let mut mount_options = MountOptions::default();
-        mount_options.read_only(true);
-        mount_options.force_readdir_plus(false);
-        // Tell kernel we don't implement opendir - it should call readdir directly
-        mount_options.no_open_dir_support(true);
-
         let mount_path = PathBuf::from(mountpoint);
+        let mount_options = mount_options(&mount_path);
 
         // State the ceiling once, so a flight log is self-describing: a reader
         // comparing dds_pinned_peak_mb against it does not have to know the
@@ -609,13 +604,8 @@ impl Fuse3OrthoUnionFS {
         self,
         mountpoint: &str,
     ) -> Fuse3Result<super::types::SpawnedMountHandle> {
-        let mut mount_options = MountOptions::default();
-        mount_options.read_only(true);
-        mount_options.force_readdir_plus(false);
-        // Tell kernel we don't implement opendir - it should call readdir directly
-        mount_options.no_open_dir_support(true);
-
         let mount_path = PathBuf::from(mountpoint);
+        let mount_options = mount_options(&mount_path);
 
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
@@ -641,6 +631,36 @@ impl Fuse3OrthoUnionFS {
         let coords = parse_dds_filename(name_str).ok()?;
         Some(self.request_dds_impl(&coords).await)
     }
+}
+
+/// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
+/// [`Fuse3OrthoUnionFS::mount_spawned`].
+fn mount_options(mount_path: &Path) -> MountOptions {
+    let mut mount_options = MountOptions::default();
+    mount_options.read_only(true);
+    mount_options.force_readdir_plus(false);
+    // Tell kernel we don't implement opendir - it should call readdir directly
+    mount_options.no_open_dir_support(true);
+    if let Some(volname) = volume_name_option(mount_path, cfg!(target_os = "macos")) {
+        mount_options.custom_options(volname);
+    }
+    mount_options
+}
+
+/// The macFUSE `volname` option naming the volume after its mount-point
+/// folder (#305).
+///
+/// Finder shows a mounted volume's name in place of the folder it is mounted
+/// on, and macFUSE's default is `macFUSE Volume 0 (<process>)`, so without
+/// this `zzXEL_ortho` appears in Custom Scenery under that name. `None` off
+/// macOS, which has no volume names, and for a folder name containing a
+/// comma, which macFUSE would split into a second option.
+fn volume_name_option(mount_path: &Path, macos: bool) -> Option<String> {
+    if !macos {
+        return None;
+    }
+    let name = mount_path.file_name()?.to_str()?;
+    (!name.contains(',')).then(|| format!("volname={name}"))
 }
 
 // =============================================================================
@@ -1348,6 +1368,34 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
     use xearthlayer_package::{InstalledPackage, Package, PackageType};
+
+    /// #305: Finder shows a mounted volume's name in place of its mount-point
+    /// folder, and macFUSE's default is `macFUSE Volume 0 (<process>)`.
+    #[test]
+    fn on_macos_the_volume_is_named_after_the_mount_point_folder() {
+        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
+
+        assert_eq!(
+            volume_name_option(mount, true).as_deref(),
+            Some("volname=zzXEL_ortho")
+        );
+    }
+
+    #[test]
+    fn off_macos_there_is_no_volume_name() {
+        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
+
+        assert_eq!(volume_name_option(mount, false), None);
+    }
+
+    /// macFUSE splits its option list on commas, so a name containing one
+    /// would leak its tail in as a separate option.
+    #[test]
+    fn a_folder_name_with_a_comma_is_not_passed_as_a_volume_name() {
+        let mount = Path::new("/Custom Scenery/zzXEL_ortho,allow_other");
+
+        assert_eq!(volume_name_option(mount, true), None);
+    }
 
     /// Mock DdsClient for testing
     struct MockDdsClient {
