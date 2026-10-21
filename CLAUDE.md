@@ -31,6 +31,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - All FUSE operations run asynchronously on the Tokio runtime
    - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
    - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
+   - Virtual DDS files open with `FOPEN_DIRECT_IO` on Linux so every read reaches the handler. macOS serves them through the kernel page cache (direct I/O crashes X-Plane's `mmap` texture loader under macFUSE), so the FUSE read counters under-report there; nothing functional depends on per-read visibility (#204). See `docs/dev/fuse-filesystem.md`
 
 2. **Tile Generation** (`xearthlayer/src/tile/`)
    - `TileGenerator` trait with dependency injection
@@ -161,9 +162,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `StateAggregator` - Combines multiple position sources with accuracy-based selection
     - `PositionModel` - Persistent position model refined by best available data
     - `WebApiAdapter` - Connects to X-Plane Web API (REST + WebSocket) for position and sim state
-    - `InferenceAdapter` - Position inference from FUSE file access patterns (macOS caveat: virtual DDS files use the kernel page cache there, so FUSE only sees cold first-reads — steady-state position tracking is effectively Web API-only; see `docs/dev/fuse-filesystem.md`)
     - `FlightPathHistory` - Position history for track derivation
-    - Position sources: Web API (10m), ManualReference (100m), SceneInference (100km)
+    - Position sources: Web API (10m), OnlineNetwork (10m), ManualReference (100m). Position inference from FUSE access patterns (`InferenceAdapter`, `SceneInference`) and the `scene_tracker` module that fed it were deleted in #204: neither had a production caller on any platform
     - Higher accuracy wins; stale high-accuracy can be beaten by fresh lower-accuracy
     - `AircraftState` includes `on_ground: bool` propagated from SimState → WebApiAdapter → aircraft_position → prefetch
 

@@ -26,17 +26,14 @@ pub(crate) struct CycleStats {
 // Public functions
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Update shared status with current position, plan details, and submission count.
+/// Update shared status with plan details and submission count.
 pub(crate) fn update_status_with_plan(
     shared_status: &SharedPrefetchStatus,
     coordinator_status: &CoordinatorStatus,
-    position: (f64, f64),
     plan: &PrefetchPlan,
     submitted: usize,
     stats: &CycleStats,
 ) {
-    shared_status.update_inferred_position(position.0, position.1);
-
     shared_status.update_state_inputs(state_inputs(coordinator_status, submitted > 0));
     shared_status.update_box_extent(coordinator_status.box_extent);
     shared_status.update_box_bounds(coordinator_status.box_bounds);
@@ -66,11 +63,6 @@ pub(crate) fn update_status_with_plan(
         deferred_cycles: stats.total_deferred_cycles,
     };
     shared_status.update_detailed_stats(detailed);
-}
-
-/// Update shared status with position only.
-pub(crate) fn update_status_position(shared_status: &SharedPrefetchStatus, position: (f64, f64)) {
-    shared_status.update_inferred_position(position.0, position.1);
 }
 
 /// Update shared status when no plan was generated.
@@ -158,18 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status_position() {
-        let status = SharedPrefetchStatus::new();
-        update_status_position(&status, (50.0, 8.0));
-
-        let snapshot = status.snapshot();
-        assert!(snapshot.aircraft.is_some());
-        let ac = snapshot.aircraft.unwrap();
-        assert!((ac.latitude - 50.0).abs() < 0.001);
-        assert!((ac.longitude - 8.0).abs() < 0.001);
-    }
-
-    #[test]
     fn test_update_status_no_plan_disabled_when_disabled() {
         let status = SharedPrefetchStatus::new();
         let mut coord_status = CoordinatorStatus::default();
@@ -223,7 +203,6 @@ mod tests {
         update_status_with_plan(
             &status,
             &coord_status,
-            (50.0, 8.0),
             &plan,
             2,
             &test_stats(10, 200, 50, 1),

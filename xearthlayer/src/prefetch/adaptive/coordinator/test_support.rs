@@ -18,7 +18,6 @@ use crate::prefetch::adaptive::strategy::PrefetchPlan;
 use crate::prefetch::state::AircraftState;
 use crate::prefetch::SceneryIndex;
 use crate::runtime::{LaneError, LaneReceipt, PrefetchLane};
-use crate::scene_tracker::{DdsTileCoord, GeoBounds, GeoRegion, SceneTracker};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Factory helpers
@@ -150,10 +149,6 @@ pub(crate) fn make_scenery_index_covering(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SceneTracker mocks
-// ─────────────────────────────────────────────────────────────────────────────
-
-// ─────────────────────────────────────────────────────────────────────────────
 // Memory cache mocks
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -256,72 +251,6 @@ impl DdsDiskCacheChecker for AlwaysHitDiskChecker {
 
     fn tile_exists_blocking(&self, _row: u32, _col: u32, _zoom: u8) -> bool {
         true
-    }
-}
-
-/// Mock SceneTracker that returns no data for all queries.
-pub(crate) struct DummyTracker;
-
-impl SceneTracker for DummyTracker {
-    fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
-        HashSet::new()
-    }
-    fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
-        false
-    }
-    fn total_requests(&self) -> u64 {
-        0
-    }
-    fn loaded_regions(&self) -> HashSet<GeoRegion> {
-        HashSet::new()
-    }
-    fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
-        false
-    }
-    fn loaded_bounds(&self) -> Option<GeoBounds> {
-        None
-    }
-}
-
-/// Mock SceneTracker that returns configurable stable bounds.
-///
-/// A SceneTracker with fixed bounds, used by coordinator tests.
-pub(crate) struct StableBoundsTracker {
-    bounds: GeoBounds,
-}
-
-impl StableBoundsTracker {
-    /// Create a tracker with custom bounds.
-    pub(crate) fn with_bounds(min_lat: f64, max_lat: f64, min_lon: f64, max_lon: f64) -> Self {
-        Self {
-            bounds: GeoBounds {
-                min_lat,
-                max_lat,
-                min_lon,
-                max_lon,
-            },
-        }
-    }
-}
-
-impl SceneTracker for StableBoundsTracker {
-    fn requested_tiles(&self) -> HashSet<DdsTileCoord> {
-        HashSet::new()
-    }
-    fn is_tile_requested(&self, _tile: &DdsTileCoord) -> bool {
-        false
-    }
-    fn total_requests(&self) -> u64 {
-        0
-    }
-    fn loaded_regions(&self) -> HashSet<GeoRegion> {
-        HashSet::new()
-    }
-    fn is_region_loaded(&self, _region: &GeoRegion) -> bool {
-        false
-    }
-    fn loaded_bounds(&self) -> Option<GeoBounds> {
-        Some(self.bounds)
     }
 }
 

@@ -48,7 +48,7 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Adaptive Prefetch Design](adaptive-prefetch-design.md) | Sliding prefetch box, boundary monitors, flight phase detection |
 | [X-Plane Scenery Loading Whitepaper](xplane-scenery-loading-whitepaper.md) | Research on X-Plane 12's scenery loading behaviour |
 | [Prefetch Flight Test Plan](prefetch-flight-test-plan.md) | Flight test data and empirical findings |
-| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (v0.4.0) |
+| [Aircraft Telemetry Architecture](aircraft-telemetry-architecture.md) | X-Plane Web API telemetry integration (v0.4.0); the Scene Tracker it describes was removed in #204 |
 
 ## Debugging & Operations
 

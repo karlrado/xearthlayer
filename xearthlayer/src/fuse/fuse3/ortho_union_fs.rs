@@ -48,7 +48,6 @@ use crate::night::{BlackLitSource, LitTextureSource};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use crate::scene_tracker::{DdsTileCoord, FuseAccessEvent};
 use bytes::Bytes;
 use dashmap::DashMap;
 use fuse3::raw::prelude::*;
@@ -68,7 +67,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::mpsc;
 use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn, Instrument};
 
@@ -88,25 +86,26 @@ struct DdsHandle {
 ///
 /// When set in `ReplyOpen::flags`, the kernel sends every `read()` through
 /// the FUSE handler instead of serving from its page cache. Used for virtual
-/// DDS files so that `FuseLoadMonitor` and `SceneTracker`
-/// see every X-Plane read.
+/// DDS files so that every X-Plane read is counted (`MetricEvent::FuseRead`)
+/// and none is answered from a cache this filesystem cannot invalidate.
 #[cfg_attr(target_os = "macos", allow(dead_code))]
 const FOPEN_DIRECT_IO: u32 = 1;
 
 /// Open flags reported for virtual DDS files.
 ///
-/// Linux uses [`FOPEN_DIRECT_IO`] so that every `read()` reaches this handler,
-/// which is what feeds `FuseLoadMonitor` and `SceneTracker`.
+/// Linux uses [`FOPEN_DIRECT_IO`]: every `read()` reaches this handler, so the
+/// FUSE read counters are exact and the page cache never holds a second copy
+/// of a tile the memory cache already has.
 ///
 /// **macOS must not.** X-Plane memory-maps texture files, and macFUSE faults
 /// with `EXC_BAD_ACCESS` when a `direct_io` file is `mmap`ed, because `mmap`
 /// needs the page cache that `direct_io` bypasses. macOS therefore serves
 /// virtual DDS through the page cache, trading per-read visibility for not
-/// crashing the sim's texture loader. The consequence is that on macOS only
-/// the cold first read of a tile reaches FUSE, so scene inference degrades to
-/// "tiles seen once since mount" and position tracking is effectively Web API
-/// only. Prefetch is unaffected: it is driven by telemetry, and the cold reads
-/// that trigger generation still arrive.
+/// crashing the sim's texture loader. The one consequence is that the FUSE
+/// read counters under-report there: a tile's cold first read reaches this
+/// handler and repeat reads are answered by the kernel. Nothing functional
+/// depends on seeing every read (#204): prefetch is driven by telemetry, and
+/// the cold reads that trigger generation still arrive.
 #[cfg(not(target_os = "macos"))]
 const VIRTUAL_DDS_OPEN_FLAGS: u32 = FOPEN_DIRECT_IO;
 #[cfg(target_os = "macos")]
@@ -189,15 +188,6 @@ pub struct Fuse3OrthoUnionFS {
     /// once: an unlatched warn would bury the log it exists to serve. The
     /// per-occurrence count goes to metrics instead (#236).
     budget_warning_logged: AtomicBool,
-    /// Optional channel for notifying Scene Tracker of DDS accesses.
-    ///
-    /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
-    /// texture request, enabling the Scene Tracker to build an empirical
-    /// model of what X-Plane has requested.
-    ///
-    /// Sends raw DDS tile coordinates (row, col, zoom) for Scene Tracker to
-    /// store as empirical data.
-    scene_tracker_tx: Option<mpsc::UnboundedSender<FuseAccessEvent>>,
     /// Optional metrics client for reporting FUSE-level metrics.
     ///
     /// When set, reports coalesced requests and other FUSE-specific metrics.
@@ -260,7 +250,6 @@ impl Fuse3OrthoUnionFS {
             pinned: Arc::new(PinnedTileBudget::new()),
             peak_handles_open: AtomicU64::new(0),
             budget_warning_logged: AtomicBool::new(false),
-            scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
@@ -297,7 +286,6 @@ impl Fuse3OrthoUnionFS {
             pinned: Arc::new(PinnedTileBudget::new()),
             peak_handles_open: AtomicU64::new(0),
             budget_warning_logged: AtomicBool::new(false),
-            scene_tracker_tx: None,
             metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
@@ -352,36 +340,6 @@ impl Fuse3OrthoUnionFS {
     /// the prefetch system to infer aircraft position from FUSE requests.
     pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
         self.tile_request_callback = Some(callback);
-        self
-    }
-
-    /// Set the channel for Scene Tracker events.
-    ///
-    /// When set, the filesystem sends a [`FuseAccessEvent`] for each DDS
-    /// texture accessed. This enables the Scene Tracker to build an empirical
-    /// model of X-Plane's requests, which can be used for position inference
-    /// and prefetch prediction.
-    ///
-    /// Unlike the prefetcher channel which sends derived DSF regions, this
-    /// channel sends raw DDS tile coordinates (row, col, zoom) - the Scene
-    /// Tracker stores empirical data and derives regions via calculation.
-    ///
-    /// The channel is fire-and-forget: sending is non-blocking and failures
-    /// are silently ignored to avoid impacting FUSE performance.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let (tx, rx) = mpsc::unbounded_channel();
-    /// let fs = Fuse3OrthoUnionFS::new(index, client, size)
-    ///     .with_scene_tracker_channel(tx);
-    /// // rx is passed to DefaultSceneTracker::start()
-    /// ```
-    pub fn with_scene_tracker_channel(
-        mut self,
-        tx: mpsc::UnboundedSender<FuseAccessEvent>,
-    ) -> Self {
-        self.scene_tracker_tx = Some(tx);
         self
     }
 
@@ -462,18 +420,11 @@ impl Fuse3OrthoUnionFS {
     /// `lookup()`, not here.
     ///
     /// This is the composition point: GeoIndex (geography) + OrthoUnionIndex (files).
-    /// Produce a whole DDS tile, reporting the access to Scene Tracker.
+    /// Produce a whole DDS tile.
     ///
     /// Called once per open when the handle memoises, once per read when it
-    /// does not. Scene Tracker therefore sees one event per texture X-Plane
-    /// opens rather than one per ranged read -- the same access pattern,
-    /// without the 12-23x inflation.
+    /// does not.
     async fn resolve_tile(&self, coords: &DdsFilename) -> Bytes {
-        if let Some(ref tx) = self.scene_tracker_tx {
-            let tile = DdsTileCoord::new(coords.row, coords.col, coords.zoom);
-            let _ = tx.send(FuseAccessEvent::new(tile));
-        }
-
         // request_dds parses a filename; Display carries the correct zoom.
         self.request_dds(&format!("{}.dds", coords))
             .await
@@ -1213,7 +1164,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         }
 
         // Virtual DDS files: bypass the kernel page cache so every read()
-        // reaches this handler and SceneTracker sees the access pattern.
+        // reaches this handler (see VIRTUAL_DDS_OPEN_FLAGS).
         //
         // Allocate a handle so the tile is produced once and every later read
         // slices it. The tile itself is NOT produced here: generation can take
