@@ -57,6 +57,8 @@ pub struct SetupConfig {
     pub google_api_key: Option<String>,
     /// Mapbox access token, when the chosen provider needs one.
     pub mapbox_access_token: Option<String>,
+    /// Give SimHeaven X-World Pro priority over XEarthLayer overlays.
+    pub xworld_pro: bool,
 }
 
 /// Output of the provider step.
@@ -116,6 +118,11 @@ pub fn run_wizard() -> Result<(), CliError> {
     print_step_header("Step 5: DDS Encoding");
     let (texture_compressor, texture_gpu_device) = step_encoding(&theme)?;
 
+    // Step 6: Third-party Scenery. Last, so the other step numbers are unchanged,
+    // and it needs Step 1's Custom Scenery folder.
+    print_step_header("Step 6: Third-party Scenery");
+    let xworld_pro = super::xworld::step_xworld(&theme, xplane_scenery_dir.as_deref())?;
+
     // Build setup config
     let setup_config = SetupConfig {
         xplane_scenery_dir,
@@ -129,6 +136,7 @@ pub fn run_wizard() -> Result<(), CliError> {
         provider_type: provider.provider_type,
         google_api_key: provider.google_api_key,
         mapbox_access_token: provider.mapbox_access_token,
+        xworld_pro,
     };
 
     write_config(&setup_config)?;
@@ -787,6 +795,7 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
     }
 
     config.packages.install_location = Some(setup.package_dir.clone());
+    config.packages.xworld_pro = setup.xworld_pro;
 
     config.cache.directory = setup.cache_dir.clone();
     config.cache.memory_size = setup.memory_cache_size;
