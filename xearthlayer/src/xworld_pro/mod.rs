@@ -5,8 +5,10 @@
 
 mod coverage;
 mod detect;
+mod findings;
 mod packs;
 
 pub use coverage::{continent_of_region, OverlayCoverage};
 pub use detect::{detect, Continent, Detection, XwpLayer, XwpLibrary, LAYER_PREFIX, LIBRARY_NAME};
+pub use findings::{manual_path, order_violation, setup_findings, Finding, OrderViolation};
 pub use packs::{parse_scenery_packs, PackEntry, SCENERY_PACKS_FILE};
