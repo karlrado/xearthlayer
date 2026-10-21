@@ -15,3 +15,4 @@ pub use dashboard::{
     Dashboard, DashboardConfig, DashboardEvent, DashboardState, LoadingPhase, LoadingProgress,
     PrefetchLaneConfig, PrewarmProgress,
 };
+pub use widgets::{EncoderStatus, FeatureStatus, XworldProStatus};

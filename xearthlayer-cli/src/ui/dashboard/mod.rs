@@ -28,13 +28,14 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
+use xearthlayer::aircraft_position::web_api::SharedSimState;
 use xearthlayer::aircraft_position::{AircraftPositionProvider, SharedAircraftPosition};
 use xearthlayer::metrics::TelemetrySnapshot;
 use xearthlayer::prefetch::SharedPrefetchStatus;
 use xearthlayer::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
 use xearthlayer::update::UpdateInfo;
 
-use crate::ui::widgets::{CacheConfig, DiskHistory, NetworkHistory, SceneryHistory};
+use crate::ui::widgets::{CacheConfig, DiskHistory, FeatureStatus, NetworkHistory, SceneryHistory};
 
 // Re-export public types from state module
 pub use state::{
@@ -75,6 +76,10 @@ pub struct Dashboard {
     tile_progress_tracker: Option<SharedTileProgressTracker>,
     /// Update information when a newer version is available.
     update_info: Option<UpdateInfo>,
+    /// Key features' state for the Status pane, known once services start.
+    feature_status: Option<FeatureStatus>,
+    /// X-Plane sim state from the Web API, for the live frame rate.
+    sim_state: Option<SharedSimState>,
 }
 
 impl Dashboard {
@@ -109,6 +114,8 @@ impl Dashboard {
             aircraft_position: None,
             tile_progress_tracker: None,
             update_info: None,
+            feature_status: None,
+            sim_state: None,
         })
     }
 
@@ -134,6 +141,17 @@ impl Dashboard {
     pub fn with_tile_progress_tracker(mut self, tracker: SharedTileProgressTracker) -> Self {
         self.tile_progress_tracker = Some(tracker);
         self
+    }
+
+    /// Set the sim state source for the Status pane's frame rate.
+    pub fn with_sim_state(mut self, sim_state: SharedSimState) -> Self {
+        self.sim_state = Some(sim_state);
+        self
+    }
+
+    /// Set the key features' state shown in the Status pane.
+    pub fn set_feature_status(&mut self, status: FeatureStatus) {
+        self.feature_status = Some(status);
     }
 
     /// Set update information for footer display.
@@ -247,6 +265,13 @@ impl Dashboard {
             .map(|t| t.snapshot())
             .unwrap_or_default();
 
+        let sim = self
+            .sim_state
+            .as_ref()
+            .and_then(|s| s.read().ok().map(|guard| *guard));
+        let frame_rate =
+            render::displayed_frame_rate(aircraft_position_status.telemetry_status, sim.as_ref());
+
         self.terminal.draw(|frame| {
             render::render_ui(
                 frame,
@@ -266,6 +291,8 @@ impl Dashboard {
                 &tile_progress_entries,
                 update_info,
                 self.config.prefetch_lane,
+                self.feature_status.as_ref(),
+                frame_rate,
             );
         })?;
 

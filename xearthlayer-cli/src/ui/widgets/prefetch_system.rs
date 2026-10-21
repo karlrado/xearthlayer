@@ -1,10 +1,8 @@
 //! Prefetch system status widget.
 //!
-//! Three lines: the prefetcher's state with its flight phase and cycle size,
-//! the prefetch lane's load and backlog, and the session FUSE generation
-//! latency (coloured from the latest sample against the generation timeout).
-
-use std::time::Duration;
+//! Two lines: the prefetcher's state with its flight phase and cycle size,
+//! and the prefetch lane's capacity in use as a meter with its backlog. FUSE
+//! latency is a demand-side figure and lives in the Scenery System pane.
 
 use ratatui::{
     buffer::Buffer,
@@ -13,10 +11,14 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
-use xearthlayer::metrics::LatencySummary;
 use xearthlayer::prefetch::{DetailedPrefetchStats, FlightPhase, PrefetchState};
 
+use super::primitives::ProgressBar;
+
 const LABEL_COLOR: Color = Color::DarkGray;
+
+/// Cells in the capacity meter.
+const CAPACITY_METER_WIDTH: usize = 10;
 
 /// How full the prefetch lane is: jobs running against its group size, plus
 /// the jobs waiting for admission (a full group or the demand pause).
@@ -27,18 +29,23 @@ pub struct LaneView {
     pub queued: usize,
 }
 
+impl LaneView {
+    /// Running jobs as a whole percent of the group, capped at 100. Zero
+    /// while the group size is unknown.
+    fn utilisation_percent(&self) -> u64 {
+        if self.group == 0 {
+            return 0;
+        }
+        ((self.running as f64 * 100.0 / self.group as f64).round() as u64).min(100)
+    }
+}
+
 /// Widget displaying prefetch system status.
 pub struct PrefetchSystemWidget<'a> {
     state: &'a PrefetchState,
     phase: FlightPhase,
     stats: Option<&'a DetailedPrefetchStats>,
     lane: LaneView,
-    latency: Option<&'a LatencySummary>,
-    recent: Option<&'a LatencySummary>,
-    generation_timeout: Duration,
-    timeouts: usize,
-    cached: u64,
-    generated: u64,
 }
 
 impl<'a> PrefetchSystemWidget<'a> {
@@ -47,59 +54,13 @@ impl<'a> PrefetchSystemWidget<'a> {
         phase: FlightPhase,
         stats: Option<&'a DetailedPrefetchStats>,
         lane: LaneView,
-        latency: Option<&'a LatencySummary>,
-        generation_timeout: Duration,
     ) -> Self {
         Self {
             state,
             phase,
             stats,
             lane,
-            latency,
-            recent: None,
-            generation_timeout,
-            timeouts: 0,
-            cached: 0,
-            generated: 0,
         }
-    }
-
-    /// The most recent sample that had FUSE generations. The colour comes
-    /// from it so one early stall does not keep the session line red; until
-    /// the first sample closes the session figures colour the line.
-    pub fn with_recent(mut self, recent: Option<&'a LatencySummary>) -> Self {
-        self.recent = recent;
-        self
-    }
-
-    /// FUSE waits that hit the generation timeout this session. Shown only
-    /// when non-zero: the no-harm bar counts them.
-    pub fn with_timeouts(mut self, timeouts: usize) -> Self {
-        self.timeouts = timeouts;
-        self
-    }
-
-    /// Session FUSE requests served from cache against those that needed a
-    /// generation. Latency covers generations only, so without this the line
-    /// is empty on a well-prefetched flight and reads as a broken component.
-    pub fn with_cache_served(mut self, cached: u64, generated: u64) -> Self {
-        self.cached = cached;
-        self.generated = generated;
-        self
-    }
-
-    /// Whole percent, but never 100 unless every request was cache-served.
-    fn cached_share(&self) -> Option<String> {
-        let total = self.cached + self.generated;
-        if total == 0 {
-            return None;
-        }
-        let pct = (self.cached as f64 * 100.0 / total as f64).round() as u64;
-        Some(if pct >= 100 && self.generated > 0 {
-            ">99%".to_string()
-        } else {
-            format!("{pct}%")
-        })
     }
 
     fn state_color(&self) -> Color {
@@ -109,22 +70,6 @@ impl<'a> PrefetchSystemWidget<'a> {
             PrefetchState::HoldingTakeoff | PrefetchState::DeferredLoad => Color::Yellow,
             PrefetchState::Ramping { .. } => Color::Cyan,
             PrefetchState::Active => Color::Green,
-        }
-    }
-
-    /// Red once a wait outlasts the timeout, amber when p95 or max is past
-    /// half of it, green otherwise. The summary includes failed and timed-out
-    /// waits, so red is reachable.
-    fn latency_color(&self, summary: &LatencySummary) -> Color {
-        let timeout_us = self.generation_timeout.as_micros();
-        if u128::from(summary.max_us) > timeout_us {
-            Color::Red
-        } else if u128::from(summary.p95_us) * 2 > timeout_us
-            || u128::from(summary.max_us) * 2 > timeout_us
-        {
-            Color::Yellow
-        } else {
-            Color::Green
         }
     }
 
@@ -142,82 +87,35 @@ impl<'a> PrefetchSystemWidget<'a> {
         ])
     }
 
-    fn lane_line(&self) -> Line<'static> {
-        Line::from(vec![
-            Span::styled("             ", Style::default().fg(LABEL_COLOR)),
-            Span::styled(
-                format!(
-                    "lane {}/{} · {} queued",
-                    self.lane.running,
-                    self.lane.group,
-                    group_thousands(self.lane.queued)
-                ),
-                Style::default().fg(Color::White),
-            ),
-        ])
-    }
-
-    fn latency_line(&self) -> Line<'static> {
-        let label = Span::styled("   Latency:  ", Style::default().fg(LABEL_COLOR));
-        let neutral = Style::default().fg(LABEL_COLOR);
-        let share = self.cached_share();
-        let Some(summary) = self.latency else {
-            let text = match &share {
-                None => "no FUSE requests yet".to_string(),
-                Some(share) => format!("no FUSE generations yet │ {share} cached"),
-            };
-            return Line::from(vec![label, Span::styled(text, neutral)]);
-        };
-        let figures = format!(
-            "p50 {} │ p95 {} │ max {}",
-            format_latency(summary.median_us),
-            format_latency(summary.p95_us),
-            format_latency(summary.max_us)
+    /// How much of the lane's capacity is in use, as a meter and a whole
+    /// percent, then the jobs waiting for admission. Raw job counts against
+    /// the group size meant nothing to a user; a share of capacity does.
+    fn capacity_line(&self) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            "   Capacity: ",
+            Style::default().fg(LABEL_COLOR),
+        )];
+        spans.extend(
+            ProgressBar::from_usize(self.lane.running, self.lane.group, CAPACITY_METER_WIDTH)
+                .filled_color(Color::Cyan)
+                .to_spans(),
         );
-        let mut spans = vec![
-            label,
-            Span::styled(
-                figures,
-                Style::default().fg(self.latency_color(self.recent.unwrap_or(summary))),
-            ),
-        ];
-        // The share keeps the neutral style so it never competes with the
-        // amber or red of the latency figures.
-        if let Some(share) = share {
-            spans.push(Span::styled(format!(" │ {share} cached"), neutral));
-        }
-        // Timeouts stay amber whatever the latency colour: each one handed
-        // X-Plane a placeholder, so the count must not read as routine.
-        if self.timeouts > 0 {
-            let noun = if self.timeouts == 1 {
-                "timeout"
-            } else {
-                "timeouts"
-            };
-            spans.push(Span::styled(
-                format!(" │ {} {noun}", self.timeouts),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
+        spans.push(Span::styled(
+            format!(" {:>3}%", self.lane.utilisation_percent()),
+            Style::default().fg(Color::White),
+        ));
+        spans.push(Span::styled(
+            format!(" │ {} queued", group_thousands(self.lane.queued)),
+            Style::default().fg(LABEL_COLOR),
+        ));
         Line::from(spans)
     }
 }
 
 impl Widget for PrefetchSystemWidget<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let text = vec![self.state_line(), self.lane_line(), self.latency_line()];
+        let text = vec![self.state_line(), self.capacity_line()];
         Paragraph::new(text).render(area, buf);
-    }
-}
-
-/// Microseconds as `180ms` or `1.4s`; sub-millisecond waits as `340us`.
-fn format_latency(us: u64) -> String {
-    if us >= 1_000_000 {
-        format!("{:.1}s", us as f64 / 1_000_000.0)
-    } else if us >= 1_000 {
-        format!("{}ms", us / 1_000)
-    } else {
-        format!("{us}us")
     }
 }
 
@@ -244,7 +142,7 @@ mod tests {
         queued: 1_904,
     };
 
-    fn render(widget: PrefetchSystemWidget<'_>) -> (Buffer, String) {
+    fn render(widget: PrefetchSystemWidget<'_>) -> String {
         let area = Rect::new(0, 0, 100, 3);
         let mut buf = Buffer::empty(area);
         widget.render(area, &mut buf);
@@ -255,195 +153,77 @@ mod tests {
             }
             out.push('\n');
         }
-        (buf, out)
+        out
     }
 
-    fn summary(median_ms: u64, p95_ms: u64, max_ms: u64) -> LatencySummary {
-        LatencySummary {
-            median_us: median_ms * 1_000,
-            p95_us: p95_ms * 1_000,
-            max_us: max_ms * 1_000,
-            count: 40,
-        }
+    fn widget_with(state: &PrefetchState, lane: LaneView) -> PrefetchSystemWidget<'_> {
+        PrefetchSystemWidget::new(state, FlightPhase::Cruise, None, lane)
     }
 
-    fn widget<'a>(
-        state: &'a PrefetchState,
-        latency: Option<&'a LatencySummary>,
-    ) -> PrefetchSystemWidget<'a> {
-        PrefetchSystemWidget::new(
-            state,
-            FlightPhase::Cruise,
-            None,
-            LANE,
-            latency,
-            Duration::from_secs(10),
-        )
+    /// The capacity row as rendered, from its label onwards.
+    fn capacity_row(out: &str) -> &str {
+        out.lines()
+            .find(|l| l.contains("Capacity:"))
+            .expect("capacity row")
+            .trim_end()
     }
 
-    /// Foreground colour of the first cell of `needle` on the latency row.
-    fn latency_fg(buf: &Buffer, out: &str, needle: &str) -> Color {
-        let row = out
-            .lines()
-            .position(|l| l.contains("Latency:"))
-            .expect("latency row");
-        let col = out.lines().nth(row).unwrap().find(needle).expect("needle");
-        let col = out.lines().nth(row).unwrap()[..col].chars().count();
-        buf[(col as u16, row as u16)].fg
+    #[test]
+    fn has_no_latency_row() {
+        let state = PrefetchState::Active;
+        let out = render(widget_with(&state, LANE));
+        assert!(
+            !out.contains("Latency:"),
+            "latency lives in Scenery System, got:\n{out}"
+        );
     }
 
     #[test]
     fn renders_the_state_label() {
         let state = PrefetchState::PausedForDemand;
-        let (_, out) = render(widget(&state, None));
+        let out = render(widget_with(&state, LANE));
         assert!(out.contains("Paused (demand)"), "got:\n{out}");
     }
 
     #[test]
-    fn renders_the_latency_summary() {
+    fn renders_lane_capacity_as_a_percentage_meter_with_the_queue() {
         let state = PrefetchState::Active;
-        let s = summary(180, 1_400, 3_900);
-        let (_, out) = render(widget(&state, Some(&s)));
-        assert!(
-            out.contains("p50 180ms │ p95 1.4s │ max 3.9s"),
-            "got:\n{out}"
+        let out = render(widget_with(&state, LANE));
+        // 28 of 30 running is 93%: nine of ten cells filled.
+        assert_eq!(
+            capacity_row(&out),
+            "   Capacity: █████████░  93% │ 1,904 queued"
         );
-        assert!(!out.contains("timeout"), "absent when zero, got:\n{out}");
+        assert!(!out.contains("28/30"), "no raw job counts, got:\n{out}");
     }
 
     #[test]
-    fn renders_timeouts_when_nonzero() {
+    fn capacity_meter_never_reads_above_100_percent() {
         let state = PrefetchState::Active;
-        let s = summary(180, 1_400, 3_900);
-        let (_, out) = render(widget(&state, Some(&s)).with_timeouts(2));
-        assert!(out.contains("max 3.9s │ 2 timeouts"), "got:\n{out}");
+        let lane = LaneView {
+            running: 35,
+            group: 30,
+            queued: 0,
+        };
+        let out = render(widget_with(&state, lane));
+        assert_eq!(
+            capacity_row(&out),
+            "   Capacity: ██████████ 100% │ 0 queued"
+        );
     }
 
     #[test]
-    fn latency_is_green_amber_or_red_against_the_timeout() {
-        let state = PrefetchState::Active;
-
-        let calm = summary(100, 800, 2_000);
-        let (buf, out) = render(widget(&state, Some(&calm)));
-        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Green);
-
-        let slow = summary(100, 6_000, 9_000);
-        let (buf, out) = render(widget(&state, Some(&slow)));
-        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Yellow);
-
-        let long_tail = summary(100, 800, 6_000);
-        let (buf, out) = render(widget(&state, Some(&long_tail)));
-        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Yellow);
-
-        let timed_out = summary(100, 6_000, 10_500);
-        let (buf, out) = render(widget(&state, Some(&timed_out)));
-        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Red);
-    }
-
-    #[test]
-    fn numbers_come_from_session_and_colour_from_recent() {
-        let state = PrefetchState::Active;
-        let session = summary(100, 6_000, 12_000);
-        let recent = summary(90, 400, 900);
-        let (buf, out) = render(widget(&state, Some(&session)).with_recent(Some(&recent)));
-        assert!(out.contains("max 12.0s"), "got:\n{out}");
-        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Green);
-
-        let bad_recent = summary(100, 6_000, 11_000);
-        let calm_session = summary(100, 800, 2_000);
-        let (buf, out) = render(widget(&state, Some(&calm_session)).with_recent(Some(&bad_recent)));
-        assert_eq!(latency_fg(&buf, &out, "p50"), Color::Red);
-    }
-
-    #[test]
-    fn renders_a_placeholder_without_a_sample() {
+    fn capacity_meter_is_empty_when_the_lane_size_is_unknown() {
         let state = PrefetchState::Idle;
-        let (_, out) = render(widget(&state, None).with_cache_served(5, 0));
-        assert!(
-            out.contains("Latency:  no FUSE generations yet"),
-            "got:\n{out}"
+        let lane = LaneView {
+            running: 0,
+            group: 0,
+            queued: 0,
+        };
+        let out = render(widget_with(&state, lane));
+        assert_eq!(
+            capacity_row(&out),
+            "   Capacity: ░░░░░░░░░░   0% │ 0 queued"
         );
-    }
-
-    #[test]
-    fn renders_no_requests_before_any_fuse_request() {
-        let state = PrefetchState::Idle;
-        let (_, out) = render(widget(&state, None));
-        assert!(
-            out.contains("Latency:  no FUSE requests yet"),
-            "got:\n{out}"
-        );
-        assert!(!out.contains("cached"), "got:\n{out}");
-    }
-
-    #[test]
-    fn renders_fully_cached_when_requests_need_no_generation() {
-        let state = PrefetchState::Idle;
-        let (_, out) = render(widget(&state, None).with_cache_served(250, 0));
-        assert!(
-            out.contains("Latency:  no FUSE generations yet │ 100% cached"),
-            "got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn renders_the_cached_share_after_the_latency_figures() {
-        let state = PrefetchState::Active;
-        let s = summary(180, 1_400, 3_900);
-        let (_, out) = render(widget(&state, Some(&s)).with_cache_served(97, 3));
-        assert!(
-            out.contains("p50 180ms │ p95 1.4s │ max 3.9s │ 97% cached"),
-            "got:\n{out}"
-        );
-
-        let (_, out) = render(
-            widget(&state, Some(&s))
-                .with_cache_served(97, 3)
-                .with_timeouts(2),
-        );
-        assert!(
-            out.contains("97% cached │ 2 timeouts"),
-            "timeouts stay last, got:\n{out}"
-        );
-    }
-
-    #[test]
-    fn timeouts_are_amber_while_the_share_stays_neutral() {
-        let state = PrefetchState::Active;
-        let s = summary(180, 1_400, 3_900);
-        let (buf, out) = render(
-            widget(&state, Some(&s))
-                .with_cache_served(97, 3)
-                .with_timeouts(2),
-        );
-        assert_eq!(latency_fg(&buf, &out, "2 timeouts"), Color::Yellow);
-        assert_ne!(latency_fg(&buf, &out, "97% cached"), Color::Yellow);
-    }
-
-    #[test]
-    fn never_rounds_a_partial_share_up_to_100() {
-        let state = PrefetchState::Active;
-        let s = summary(100, 200, 300);
-        let (_, out) = render(widget(&state, Some(&s)).with_cache_served(999, 1));
-        assert!(out.contains(">99% cached"), "got:\n{out}");
-        assert!(!out.contains("100% cached"), "got:\n{out}");
-    }
-
-    #[test]
-    fn cached_segment_stays_neutral_when_latency_is_amber_or_red() {
-        let state = PrefetchState::Active;
-        for (p95, max, expected) in [(800, 6_000, Color::Yellow), (800, 11_000, Color::Red)] {
-            let s = summary(100, p95, max);
-            let (buf, out) = render(widget(&state, Some(&s)).with_cache_served(90, 10));
-            assert_eq!(latency_fg(&buf, &out, "p50"), expected);
-            assert_eq!(latency_fg(&buf, &out, "90% cached"), LABEL_COLOR);
-        }
-    }
-
-    #[test]
-    fn renders_the_lane_view() {
-        let state = PrefetchState::Active;
-        let (_, out) = render(widget(&state, None));
-        assert!(out.contains("lane 28/30 · 1,904 queued"), "got:\n{out}");
     }
 }

@@ -275,6 +275,10 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
                 .as_ref()
                 .or(config.xplane.scenery_dir.as_ref())
                 .and_then(|p| XPlaneEnvironment::from_custom_scenery_path(p).ok()),
+            xworld_pro: crate::ui::XworldProStatus::from_detection(
+                config.packages.xworld_pro,
+                ctx.xworld_pro(),
+            ),
         };
         run_tui(tui_config)?
     } else {

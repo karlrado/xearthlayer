@@ -88,6 +88,8 @@ pub struct XEarthLayerService {
     gpu_worker_handle: Option<JoinHandle<()>>,
     /// Shutdown token for the GPU pipeline worker.
     gpu_shutdown: Option<CancellationToken>,
+    /// The GPU the encoder selected (when `texture.compressor = gpu`).
+    gpu_adapter: Option<crate::system::GpuAdapter>,
 }
 
 impl XEarthLayerService {
@@ -143,6 +145,7 @@ impl XEarthLayerService {
         let dds_encoder = encoder_components.encoder;
         let gpu_worker_handle = encoder_components.gpu_worker_handle;
         let gpu_shutdown = encoder_components.gpu_shutdown;
+        let gpu_adapter = encoder_components.gpu_adapter;
 
         // 6. Create XEarthLayer runtime with cache bridges
         // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
@@ -257,6 +260,7 @@ impl XEarthLayerService {
             gc_scheduler_shutdown,
             gpu_worker_handle,
             gpu_shutdown,
+            gpu_adapter,
         })
     }
 
@@ -386,6 +390,11 @@ impl XEarthLayerService {
         self.cache_layer.as_ref().map(|cl| {
             Arc::clone(&cl.dds_disk_bridge()) as Arc<dyn crate::executor::DdsDiskCacheChecker>
         })
+    }
+
+    /// The GPU encoding textures, or `None` when a CPU encoder is in use.
+    pub fn gpu_adapter(&self) -> Option<&crate::system::GpuAdapter> {
+        self.gpu_adapter.as_ref()
     }
 
     /// The lit disk cache (generated night lighting payloads).

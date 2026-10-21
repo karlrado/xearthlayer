@@ -33,3 +33,18 @@ pub use prefs::{
 pub use recipe::{parse_recipe, BrightnessScale, Grid, Recipe, RecipeError, SUPPORTED_MAJOR};
 pub use service::{BlackLitSource, LitTextureSource, NightLitSource, DEFAULT_NIGHT_BRIGHTNESS};
 pub use store::{block_name, recipe_path, tile_name, FileIdentity, RecipeStore};
+
+/// What night lighting is actually doing this session, as decided when the
+/// ortho mount was built. Differs from `night.enabled` when the X-Plane
+/// installation behind the scenery path cannot be found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NightLighting {
+    /// `night.enabled` is off: every lit texture is a minimal black DDS.
+    #[default]
+    Off,
+    /// Lit textures are generated from recipes and the user's Laminar art.
+    Lit,
+    /// Enabled, but the X-Plane installation was not found, so lit textures
+    /// stay black.
+    Dark,
+}

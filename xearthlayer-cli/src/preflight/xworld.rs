@@ -50,34 +50,13 @@ impl Preflight<BootstrapContext> for XWorldProDetect {
         let Some(d) = ctx.xworld_pro() else {
             return Status::unsatisfied("X-World Pro detection has not run").remediable();
         };
-        let mut message = if let Some(e) = &d.read_error {
-            format!("X-World Pro: could not read {e}; XEarthLayer overlays are unchanged")
-        } else if !d.is_present() {
-            "packages.xworld_pro is on, but no X-World Pro was found in scenery_packs.ini; \
-             XEarthLayer overlays are unchanged"
-                .to_string()
-        } else {
-            let coverage = OverlayCoverage::from_detection(d);
-            if coverage.is_empty() {
-                "X-World Pro is installed but no continent is enabled; XEarthLayer overlays \
-                 are unchanged"
-                    .to_string()
-            } else if coverage.whole_planet {
-                "X-World Pro: the whole planet is active; all XEarthLayer overlays are off"
-                    .to_string()
-            } else {
-                format!(
-                    "X-World Pro: {} active; XEarthLayer overlays are off there",
-                    coverage.describe()
-                )
+        match coverage_report(d, config.packages.disable_overlays) {
+            CoverageReport::Info(message) => {
+                tracing::info!("{message}");
+                Status::Satisfied
             }
-        };
-        if config.packages.disable_overlays {
-            message.push_str(
-                " (packages.disable_overlays turns every XEarthLayer overlay off anyway)",
-            );
+            CoverageReport::Warn(message) => Status::Warning(message),
         }
-        Status::Warning(message)
     }
 
     fn remediate(
@@ -93,6 +72,58 @@ impl Preflight<BootstrapContext> for XWorldProDetect {
         ctx.set_xworld_pro(detect(&custom_scenery));
         Ok(Remedy::default())
     }
+}
+
+/// The detection outcome as a message: a report of what is active (logged)
+/// or a misconfiguration the user should see (printed as a warning).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoverageReport {
+    Info(String),
+    Warn(String),
+}
+
+/// Describe what X-World Pro detection found. Active continents are a report
+/// the dashboard's Status pane also shows; an unreadable file, support with
+/// nothing installed, or no enabled continent are worth the user's attention.
+pub fn coverage_report(
+    d: &xearthlayer::xworld_pro::Detection,
+    disable_overlays: bool,
+) -> CoverageReport {
+    let mut report = if let Some(e) = &d.read_error {
+        CoverageReport::Warn(format!(
+            "X-World Pro: could not read {e}; XEarthLayer overlays are unchanged"
+        ))
+    } else if !d.is_present() {
+        CoverageReport::Warn(
+            "packages.xworld_pro is on, but no X-World Pro was found in scenery_packs.ini; \
+             XEarthLayer overlays are unchanged"
+                .to_string(),
+        )
+    } else {
+        let coverage = OverlayCoverage::from_detection(d);
+        if coverage.is_empty() {
+            CoverageReport::Warn(
+                "X-World Pro is installed but no continent is enabled; XEarthLayer overlays \
+                 are unchanged"
+                    .to_string(),
+            )
+        } else if coverage.whole_planet {
+            CoverageReport::Info(
+                "X-World Pro: the whole planet is active; all XEarthLayer overlays are off"
+                    .to_string(),
+            )
+        } else {
+            CoverageReport::Info(format!(
+                "X-World Pro: {} active; XEarthLayer overlays are off there",
+                coverage.describe()
+            ))
+        }
+    };
+    if disable_overlays {
+        let (CoverageReport::Info(message) | CoverageReport::Warn(message)) = &mut report;
+        message.push_str(" (packages.disable_overlays turns every XEarthLayer overlay off anyway)");
+    }
+    report
 }
 
 /// What the user chose when the order is wrong.
@@ -285,8 +316,43 @@ mod tests {
             }
         ));
         XWorldProDetect.remediate(&mut c).unwrap();
+        // Active continents are a report, not a problem: it goes to the log
+        // and the dashboard's Status pane, not to the terminal.
+        assert_eq!(XWorldProDetect.inspect(&c), Status::Satisfied);
+        match coverage_report(c.xworld_pro().unwrap(), false) {
+            CoverageReport::Info(m) => assert!(m.contains("Europe"), "{m}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_whole_planet_is_logged_not_printed() {
+        let folders: Vec<String> = ["Africa", "America", "Asia", "Australia-Oceania", "Europe"]
+            .iter()
+            .map(|c| format!("simHeaven_X-WORLD-Pro_{c}-09-scenery"))
+            .collect();
+        let names: Vec<&str> = folders.iter().map(String::as_str).collect();
+        let ini: String = names.iter().map(|n| pack(n)).collect();
+        let (_d, mut c) = ctx(true, &names, &ini);
+        XWorldProDetect.remediate(&mut c).unwrap();
+
+        assert_eq!(XWorldProDetect.inspect(&c), Status::Satisfied);
+        assert_eq!(
+            coverage_report(c.xworld_pro().unwrap(), true),
+            CoverageReport::Info(
+                "X-World Pro: the whole planet is active; all XEarthLayer overlays are off \
+                 (packages.disable_overlays turns every XEarthLayer overlay off anyway)"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn a_setting_with_nothing_installed_still_warns_on_the_terminal() {
+        let (_d, mut c) = ctx(true, &[], "");
+        XWorldProDetect.remediate(&mut c).unwrap();
         match XWorldProDetect.inspect(&c) {
-            Status::Warning(m) => assert!(m.contains("Europe"), "{m}"),
+            Status::Warning(m) => assert!(m.contains("no X-World Pro was found"), "{m}"),
             other => panic!("{other:?}"),
         }
     }
