@@ -279,9 +279,12 @@ constraints described above.
 | 5 | `packages-installed` | Resolves the install location, requires it exists |
 | 6 | `resolve-custom-scenery` | Resolves X-Plane's Custom Scenery path |
 | 7 | `custom-scenery-exists` | Requires that path to exist |
-| 8 | `airport-icao` | Validates `--airport`, only when one was given |
-| 9 | `macfuse-available` | Requires macFUSE, macOS only |
-| 10 | `no-running-instance` | Refuses a second concurrent instance |
+| 8 | `xworld-pro-detect` | `run` only. Contributes the X-World Pro detection to the context when `packages.xworld_pro` is on; with it off, hints when X-World Pro is installed |
+| 9 | `xworld-pro-order` | Setting on: every enabled XEL entry must come after every enabled X-World Pro layer; reads the detection |
+| 10 | `xworld-pro-setup` | Setting on: warnings only (ortho library, mesh variants, install links, broken entries); reads the detection |
+| 11 | `airport-icao` | Validates `--airport`, only when one was given |
+| 12 | `macfuse-available` | Requires macFUSE, macOS only |
+| 13 | `no-running-instance` | Refuses a second concurrent instance |
 
 Two positions are themselves load-bearing.
 
@@ -296,6 +299,28 @@ built from the previous commit.
 **`no-running-instance` is last.** The lock is claimed only for a run that will
 actually proceed. Claiming it earlier would leave a lock file behind after a run
 that a later prerequisite rejected.
+
+### X-World Pro checks (#213)
+
+The three `xworld-pro-*` checks (user guide: `docs/x-world-pro.md`) live in
+`xearthlayer-cli/src/preflight/xworld.rs`; the detection and the rules behind
+them are in `xearthlayer/src/xworld_pro/` (`detect`, `packs`, `coverage`,
+`findings`). Detection reads `scenery_packs.ini` and resolves each X-World Pro
+folder with `std::fs::metadata`, so copied and symlinked folders are alike.
+
+`xworld-pro-detect` is the only one that contributes: its `remediate` stores a
+`xearthlayer::xworld_pro::Detection` in `BootstrapContext`, and `inspect`
+returns `Unsatisfied` (remediable) until it is there. The other two read it
+and return `Unsatisfied` naming it when absent. The overlay build later reads
+the same coverage through `OrchestratorConfig.xworld_pro`, so the continents
+the user is told about are the ones left out.
+
+`xworld-pro-order` takes an injected `ConfirmOrder` (the pattern of
+`migrate.rs`). A violation is a remediable `Unsatisfied`; `remediate` asks the
+confirmer for `Stop` or `Continue`, and `Continue` records the answer in the
+context so re-inspection returns `Warning`. `AskUserOrder` checks
+`!cfg!(test) && stdin().is_terminal()` and continues without a terminal, so no
+test or script blocks. `xworld-pro-setup` never fails a run.
 
 ### Execution
 

@@ -346,6 +346,8 @@ Installed packages appear in your Custom Scenery folder with names like:
 
 **Overlay packages** are installed to the package directory, then a symlink is automatically created in Custom Scenery pointing to the installed package. This allows X-Plane to access the overlay files directly without FUSE.
 
+If you also use SimHeaven X-World Pro, see [X-World Pro](x-world-pro.md) for how XEarthLayer leaves its overlays out where X-World Pro is active.
+
 ### Running XEarthLayer
 
 After installing packages, start XEarthLayer to mount them:
