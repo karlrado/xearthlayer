@@ -594,6 +594,18 @@ impl ServiceOrchestrator {
         self.mount_manager.get_service()
     }
 
+    /// The GPU encoding textures, or `None` when a CPU encoder is in use or
+    /// services are not initialized yet.
+    pub fn gpu_adapter(&self) -> Option<&crate::system::GpuAdapter> {
+        self.service().and_then(|s| s.gpu_adapter())
+    }
+
+    /// What night lighting is doing this session, decided when the ortho
+    /// mount was built.
+    pub fn night_lighting(&self) -> crate::night::NightLighting {
+        self.mount_manager.night_lighting()
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &OrchestratorConfig {
         &self.config

@@ -166,6 +166,8 @@ pub struct MountManager {
     generation_timeout_secs: u64,
     /// Whether the ortho mount serves generated night lighting (`night.enabled`).
     night_enabled: bool,
+    /// Outcome of the last night lit source resolution.
+    night_lighting: crate::night::NightLighting,
     /// Overall lit brightness multiplier (`night.brightness`).
     night_brightness: f64,
 }
@@ -192,6 +194,7 @@ impl MountManager {
             fuse_congestion_threshold: DEFAULT_FUSE_CONGESTION_THRESHOLD,
             generation_timeout_secs: DEFAULT_GENERATION_TIMEOUT_SECS,
             night_enabled: false,
+            night_lighting: crate::night::NightLighting::Off,
             night_brightness: crate::night::DEFAULT_NIGHT_BRIGHTNESS,
         }
     }
@@ -222,6 +225,29 @@ impl MountManager {
     /// but the X-Plane installation cannot be found, lit textures stay black.
     pub fn set_night_lighting(&mut self, enabled: bool) {
         self.night_enabled = enabled;
+    }
+
+    /// What night lighting is doing this session: off, lit, or enabled but
+    /// dark because the X-Plane installation was not found. `Off` until the
+    /// ortho mount is built.
+    pub fn night_lighting(&self) -> crate::night::NightLighting {
+        self.night_lighting
+    }
+
+    /// Resolve the lit source for the ortho mount and record the outcome for
+    /// [`night_lighting`](Self::night_lighting).
+    fn resolve_night_lit_source(
+        &mut self,
+        index: &OrthoUnionIndex,
+        disk: Option<Arc<dyn crate::cache::Cache>>,
+    ) -> Option<Arc<dyn crate::night::LitTextureSource>> {
+        let source = self.night_lit_source(index, disk);
+        self.night_lighting = if source.is_some() {
+            crate::night::NightLighting::Lit
+        } else {
+            crate::night::NightLighting::Dark
+        };
+        source
     }
 
     /// Overall lit brightness for the night lit source (`night.brightness`).
@@ -577,7 +603,7 @@ impl MountManager {
 
         if self.night_enabled {
             if let Some(source) =
-                self.night_lit_source(&index_for_prefetch, service.lit_disk_cache())
+                self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
             {
                 ortho_union_fs = ortho_union_fs.with_lit_source(source);
             }
@@ -1081,6 +1107,38 @@ mod tests {
         assert!(!manager.night_enabled);
         manager.set_night_lighting(true);
         assert!(manager.night_enabled);
+    }
+
+    #[test]
+    fn night_lighting_reports_off_when_disabled() {
+        let manager = MountManager::new();
+        assert_eq!(manager.night_lighting(), crate::night::NightLighting::Off);
+    }
+
+    #[test]
+    fn night_lighting_reports_lit_once_the_installation_is_found() {
+        let install = tempfile::tempdir().unwrap();
+        let scenery = install.path().join("Custom Scenery");
+        let mut manager = MountManager::with_scenery_path(&scenery);
+        manager.set_night_lighting(true);
+
+        let source = manager.resolve_night_lit_source(&OrthoUnionIndex::default(), None);
+
+        assert!(source.is_some());
+        assert_eq!(manager.night_lighting(), crate::night::NightLighting::Lit);
+    }
+
+    #[test]
+    fn night_lighting_reports_dark_when_the_installation_is_missing() {
+        let mut manager = MountManager::with_scenery_path(std::path::Path::new(
+            "/nonexistent/xel-test/X-Plane 12/Custom Scenery",
+        ));
+        manager.set_night_lighting(true);
+
+        let source = manager.resolve_night_lit_source(&OrthoUnionIndex::default(), None);
+
+        assert!(source.is_none());
+        assert_eq!(manager.night_lighting(), crate::night::NightLighting::Dark);
     }
 
     #[test]

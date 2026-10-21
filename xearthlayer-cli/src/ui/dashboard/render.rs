@@ -10,15 +10,18 @@
 //! ├─────────────────────────────────────────────────────────┤
 //! │ Aircraft Position (5 lines)                             │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Prefetch System (5 lines)                               │
+//! │ Prefetch System (4 lines) - state, capacity meter       │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Scenery System (8 lines) - 3-column                     │
+//! │ Scenery System (9 lines) - 3-column                     │
 //! │ TILE REQUESTS   │   QUEUE (3/12)   │  TILE PROCESSING   │
+//! │ Latency: p50 │ p95 │ max │ cached │ timeouts            │
 //! ├─────────────────────────────────────────────────────────┤
 //! │ Input/Output (8 lines) - 2-column                       │
 //! │ NETWORK              │ DISK                             │
 //! ├─────────────────────────────────────────────────────────┤
-//! │ Caches (6 lines)                                        │
+//! │ Caches (4 lines)                                        │
+//! ├─────────────────────────────────────────────────────────┤
+//! │ Status (8 lines) - frame rate, GPU, night, X-World Pro  │
 //! └─────────────────────────────────────────────────────────┘
 //! ```
 
@@ -40,8 +43,9 @@ use super::render_sections::inner_rect;
 use super::state::{PrefetchLaneConfig, PrewarmProgress};
 use super::utils::format_duration;
 use crate::ui::widgets::{
-    AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, InputOutputWidget,
-    LaneView, NetworkHistory, PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
+    AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, FeatureStatus,
+    FeatureStatusWidget, FuseLatencyWidget, InputOutputWidget, LaneView, NetworkHistory,
+    PrefetchSystemWidget, SceneryHistory, ScenerySystemWidget,
 };
 use xearthlayer::aircraft_position::AircraftPositionStatus;
 
@@ -70,6 +74,8 @@ pub fn render_ui(
     tile_progress_entries: &[RegionProgressEntry],
     update_info: Option<&UpdateInfo>,
     prefetch_lane: PrefetchLaneConfig,
+    feature_status: Option<&FeatureStatus>,
+    frame_rate: Option<u16>,
 ) {
     let size = frame.area();
 
@@ -77,10 +83,11 @@ pub fn render_ui(
     let mut constraints = vec![
         Constraint::Length(3), // Header
         Constraint::Length(5), // Aircraft Position (3 content lines + border + padding)
-        Constraint::Length(5), // Prefetch System (3 content lines + border + padding)
-        Constraint::Length(8), // Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
+        Constraint::Length(4), // Prefetch System (2 content lines + border + padding)
+        Constraint::Length(9), // Scenery System (3 columns + latency row + border + padding)
         Constraint::Length(8), // Input/Output (2-column)
-        Constraint::Length(6), // Caches
+        Constraint::Length(4), // Caches (2 content lines + border + padding)
+        Constraint::Length(8), // Status (4 content lines + padding above and below + borders)
     ];
     if update_info.is_some() {
         constraints.push(Constraint::Length(1)); // Update footer
@@ -100,9 +107,15 @@ pub fn render_ui(
     render_aircraft_position(frame, chunks[1], aircraft_position_status);
 
     // 3. Prefetch System (with restored padding)
-    render_prefetch_system(frame, chunks[2], prefetch_snapshot, snapshot, prefetch_lane);
+    render_prefetch_system(
+        frame,
+        chunks[2],
+        prefetch_snapshot,
+        snapshot,
+        prefetch_lane.group,
+    );
 
-    // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING)
+    // 4. Scenery System (3-column: REQUESTS | QUEUE | PROCESSING, then latency)
     let scenery_block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
@@ -116,7 +129,8 @@ pub fn render_ui(
         ScenerySystemWidget::new(snapshot)
             .with_health(control_plane_snapshot)
             .with_history(scenery_history)
-            .with_tile_progress(tile_progress_entries),
+            .with_tile_progress(tile_progress_entries)
+            .with_latency(fuse_latency(snapshot, prefetch_lane.generation_timeout)),
         scenery_inner,
     );
 
@@ -138,7 +152,7 @@ pub fn render_ui(
 
     // 6. Caches (compact format)
     let cache_block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(" Caches ", Style::default().fg(Color::Blue)));
     frame.render_widget(cache_block, chunks[5]);
@@ -148,9 +162,22 @@ pub fn render_ui(
         cache_inner,
     );
 
-    // 7. Update available footer (conditional)
+    // 7. Status (key features' state; closes the dashboard's frame)
+    let status_block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(" Status ", Style::default().fg(Color::Blue)));
+    frame.render_widget(status_block, chunks[6]);
+    if let Some(status) = feature_status {
+        frame.render_widget(
+            FeatureStatusWidget::new(status).with_frame_rate(frame_rate),
+            inner_rect(chunks[6], 1, 2),
+        );
+    }
+
+    // 8. Update available footer (conditional)
     if let Some(info) = update_info {
-        render_update_footer(frame, chunks[6], info);
+        render_update_footer(frame, chunks[7], info);
     }
 
     // Quit confirmation overlay (if active)
@@ -189,7 +216,7 @@ fn render_prefetch_system(
     area: Rect,
     prefetch: &PrefetchStatusSnapshot,
     telemetry: &TelemetrySnapshot,
-    lane_config: PrefetchLaneConfig,
+    lane_group: usize,
 ) {
     let block = Block::default()
         .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
@@ -212,7 +239,7 @@ fn render_prefetch_system(
         lane_busy,
         ..prefetch.state_inputs
     });
-    let lane = lane_view(telemetry, lane_config.group);
+    let lane = lane_view(telemetry, lane_group);
 
     frame.render_widget(
         PrefetchSystemWidget::new(
@@ -220,17 +247,35 @@ fn render_prefetch_system(
             prefetch.state_inputs.phase,
             prefetch.detailed_stats.as_ref(),
             lane,
-            telemetry.fuse_session_latency.as_ref(),
-            lane_config.generation_timeout,
-        )
+        ),
+        inner,
+    );
+}
+
+/// The FUSE latency line for the Scenery System pane.
+fn fuse_latency(
+    telemetry: &TelemetrySnapshot,
+    generation_timeout: Duration,
+) -> FuseLatencyWidget<'_> {
+    FuseLatencyWidget::new(telemetry.fuse_session_latency.as_ref(), generation_timeout)
         .with_recent(telemetry.fuse_latency.as_ref())
         .with_timeouts(telemetry.fuse_session_timeouts)
         .with_cache_served(
             telemetry.fuse_memory_cache_hits + telemetry.fuse_dds_disk_cache_hits,
             telemetry.fuse_jobs_submitted,
-        ),
-        inner,
-    );
+        )
+}
+
+/// X-Plane's frame rate for the Status pane, shown only while telemetry is
+/// connected: sim state keeps its last values after X-Plane goes away.
+pub(super) fn displayed_frame_rate(
+    telemetry: xearthlayer::aircraft_position::TelemetryStatus,
+    sim: Option<&xearthlayer::aircraft_position::web_api::sim_state::SimState>,
+) -> Option<u16> {
+    match telemetry {
+        xearthlayer::aircraft_position::TelemetryStatus::Connected => sim?.frame_rate,
+        xearthlayer::aircraft_position::TelemetryStatus::Disconnected => None,
+    }
 }
 
 fn lane_view(telemetry: &TelemetrySnapshot, group: usize) -> LaneView {
@@ -445,6 +490,27 @@ pub fn render_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frame_rate_shows_only_while_telemetry_is_connected() {
+        use xearthlayer::aircraft_position::web_api::sim_state::SimState;
+        use xearthlayer::aircraft_position::TelemetryStatus;
+
+        let sim = SimState {
+            frame_rate: Some(45),
+            ..SimState::default()
+        };
+        assert_eq!(
+            displayed_frame_rate(TelemetryStatus::Connected, Some(&sim)),
+            Some(45)
+        );
+        // Sim state keeps its last values after X-Plane goes away.
+        assert_eq!(
+            displayed_frame_rate(TelemetryStatus::Disconnected, Some(&sim)),
+            None
+        );
+        assert_eq!(displayed_frame_rate(TelemetryStatus::Connected, None), None);
+    }
 
     #[test]
     fn lane_view_shows_the_lanes_job_counts() {

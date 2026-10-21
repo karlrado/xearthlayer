@@ -47,7 +47,7 @@ Packages with no continent keep their overlays, unless the whole planet is activ
 
 With `packages.xworld_pro = true`, `xearthlayer run` runs three preflight checks after it has found your Custom Scenery folder.
 
-**`xworld-pro-detect`** reports what it found, for example which continents are active and where XEarthLayer overlays are off. If the setting is on but nothing is found, it warns and changes nothing.
+**`xworld-pro-detect`** records what it found, for example which continents are active and where XEarthLayer overlays are off, in the log at INFO level; the dashboard's Status pane shows the active continents too. It prints a warning only when something needs your attention: the setting is on but nothing is found, no continent is enabled, or `scenery_packs.ini` cannot be read. In each of those cases it changes nothing.
 
 **`xworld-pro-order`** requires that every enabled XEarthLayer entry (`zzXEL_ortho`, and `yzXEL_overlay` when present) comes after every enabled X-World Pro layer in `scenery_packs.ini`. The library's position is not checked. If the order is wrong, it names the topmost enabled XEarthLayer entry and the lowest enabled X-World Pro layer, with their line numbers, and asks whether to stop or continue:
 

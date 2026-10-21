@@ -61,6 +61,8 @@ pub struct EncoderComponents {
     /// GPU worker handle (present when `texture.compressor = gpu`).
     /// Must be awaited during shutdown to ensure GPU resources are released.
     pub gpu_worker_handle: Option<tokio::task::JoinHandle<()>>,
+    /// The GPU the encoder selected (present when `texture.compressor = gpu`).
+    pub gpu_adapter: Option<crate::system::GpuAdapter>,
     /// Shutdown token for the GPU worker (present when `texture.compressor = gpu`).
     /// Cancelling this token causes the worker to exit its loop regardless of
     /// the channel state. Required because `spawn_blocking` threads are not
@@ -94,7 +96,7 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
             use crate::dds::gpu_channel::create_gpu_encoder_channel;
 
             let shutdown_token = tokio_util::sync::CancellationToken::new();
-            let (channel, worker_handle) =
+            let (channel, worker_handle, adapter) =
                 create_gpu_encoder_channel(config.texture().gpu_device(), shutdown_token.clone())
                     .map_err(|e| ServiceError::ConfigError(format!("GPU compressor: {e}")))?;
 
@@ -109,6 +111,7 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                     .with_mipmap_compressor(Arc::new(channel)),
                 ),
                 gpu_worker_handle: Some(worker_handle),
+                gpu_adapter: Some(adapter),
                 gpu_shutdown: Some(shutdown_token),
             })
         }
@@ -133,6 +136,7 @@ pub fn create_encoder(config: &ServiceConfig) -> Result<EncoderComponents, Servi
                     .with_compressor(compressor),
                 ),
                 gpu_worker_handle: None,
+                gpu_adapter: None,
                 gpu_shutdown: None,
             })
         }
@@ -181,7 +185,14 @@ mod tests {
             .build();
         let result = create_encoder(&config);
         match result {
-            Ok(components) => assert_eq!(components.encoder.extension(), "dds"),
+            Ok(components) => {
+                assert_eq!(components.encoder.extension(), "dds");
+                // The dashboard names the adapter the worker actually chose.
+                let adapter = components
+                    .gpu_adapter
+                    .expect("a GPU encoder reports its adapter");
+                assert!(!adapter.name.is_empty());
+            }
             Err(e) => assert!(
                 e.to_string().contains("GPU"),
                 "error should mention GPU, got: {e}"
@@ -235,5 +246,6 @@ mod tests {
             components.gpu_worker_handle.is_none(),
             "ISPC compressor should not have a GPU worker handle"
         );
+        assert!(components.gpu_adapter.is_none());
     }
 }

@@ -31,8 +31,8 @@ use xearthlayer::xplane::XPlaneEnvironment;
 
 use crate::error::CliError;
 use crate::ui::{
-    self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, LoadingPhase,
-    LoadingProgress, PrefetchLaneConfig, PrewarmProgress,
+    self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, EncoderStatus, FeatureStatus,
+    LoadingPhase, LoadingProgress, PrefetchLaneConfig, PrewarmProgress, XworldProStatus,
 };
 
 /// Configuration for starting the TUI application.
@@ -55,6 +55,8 @@ pub struct TuiAppConfig<'a> {
     pub airport_icao: Option<String>,
     /// X-Plane environment for apt.dat lookup and resource paths.
     pub xplane_env: Option<XPlaneEnvironment>,
+    /// X-World Pro support, from the preflight detection.
+    pub xworld_pro: XworldProStatus,
 }
 
 /// Run the TUI application with dashboard.
@@ -77,6 +79,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         ortho_packages,
         airport_icao,
         xplane_env,
+        xworld_pro,
     } = config;
 
     let dds_disk_max = (cfg.cache.disk_size as f64 * cfg.cache.dds_disk_ratio) as usize;
@@ -103,7 +106,8 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     let mut dashboard = Dashboard::with_state(dashboard_config, shutdown.clone(), initial_state)
         .map_err(|e| CliError::Config(format!("Failed to create dashboard: {}", e)))?
         .with_prefetch_status(Arc::clone(&prefetch_status))
-        .with_aircraft_position(aircraft_position.clone());
+        .with_aircraft_position(aircraft_position.clone())
+        .with_sim_state(orchestrator.sim_state());
 
     // Draw initial loading screen immediately
     dashboard
@@ -172,6 +176,17 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     if let Some(tile_progress_tracker) = orchestrator.tile_progress_tracker() {
         dashboard = dashboard.with_tile_progress_tracker(tile_progress_tracker);
     }
+
+    // Key features' state for the Status pane: what the service actually
+    // selected and resolved, not what the configuration asked for.
+    dashboard.set_feature_status(FeatureStatus {
+        encoder: match orchestrator.gpu_adapter() {
+            Some(adapter) => EncoderStatus::Gpu(adapter.clone()),
+            None => EncoderStatus::Cpu(cfg.texture.compressor.clone()),
+        },
+        night: orchestrator.night_lighting(),
+        xworld_pro,
+    });
 
     // Transition to Running state
     tracing::info!("Transitioning to Running state");
