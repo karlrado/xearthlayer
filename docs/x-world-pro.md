@@ -15,7 +15,7 @@ XEarthLayer never edits `scenery_packs.ini`, X-World Pro's files, or anything in
 
 Nothing changes until `packages.xworld_pro` is `true`. It defaults to `false`.
 
-- `xearthlayer setup` has a step, "Third-party Scenery" (Step 6), that looks for X-World Pro and asks "Give X-World Pro priority over XEarthLayer overlays?". Answer yes and it saves `true` and prints three messages: how to install X-World Pro for use with ortho scenery, a note on video memory and frame rate, and what XEarthLayer does on each start. Answer no and it saves `false` with a short note that XEarthLayer overlays may then draw over X-World Pro. If no X-World Pro is found it says so and saves `false`.
+- `xearthlayer setup` has a step, "Third-party Scenery" (Step 6), that looks for X-World Pro and asks "Give X-World Pro priority over XEarthLayer overlays?". Answer yes and it saves `true` and prints three messages: how to install X-World Pro for use with ortho scenery, a note on video memory and frame rate, and what XEarthLayer does on each start. Answer no and it saves `false` with a short note that XEarthLayer overlays may then draw over X-World Pro, followed by the same video memory note, which applies either way. If no X-World Pro is found it says so and saves `false`.
 - Or set it directly:
 
   ```bash

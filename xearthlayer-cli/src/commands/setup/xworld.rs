@@ -18,6 +18,21 @@ pub(super) const DECLINED_NOTE: &str = "X-World Pro keeps its normal priority. X
 overlays may then draw roads and buildings over X-World Pro's; you can change this later \
 with 'xearthlayer config set packages.xworld_pro true'.";
 
+/// Shown whatever the answer: it applies to anyone running X-World Pro with ortho.
+pub(super) const VRAM_NOTE: &str = "XEarthLayer and X-World Pro both use a lot of video \
+memory. On graphics cards with less than 24 GB, lower X-Plane's rendering settings if your \
+frame rate drops. X-World Pro with all layers costs about 5 to 10 fps on its own, even \
+without ortho.";
+
+/// What a "no" prints: the decline note, then the video memory note.
+pub(super) fn declined_lines() -> Vec<String> {
+    vec![
+        DECLINED_NOTE.to_string(),
+        String::new(),
+        VRAM_NOTE.to_string(),
+    ]
+}
+
 /// "SimHeaven X-World Pro detected: ..." or `None` when nothing is installed.
 pub(super) fn detected_line(d: &Detection) -> Option<String> {
     if !d.is_present() {
@@ -63,12 +78,7 @@ pub(super) fn guidance(
         out.extend(findings.iter().map(|f| format!("   - {}", f.message())));
     }
     out.push(String::new());
-    out.push(
-        "2. XEarthLayer and X-World Pro both use a lot of video memory. On graphics cards \
-         with less than 24 GB, lower X-Plane's rendering settings if your frame rate drops. \
-         X-World Pro with all layers costs about 5 to 10 fps on its own, even without ortho."
-            .to_string(),
-    );
+    out.push(format!("2. {VRAM_NOTE}"));
     out.push(String::new());
     let coverage = OverlayCoverage::from_detection(d);
     let where_ = if coverage.whole_planet {
@@ -115,7 +125,9 @@ pub(super) fn step_xworld(
             println!("{line}");
         }
     } else {
-        println!("{DECLINED_NOTE}");
+        for line in declined_lines() {
+            println!("{line}");
+        }
     }
     Ok(yes)
 }
@@ -185,6 +197,14 @@ mod tests {
             text.contains("simHeaven_X-WORLD-Pro_Manual_v1.1.pdf"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn declining_still_gives_the_vram_note() {
+        let text = declined_lines().join("\n");
+        assert!(text.contains(DECLINED_NOTE), "{text}");
+        assert!(text.contains("24 GB"), "{text}");
+        assert!(text.contains("5 to 10 fps"), "{text}");
     }
 
     #[test]
