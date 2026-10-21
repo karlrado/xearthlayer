@@ -58,6 +58,29 @@ impl OverlayCoverage {
     }
 }
 
+/// How the consolidated `yzXEL_overlay` folder is rebuilt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OverlayPlan {
+    /// `packages.disable_overlays`: remove the folder.
+    Remove,
+    /// X-World Pro is active: build it without the covered regions.
+    Except(OverlayCoverage),
+    /// Build it from every installed overlay package.
+    All,
+}
+
+/// The one rule for startup and the package commands: disabling overlays
+/// wins, then a non-empty X-World Pro coverage, else everything.
+pub fn overlay_plan(disable_overlays: bool, coverage: Option<&OverlayCoverage>) -> OverlayPlan {
+    if disable_overlays {
+        return OverlayPlan::Remove;
+    }
+    match coverage {
+        Some(c) if !c.is_empty() => OverlayPlan::Except(c.clone()),
+        _ => OverlayPlan::All,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +127,28 @@ mod tests {
         let c = coverage(&Continent::ALL, true);
         assert!(c.suppresses("NA-USA-MX-CENTRAL"));
         assert!(c.suppresses("XX-UNKNOWN"));
+    }
+
+    #[test]
+    fn disabling_overlays_wins_over_any_coverage() {
+        let c = coverage(&[Continent::Europe], false);
+        assert_eq!(overlay_plan(true, Some(&c)), OverlayPlan::Remove);
+        assert_eq!(overlay_plan(true, None), OverlayPlan::Remove);
+    }
+
+    #[test]
+    fn no_or_empty_coverage_builds_everything() {
+        assert_eq!(overlay_plan(false, None), OverlayPlan::All);
+        assert_eq!(
+            overlay_plan(false, Some(&OverlayCoverage::default())),
+            OverlayPlan::All
+        );
+    }
+
+    #[test]
+    fn non_empty_coverage_leaves_regions_out() {
+        let c = coverage(&[Continent::Europe], false);
+        assert_eq!(overlay_plan(false, Some(&c)), OverlayPlan::Except(c));
     }
 
     #[test]

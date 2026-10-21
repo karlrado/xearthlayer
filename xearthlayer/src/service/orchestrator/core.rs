@@ -20,6 +20,7 @@ use crate::prefetch::{
     SharedPrefetchStatus,
 };
 use crate::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
+use crate::xworld_pro::{overlay_plan, OverlayPlan};
 
 use super::super::error::ServiceError;
 use super::super::orchestrator_config::OrchestratorConfig;
@@ -240,43 +241,48 @@ impl ServiceOrchestrator {
         if let Some(ref cb) = callback {
             cb(StartupProgress::CreatingOverlay);
         }
-        let (overlay_success, overlay_error) = if self.config.disable_overlays {
-            match remove_consolidated_overlay(&self.config.custom_scenery_path) {
-                Ok(true) => {
-                    tracing::info!(
-                        "Removed consolidated overlay folder (packages.disable_overlays = true); \
-                         X-Plane will not load XEarthLayer overlays this session"
-                    );
-                    (true, None)
+        let (overlay_success, overlay_error) = match overlay_plan(
+            self.config.disable_overlays,
+            self.config.xworld_pro.as_ref(),
+        ) {
+            OverlayPlan::Remove => {
+                match remove_consolidated_overlay(&self.config.custom_scenery_path) {
+                    Ok(true) => {
+                        tracing::info!(
+                            "Removed consolidated overlay folder (packages.disable_overlays = true); \
+                             X-Plane will not load XEarthLayer overlays this session"
+                        );
+                        (true, None)
+                    }
+                    Ok(false) => (true, None),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to remove consolidated overlay");
+                        (false, Some(e.to_string()))
+                    }
                 }
-                Ok(false) => (true, None),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to remove consolidated overlay");
-                    (false, Some(e.to_string()))
+            }
+            plan => {
+                let overlay_result = match &plan {
+                    OverlayPlan::Except(coverage) => {
+                        let result = create_consolidated_overlay_except(
+                            store,
+                            &self.config.custom_scenery_path,
+                            &|region: &str| coverage.suppresses(region),
+                        );
+                        tracing::info!(
+                            covered = %coverage.describe(),
+                            excluded = ?result.excluded_regions,
+                            "X-World Pro active: XEarthLayer overlays left out there"
+                        );
+                        result
+                    }
+                    _ => create_consolidated_overlay(store, &self.config.custom_scenery_path),
+                };
+                if let Some(ref error) = overlay_result.error {
+                    tracing::warn!(error = %error, "Failed to create consolidated overlay");
                 }
+                (overlay_result.success, overlay_result.error.clone())
             }
-        } else if let Some(coverage) = self.config.xworld_pro.as_ref().filter(|c| !c.is_empty()) {
-            let overlay_result = create_consolidated_overlay_except(
-                store,
-                &self.config.custom_scenery_path,
-                &|region: &str| coverage.suppresses(region),
-            );
-            tracing::info!(
-                covered = %coverage.describe(),
-                excluded = ?overlay_result.excluded_regions,
-                "X-World Pro active: XEarthLayer overlays left out there"
-            );
-            if let Some(ref error) = overlay_result.error {
-                tracing::warn!(error = %error, "Failed to create consolidated overlay");
-            }
-            (overlay_result.success, overlay_result.error.clone())
-        } else {
-            let overlay_result =
-                create_consolidated_overlay(store, &self.config.custom_scenery_path);
-            if let Some(ref error) = overlay_result.error {
-                tracing::warn!(error = %error, "Failed to create consolidated overlay");
-            }
-            (overlay_result.success, overlay_result.error.clone())
         };
 
         // Phase 3: Start APT telemetry

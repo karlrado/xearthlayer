@@ -7,9 +7,10 @@ use std::path::Path;
 
 use xearthlayer::config::format_size;
 use xearthlayer::manager::{
-    create_consolidated_overlay, remove_overlay_symlink, InstallResult, InstalledPackage,
-    LocalPackageStore, MountStatus, PackageStatus,
+    create_consolidated_overlay, create_consolidated_overlay_except, remove_overlay_symlink,
+    InstallResult, InstalledPackage, LocalPackageStore, MountStatus, PackageStatus,
 };
+use xearthlayer::xworld_pro::{detect, overlay_plan, OverlayCoverage, OverlayPlan};
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
 
 use super::args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
@@ -261,6 +262,7 @@ fn rebuild_consolidated_overlay(
     install_dir: &std::path::Path,
     custom_scenery_path: &Option<std::path::PathBuf>,
     disable_overlays: bool,
+    xworld_pro: bool,
     ctx: &CommandContext<'_>,
 ) {
     if disable_overlays {
@@ -283,7 +285,24 @@ fn rebuild_consolidated_overlay(
 
     ctx.output.println("Rebuilding consolidated overlay...");
     let store = ctx.manager.create_store(install_dir);
-    let result = create_consolidated_overlay(&store, scenery_path);
+    // The same choice `xearthlayer run` makes at startup.
+    let coverage = xworld_pro
+        .then(|| OverlayCoverage::from_detection(&detect(scenery_path)))
+        .filter(|c| !c.is_empty());
+    let result = match overlay_plan(disable_overlays, coverage.as_ref()) {
+        OverlayPlan::Except(coverage) => {
+            let result = create_consolidated_overlay_except(&store, scenery_path, &|r: &str| {
+                coverage.suppresses(r)
+            });
+            ctx.output.println(&format!(
+                "X-World Pro active ({}): left out {} overlay regions",
+                coverage.describe(),
+                result.excluded_regions.len()
+            ));
+            result
+        }
+        _ => create_consolidated_overlay(&store, scenery_path),
+    };
     if result.success {
         ctx.output.success(&format!(
             "Consolidated overlay updated: {} regions, {} files",
@@ -363,6 +382,7 @@ impl InstallHandler {
                 &args.install_dir,
                 &args.custom_scenery_path,
                 args.disable_overlays,
+                args.xworld_pro,
                 ctx,
             );
         }
@@ -569,6 +589,7 @@ impl CommandHandler for UpdateHandler {
                 &args.install_dir,
                 &args.custom_scenery_path,
                 args.disable_overlays,
+                args.xworld_pro,
                 ctx,
             );
         }
@@ -661,6 +682,7 @@ impl CommandHandler for RemoveHandler {
                 &args.install_dir,
                 &args.custom_scenery_path,
                 args.disable_overlays,
+                args.xworld_pro,
                 ctx,
             );
         }
@@ -793,6 +815,7 @@ mod tests {
                     force,
                     custom_scenery_path: None,
                     disable_overlays: false,
+                    xworld_pro: false,
                 },
                 ctx,
             )
@@ -933,6 +956,7 @@ mod tests {
                     custom_scenery_path: None,
                     auto_install_overlays: auto_overlays,
                     disable_overlays: false,
+                    xworld_pro: false,
                     concurrent_downloads: 1,
                 },
                 ctx,
@@ -1103,6 +1127,7 @@ mod tests {
                     all: true,
                     custom_scenery_path: None,
                     disable_overlays: false,
+                    xworld_pro: false,
                     concurrent_downloads: 1,
                 },
                 ctx,
@@ -1162,5 +1187,102 @@ mod tests {
         let text = run.output.text();
         assert!(text.contains("Failed to update NA-CANADA-WEST"), "{text}");
         assert!(text.contains("1 succeeded, 1 failed"), "{text}");
+    }
+
+    // ------------------------------------------------------------------------
+    // consolidated overlay rebuild (X-World Pro)
+    // ------------------------------------------------------------------------
+
+    fn overlay_package(packages: &Path, region: &str) {
+        let folder = xearthlayer_package::package_mountpoint(region, PackageType::Overlay);
+        let dir = packages.join(&folder);
+        let grid = dir.join("Earth nav data/+30-120");
+        std::fs::create_dir_all(&grid).unwrap();
+        std::fs::write(
+            grid.join(if region == "na" {
+                "+33-119.dsf"
+            } else {
+                "+34-118.dsf"
+            }),
+            "dsf",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("xearthlayer_scenery_package.txt"),
+            format!(
+                "REGIONAL SCENERY PACKAGE\n1.0.0\n{}  1.0.0\n2024-01-01T00:00:00Z\nY\n{folder}\n\
+                 test.tar.gz\n1\n\nabc123  test.tar.gz  http://example.com/test.tar.gz\n",
+                region.to_uppercase()
+            ),
+        )
+        .unwrap();
+    }
+
+    /// Rebuild with an installed NA and EU overlay and X-World Pro Europe
+    /// enabled in `scenery_packs.ini`; returns what the user saw and the
+    /// regions left in `yzXEL_overlay`.
+    fn rebuild(disable_overlays: bool, xworld_pro: bool) -> (String, bool) {
+        let packages = tempfile::tempdir().unwrap();
+        overlay_package(packages.path(), "na");
+        overlay_package(packages.path(), "eu");
+        let scenery = tempfile::tempdir().unwrap();
+        let cs = scenery.path().join("Custom Scenery");
+        std::fs::create_dir_all(cs.join("simHeaven_X-WORLD-Pro_Europe-09-scenery")).unwrap();
+        std::fs::write(
+            cs.join("scenery_packs.ini"),
+            "SCENERY_PACK Custom Scenery/simHeaven_X-WORLD-Pro_Europe-09-scenery/\n",
+        )
+        .unwrap();
+        let manager = FakeManager::default();
+        let out = run(&manager, true, |ctx| {
+            rebuild_consolidated_overlay(
+                packages.path(),
+                &Some(cs.clone()),
+                disable_overlays,
+                xworld_pro,
+                ctx,
+            );
+            Ok(())
+        });
+        let folder = cs.join("yzXEL_overlay");
+        let eu_linked = std::fs::read_dir(folder.join("Earth nav data/+30-120"))
+            .map(|d| {
+                d.flatten()
+                    .any(|f| f.file_name().to_string_lossy().contains("+34-118"))
+            })
+            .unwrap_or(false);
+        (out.output.text(), eu_linked)
+    }
+
+    #[test]
+    fn package_commands_leave_x_world_pro_continents_out() {
+        let (text, eu_linked) = rebuild(false, true);
+        assert!(!eu_linked, "{text}");
+        assert!(text.contains("X-World Pro active (Europe)"), "{text}");
+        assert!(text.contains("left out 1 overlay regions"), "{text}");
+        assert!(
+            text.contains("Consolidated overlay updated: 1 regions"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn package_commands_build_everything_with_x_world_pro_off() {
+        let (text, eu_linked) = rebuild(false, false);
+        assert!(eu_linked, "{text}");
+        assert!(
+            text.contains("Consolidated overlay updated: 2 regions"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn disable_overlays_still_wins_over_x_world_pro() {
+        let (text, _) = rebuild(true, true);
+        assert!(
+            text.contains("skipping consolidated overlay rebuild"),
+            "{text}"
+        );
+        assert!(!text.contains("X-World Pro active"), "{text}");
     }
 }

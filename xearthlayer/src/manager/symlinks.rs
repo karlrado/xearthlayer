@@ -826,6 +826,42 @@ mod tests {
     }
 
     #[test]
+    fn test_consolidated_overlay_except_over_a_built_folder_drops_the_excluded_links() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        let na_dir = create_mock_overlay_with_dsf(packages_dir.path(), "na");
+        create_mock_overlay_with_dsf(packages_dir.path(), "eu");
+        let store = LocalPackageStore::new(packages_dir.path());
+        let plain = create_consolidated_overlay(&store, scenery_dir.path());
+        assert_eq!(plain.regions.len(), 2);
+
+        let result = create_consolidated_overlay_except(&store, scenery_dir.path(), &|r: &str| {
+            r.eq_ignore_ascii_case("na")
+        });
+        assert!(result.success, "Error: {:?}", result.error);
+        assert_eq!(result.regions, vec!["EU".to_string()]);
+        assert!(consolidated_overlay_exists(scenery_dir.path()));
+
+        let nav = scenery_dir
+            .path()
+            .join(CONSOLIDATED_OVERLAY_NAME)
+            .join("Earth nav data");
+        let mut links = 0;
+        for grid in fs::read_dir(&nav).unwrap().flatten() {
+            for f in fs::read_dir(grid.path()).unwrap().flatten() {
+                links += 1;
+                let target = fs::read_link(f.path()).unwrap();
+                assert!(
+                    !target.starts_with(&na_dir),
+                    "{} still points into the excluded package",
+                    f.path().display()
+                );
+            }
+        }
+        assert_eq!(links, 2);
+    }
+
+    #[test]
     fn test_consolidated_overlay_single_package() {
         let packages_dir = TempDir::new().unwrap();
         let scenery_dir = TempDir::new().unwrap();

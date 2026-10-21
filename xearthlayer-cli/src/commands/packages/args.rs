@@ -170,6 +170,9 @@ pub struct InstallArgs {
     /// folder X-Plane reads is left alone. The next `xearthlayer run` will
     /// remove any stale folder. See `packages.disable_overlays` config key.
     pub disable_overlays: bool,
+    /// `packages.xworld_pro`: leave the continents X-World Pro covers out of
+    /// the consolidated overlay, as `xearthlayer run` does.
+    pub xworld_pro: bool,
     /// Number of concurrent part downloads.
     pub concurrent_downloads: usize,
 }
@@ -186,6 +189,8 @@ pub struct UpdateArgs {
     pub custom_scenery_path: Option<PathBuf>,
     /// See `InstallArgs::disable_overlays`.
     pub disable_overlays: bool,
+    /// See `InstallArgs::xworld_pro`.
+    pub xworld_pro: bool,
     /// Number of concurrent part downloads.
     pub concurrent_downloads: usize,
 }
@@ -200,6 +205,8 @@ pub struct RemoveArgs {
     pub custom_scenery_path: Option<PathBuf>,
     /// See `InstallArgs::disable_overlays`.
     pub disable_overlays: bool,
+    /// See `InstallArgs::xworld_pro`.
+    pub xworld_pro: bool,
 }
 
 /// Arguments for the info command.
