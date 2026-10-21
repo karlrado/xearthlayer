@@ -180,9 +180,10 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
     // Key features' state for the Status pane: what the service actually
     // selected and resolved, not what the configuration asked for.
     dashboard.set_feature_status(FeatureStatus {
-        encoder: match orchestrator.gpu_adapter() {
-            Some(adapter) => EncoderStatus::Gpu(adapter.clone()),
-            None => EncoderStatus::Cpu(cfg.texture.compressor.clone()),
+        encoder: match (orchestrator.gpu_adapter(), orchestrator.gpu_warning()) {
+            (Some(adapter), Some(_)) => EncoderStatus::GpuSharedWithSim(adapter.clone()),
+            (Some(adapter), None) => EncoderStatus::Gpu(adapter.clone()),
+            (None, _) => EncoderStatus::Cpu(cfg.texture.compressor.clone()),
         },
         night: orchestrator.night_lighting(),
         xworld_pro,

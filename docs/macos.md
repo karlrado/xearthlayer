@@ -74,6 +74,16 @@ X-Plane **Web API** on every platform. The connection is automatic and requires
 no configuration, just make sure X-Plane's Web API is not disabled. Prefetching
 and adaptive scenery loading work normally through it.
 
+### Texture encoding stays on the CPU
+
+Apple Silicon has one GPU, shared with X-Plane's Metal renderer, and no
+Apple-native BC1/BC3 encoder. XEarthLayer therefore encodes DDS textures with
+the ISPC backend by default (`texture.compressor = ispc`), which ships prebuilt
+Apple Silicon kernels. Setting `texture.compressor = gpu` is honoured, but
+XEarthLayer logs a warning at startup and the dashboard's Status pane shows the
+GPU line in amber, because encoding would then compete with the simulator for
+the GPU. The setup wizard never selects `gpu` on a Mac.
+
 ### The mount's name in Finder
 
 Finder shows a mounted volume's name in place of the folder it is mounted on.

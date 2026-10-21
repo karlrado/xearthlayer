@@ -54,6 +54,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - `MipmapCompressor` trait for full-pipeline backends (GPU):
      - `GpuEncoderChannel` — Worker-side mipmap streaming, zero-clone channel transfer
    - `MipmapStream` — Memory-efficient iterator yielding one mipmap level at a time (no clones)
+   - `system::encoder_policy` (#203): `EncoderPolicy` chooses the backend from a `HardwareProfile` (the adapters wgpu enumerated). `DefaultEncoderPolicy` honours an explicit `texture.compressor`, warns (log and an amber Status-pane line) when `gpu` is honoured on a host whose only GPU is the one X-Plane renders with (every Apple Silicon Mac, any single-GPU PC), and picks ISPC with no preference; GPU is never auto-selected. The runtime encoder and the wizard's GPU step both go through it, and the profile comes from the one enumeration the GPU path already does (`GpuSelection.host`), never a second one
    - GPU encoding architecture: `mpsc` channel → dedicated pipeline worker → `GpuBlockCompressor`
    - `WgpuCompressor` wraps `block_compression` crate (ISPC kernels ported to WGSL compute shaders)
    - Worker-side tile processing: one channel round-trip per tile, GPU buffer reuse across mipmap levels

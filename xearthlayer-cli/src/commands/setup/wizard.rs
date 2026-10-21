@@ -26,7 +26,8 @@ use xearthlayer::config::{
 };
 use xearthlayer::provider::catalog::{find as find_provider, PROVIDERS};
 use xearthlayer::system::{
-    enumerate_gpus, GpuAdapter, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
+    enumerate_gpus, CompressorKind, DefaultEncoderPolicy, EncoderPolicy, GpuAdapter,
+    HardwareProfile, SystemInfo, MIN_DISK_CACHE_BYTES, MIN_MEMORY_CACHE_BYTES,
 };
 
 use crate::error::CliError;
@@ -717,32 +718,38 @@ fn prompt_memory_cache_size(
 /// `gpu_device` is always populated even when ISPC is selected so that
 /// switching to GPU later in `config set` doesn't require revisiting
 /// this step.
+///
+/// The choice goes through the [`EncoderPolicy`] (#203): with one GPU or
+/// none there is nothing to offer, because that GPU is the one X-Plane
+/// renders with, and the policy's default (ISPC) stands.
 fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
-    let adapters = enumerate_with_spinner();
+    let hw = HardwareProfile::new(enumerate_with_spinner());
+    let policy = DefaultEncoderPolicy;
+    let candidates = hw.encoding_candidates();
 
-    if adapters.len() < 2 {
-        // Single adapter (or none): GPU selection has no meaningful
-        // choice. Stick with the safer ISPC default.
-        if adapters.is_empty() {
-            println!(
+    if candidates.is_empty() {
+        match hw.adapters.first() {
+            None => println!(
                 "{}",
                 style("No GPU adapters detected — using ISPC (CPU-based, recommended).").cyan()
-            );
-        } else {
-            println!(
+            ),
+            Some(only) => println!(
                 "{}",
                 style(format!(
-                    "Single GPU detected ({}) — using ISPC (CPU-based, avoids competing with X-Plane).",
-                    adapters[0]
+                    "Single GPU detected ({only}) — using ISPC (CPU-based, avoids competing with X-Plane)."
                 ))
                 .cyan()
-            );
+            ),
         }
-        return Ok(("ispc".to_string(), "integrated".to_string()));
+        let decision = policy.select(&hw, None);
+        return Ok((
+            decision.backend.config_value().to_string(),
+            "integrated".to_string(),
+        ));
     }
 
     println!("Multiple GPUs detected:");
-    for (i, adapter) in adapters.iter().enumerate() {
+    for (i, adapter) in candidates.iter().enumerate() {
         println!("  {}. {}", i + 1, adapter);
     }
     println!();
@@ -756,7 +763,7 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
     println!();
 
     let mut items: Vec<String> = vec!["ISPC (CPU, recommended default)".to_string()];
-    for adapter in &adapters {
+    for adapter in candidates {
         items.push(format!("GPU: {}", adapter));
     }
 
@@ -769,17 +776,25 @@ fn step_encoding(theme: &ColorfulTheme) -> Result<(String, String), CliError> {
 
     if idx == 0 {
         println!("  {} ISPC (CPU)", style("✓").green());
-        Ok(("ispc".to_string(), "integrated".to_string()))
+        let decision = policy.select(&hw, Some(CompressorKind::Ispc));
+        Ok((
+            decision.backend.config_value().to_string(),
+            "integrated".to_string(),
+        ))
     } else {
-        let adapter = &adapters[idx - 1];
-        let gpu_device = adapter.config_value(&adapters);
+        let adapter = &candidates[idx - 1];
+        let gpu_device = adapter.config_value(&hw.adapters);
+        let decision = policy.select(&hw, Some(CompressorKind::Gpu));
+        if let Some(warning) = &decision.warning {
+            println!("{}", style(format!("⚠  {warning}")).yellow());
+        }
         println!(
             "  {} GPU: {} (config: {})",
             style("✓").green(),
             adapter,
             gpu_device
         );
-        Ok(("gpu".to_string(), gpu_device))
+        Ok((decision.backend.config_value().to_string(), gpu_device))
     }
 }
 

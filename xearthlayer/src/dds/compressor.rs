@@ -314,13 +314,13 @@ mod gpu {
         /// Returns `DdsError::CompressionFailed` if no matching adapter is found or
         /// device creation fails.
         pub fn try_new(gpu_device: &str) -> Result<Self, DdsError> {
-            let (device, queue, compressor, adapter) = create_gpu_resources(gpu_device)?;
+            let (device, queue, compressor, selection) = create_gpu_resources(gpu_device)?;
 
             Ok(Self {
                 device,
                 queue,
                 compressor: std::sync::Mutex::new(compressor),
-                adapter_name: adapter.to_string(),
+                adapter_name: selection.adapter.to_string(),
             })
         }
     }
@@ -337,8 +337,9 @@ mod gpu {
     ///
     /// # Returns
     ///
-    /// A tuple of `(Device, Queue, GpuBlockCompressor, adapter)`, where
-    /// `adapter` describes the GPU that was selected.
+    /// A tuple of `(Device, Queue, GpuBlockCompressor, selection)`, where
+    /// `selection` names the GPU that was selected and carries every GPU
+    /// the host offered, for the encoder policy (#203).
     pub fn create_gpu_resources(
         gpu_device: &str,
     ) -> Result<
@@ -346,7 +347,7 @@ mod gpu {
             wgpu::Device,
             wgpu::Queue,
             GpuBlockCompressor,
-            crate::system::GpuAdapter,
+            crate::system::GpuSelection,
         ),
         DdsError,
     > {
@@ -356,7 +357,15 @@ mod gpu {
         let adapters = crate::system::enumerate_gpus_raw();
         let adapter = crate::system::find_gpu(&adapters, gpu_device)
             .map_err(|e| DdsError::CompressionFailed(e.to_string()))?;
-        let selected = crate::system::GpuAdapter::from_wgpu(adapter);
+        let selected = crate::system::GpuSelection {
+            adapter: crate::system::GpuAdapter::from_wgpu(adapter),
+            host: crate::system::HardwareProfile::new(
+                adapters
+                    .iter()
+                    .map(crate::system::GpuAdapter::from_wgpu)
+                    .collect(),
+            ),
+        };
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("xearthlayer-dds"),
@@ -370,7 +379,7 @@ mod gpu {
 
         let compressor = GpuBlockCompressor::new(device.clone(), queue.clone());
 
-        tracing::info!(adapter = %selected, "GPU resources initialized");
+        tracing::info!(adapter = %selected.adapter, "GPU resources initialized");
 
         Ok((device, queue, compressor, selected))
     }
@@ -717,8 +726,12 @@ mod gpu_tests {
     fn test_create_gpu_resources_returns_adapter_name() {
         // Skip if no GPU available
         let result = create_gpu_resources("integrated");
-        if let Ok((_, _, _, adapter)) = result {
-            assert!(!adapter.name.is_empty());
+        if let Ok((_, _, _, selection)) = result {
+            assert!(!selection.adapter.name.is_empty());
+            assert!(
+                selection.host.adapters.contains(&selection.adapter),
+                "the host profile includes the selected adapter"
+            );
         }
     }
 
@@ -730,7 +743,7 @@ mod gpu_tests {
         // Either succeeds (GPU available) or fails with adapter error (no GPU)
         // — neither should panic from the error handler registration.
         match result {
-            Ok((_, _, _, adapter)) => assert!(!adapter.name.is_empty()),
+            Ok((_, _, _, selection)) => assert!(!selection.adapter.name.is_empty()),
             Err(_) => {} // No GPU available, that's fine
         }
     }

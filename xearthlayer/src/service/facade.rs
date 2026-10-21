@@ -90,6 +90,9 @@ pub struct XEarthLayerService {
     gpu_shutdown: Option<CancellationToken>,
     /// The GPU the encoder selected (when `texture.compressor = gpu`).
     gpu_adapter: Option<crate::system::GpuAdapter>,
+    /// The encoder policy's contention warning, when `gpu` was honoured on
+    /// a host whose only GPU is the one X-Plane renders with (#203).
+    gpu_warning: Option<String>,
 }
 
 impl XEarthLayerService {
@@ -146,6 +149,7 @@ impl XEarthLayerService {
         let gpu_worker_handle = encoder_components.gpu_worker_handle;
         let gpu_shutdown = encoder_components.gpu_shutdown;
         let gpu_adapter = encoder_components.gpu_adapter;
+        let gpu_warning = encoder_components.gpu_warning;
 
         // 6. Create XEarthLayer runtime with cache bridges
         // Clone metrics_client before passing to RuntimeBuilder (we need it for GC daemon)
@@ -261,6 +265,7 @@ impl XEarthLayerService {
             gpu_worker_handle,
             gpu_shutdown,
             gpu_adapter,
+            gpu_warning,
         })
     }
 
@@ -395,6 +400,12 @@ impl XEarthLayerService {
     /// The GPU encoding textures, or `None` when a CPU encoder is in use.
     pub fn gpu_adapter(&self) -> Option<&crate::system::GpuAdapter> {
         self.gpu_adapter.as_ref()
+    }
+
+    /// Why GPU encoding will contend with X-Plane on this host, or `None`
+    /// when it will not or a CPU encoder is in use (#203).
+    pub fn gpu_warning(&self) -> Option<&str> {
+        self.gpu_warning.as_deref()
     }
 
     /// The lit disk cache (generated night lighting payloads).
