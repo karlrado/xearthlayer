@@ -15,7 +15,7 @@ XEarthLayer never edits `scenery_packs.ini`, X-World Pro's files, or anything in
 
 Nothing changes until `packages.xworld_pro` is `true`. It defaults to `false`.
 
-- `xearthlayer setup` has a step, "Third-party Scenery" (Step 6), that looks for X-World Pro and asks "Give X-World Pro priority over XEarthLayer overlays?". Answer yes and it saves `true` and prints three messages: how to install X-World Pro for use with ortho scenery, a note on video memory and frame rate, and what XEarthLayer does on each start. Answer no and it saves `false` with a one-line note that XEarthLayer overlays may then draw over X-World Pro. If no X-World Pro is found it says so and saves `false`.
+- `xearthlayer setup` has a step, "Third-party Scenery" (Step 6), that looks for X-World Pro and asks "Give X-World Pro priority over XEarthLayer overlays?". Answer yes and it saves `true` and prints three messages: how to install X-World Pro for use with ortho scenery, a note on video memory and frame rate, and what XEarthLayer does on each start. Answer no and it saves `false` with a short note that XEarthLayer overlays may then draw over X-World Pro. If no X-World Pro is found it says so and saves `false`.
 - Or set it directly:
 
   ```bash
@@ -23,6 +23,8 @@ Nothing changes until `packages.xworld_pro` is `true`. It defaults to `false`.
   ```
 
 With the setting off and X-World Pro installed, `xearthlayer run` prints a one-line hint suggesting one of the two ways above, and otherwise behaves as before.
+
+`xearthlayer packages install`, `update` and `remove` follow the same rule: when they rebuild the consolidated overlay folder they leave out the continents X-World Pro covers, and say which regions were left out, so a package command no longer puts them back until the next `run`.
 
 `packages.disable_overlays = true` still turns every XEarthLayer overlay off, whatever `xworld_pro` says. The two settings combine: `disable_overlays` is all continents, `xworld_pro` is only the ones X-World Pro covers. Use `xworld_pro` when you want XEarthLayer overlays to remain on continents that X-World Pro does not cover.
 
@@ -47,7 +49,7 @@ With `packages.xworld_pro = true`, `xearthlayer run` runs three preflight checks
 
 **`xworld-pro-detect`** reports what it found, for example which continents are active and where XEarthLayer overlays are off. If the setting is on but nothing is found, it warns and changes nothing.
 
-**`xworld-pro-order`** requires that every enabled XEarthLayer entry (`zzXEL_ortho`, and `yzXEL_overlay` when present) comes after every enabled X-World Pro layer in `scenery_packs.ini`. The library's position is not checked. If the order is wrong, it names the first offending pair with their line numbers and asks whether to stop or continue:
+**`xworld-pro-order`** requires that every enabled XEarthLayer entry (`zzXEL_ortho`, and `yzXEL_overlay` when present) comes after every enabled X-World Pro layer in `scenery_packs.ini`. The library's position is not checked. If the order is wrong, it names the topmost enabled XEarthLayer entry and the lowest enabled X-World Pro layer, with their line numbers, and asks whether to stop or continue:
 
 - Stop: XEarthLayer exits. Reorder `scenery_packs.ini` as the "Scenery_packs.ini" section of the X-World Pro manual describes, then start again.
 - Continue: XEarthLayer starts and repeats the problem as a warning.
@@ -68,7 +70,7 @@ Follow the X-World Pro manual. The points that matter alongside XEarthLayer:
 1. In `scenery_packs.ini`, the manual's order: airports, regional scenery, global airports, X-World Pro packages, libraries, photo overlays, orthos last. XEarthLayer's entries (`yzXEL_overlay`, `zzXEL_ortho`) must come after every X-World Pro layer.
 2. Use the ortho library: replace `library.txt` in the X-World Pro library folder with the contents of `library - ortho.txt`. It removes the farmland, meadow and grass polygons that would otherwise cover the imagery.
 3. For any layer that ships two mesh versions, enable the `_O4XP-Mesh` one and disable its `_XP12-Mesh` twin. XEarthLayer packages use Ortho4XP meshes. In X-World Pro 1.1 only Europe's bridges have the pair.
-4. After an X-Plane update, run the library's install script (`install_XWP_Linux_Mac.sh`, from inside Custom Scenery) again. It links forest and boat files into X-Plane's `Resources`, and updates can remove those links.
+4. After an X-Plane update, run the library's install script (`install_XWP_Linux_Mac.sh`) again in the X-World Pro library folder inside Custom Scenery. It links forest and boat files into X-Plane's `Resources`, and updates can remove those links.
 
 ## Performance
 

@@ -280,7 +280,7 @@ constraints described above.
 | 6 | `resolve-custom-scenery` | Resolves X-Plane's Custom Scenery path |
 | 7 | `custom-scenery-exists` | Requires that path to exist |
 | 8 | `xworld-pro-detect` | `run` only. Contributes the X-World Pro detection to the context when `packages.xworld_pro` is on; with it off, hints when X-World Pro is installed |
-| 9 | `xworld-pro-order` | Setting on: every enabled XEL entry must come after every enabled X-World Pro layer; reads the detection |
+| 9 | `xworld-pro-order` | Setting on: every enabled XEL entry that will load must come after every enabled X-World Pro layer that resolves (the topmost XEL entry and the lowest layer are named); reads the detection |
 | 10 | `xworld-pro-setup` | Setting on: warnings only (ortho library, mesh variants, install links, broken entries); reads the detection |
 | 11 | `airport-icao` | Validates `--airport`, only when one was given |
 | 12 | `macfuse-available` | Requires macFUSE, macOS only |
@@ -309,11 +309,13 @@ them are in `xearthlayer/src/xworld_pro/` (`detect`, `packs`, `coverage`,
 folder with `std::fs::metadata`, so copied and symlinked folders are alike.
 
 `xworld-pro-detect` is the only one that contributes: its `remediate` stores a
-`xearthlayer::xworld_pro::Detection` in `BootstrapContext`, and `inspect`
-returns `Unsatisfied` (remediable) until it is there. The other two read it
+`xearthlayer::xworld_pro::Detection` in `BootstrapContext`, and with the setting on, `inspect`
+returns `Unsatisfied` (remediable) until it is there; with it off it returns the
+hint `Warning` or `Satisfied` and never contributes. The other two read it
 and return `Unsatisfied` naming it when absent. The overlay build later reads
 the same coverage through `OrchestratorConfig.xworld_pro`, so the continents
-the user is told about are the ones left out.
+the user is told about are the ones left out. Startup and the `packages`
+commands share one rule, `xworld_pro::overlay_plan` (`Remove`, `Except`, `All`).
 
 `xworld-pro-order` takes an injected `ConfirmOrder` (the pattern of
 `migrate.rs`). A violation is a remediable `Unsatisfied`; `remediate` asks the

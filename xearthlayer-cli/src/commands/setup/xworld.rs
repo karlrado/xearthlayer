@@ -44,13 +44,13 @@ pub(super) fn guidance(
     let mut out = vec![
         "1. Install X-World Pro as its manual describes:".to_string(),
         "   - in scenery_packs.ini, X-World Pro above the libraries, and XEarthLayer's \
-         entries (zzXEL_..., yzXEL_...) below every X-World Pro entry"
+         entries (zzXEL_..., yzXEL_...) below every X-World Pro layer (the library is not checked)"
             .to_string(),
         "   - the ortho library: 'library - ortho.txt' in place of library.txt".to_string(),
         "   - for any layer with two versions, the _O4XP-Mesh one enabled and the \
          _XP12-Mesh one disabled (Europe's bridges in X-World Pro 1.1)"
             .to_string(),
-        "   - after an X-Plane update, run the library's install script again".to_string(),
+        "   - after an X-Plane update, run the library's install script (install_XWP_Linux_Mac.sh) again in the X-World Pro library folder inside Custom Scenery".to_string(),
     ];
     if let Some(manual) = manual {
         out.push(format!("   Manual: {}", manual.display()));

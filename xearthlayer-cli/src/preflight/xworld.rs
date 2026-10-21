@@ -13,7 +13,7 @@ const ENABLE_HINT: &str = "SimHeaven X-World Pro detected. Run 'xearthlayer setu
 'xearthlayer config set packages.xworld_pro true', to give it priority over XEarthLayer overlays";
 
 const ORDER_HINT: &str = "Move XEarthLayer's entries (zzXEL_..., yzXEL_...) below every \
-X-World Pro entry in scenery_packs.ini, as the 'Scenery_packs.ini' section of the \
+X-World Pro layer in scenery_packs.ini, as the 'Scenery_packs.ini' section of the \
 X-World Pro manual describes, then start XEarthLayer again";
 
 fn xworld_on(ctx: &BootstrapContext) -> bool {
