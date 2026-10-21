@@ -169,13 +169,13 @@ git push origin vX.Y.Z
 gh run watch --repo samsoir/xearthlayer
 
 # Expected jobs (all should succeed):
-# ✓ Verify (~3-4 min)
-# ✓ Verify (macOS) (~10-15 min)
-# ✓ Build Release Binary (~4 min)
-# ✓ Prepare AUR Package (~10-15 min — see note below)
+# ✓ Verify (~4-5 min)
+# ✓ Verify (macOS) (~5 min)
+# ✓ Build Release Binary (~6 min)
+# ✓ Prepare AUR Package (~10-15 min, see note below)
 # ✓ Build RPM Package (~7-8 min)
-# ✓ Package Linux Binary (~10 sec)
-# ✓ Package macOS Binary (~5-6 min)
+# ✓ Package Linux Binary (~15 sec)
+# ✓ Package macOS Binary (~6 min)
 # ✓ Package Debian Package (~1 min)
 # ✓ Publish Release (~15 sec)
 ```
@@ -191,8 +191,13 @@ gh run watch --repo samsoir/xearthlayer
 > transient pacman-mirror failure stops the release. Recover with
 > `gh run rerun <run-id> --failed`; the tag is immutable and safe to re-run.
 
-macOS timings are estimates — the runner has fewer cores than `ubuntu-latest`. Replace
-them with measured values after the first `v0.5.0-dev.N` release.
+The macOS timings were measured on the first macOS release, `v0.5.0-dev.2`
+(2026-10-21): a preview took about 11.5 minutes end to end.
+
+> **Releases are immutable.** The repository has GitHub's immutable releases on:
+> once a release is published its assets cannot be replaced, and its tag can never
+> be reused, even after the release is deleted. A broken published release is fixed
+> by the next identifier, never by re-uploading.
 
 ### Step 6: Reconcile Asset Filenames, Then Merge PR
 
@@ -243,22 +248,21 @@ curl -s https://xearthlayer.app | grep -o 'v[0-9]\+\.[0-9]\+\.[0-9]\+'
 Changelog](https://keepachangelog.com/) format), under the usual
 Added / Changed / Fixed / Removed groups.
 
-**The changelog is compiled when a release is cut, not per-PR.** A feature PR
-leaves `CHANGELOG.md` alone; an empty `## [Unreleased]` section on a feature
-branch is correct and should not be flagged in review. At release-cut time the
-entries are written in one pass from the PRs merged since the last release
-tag:
+**Substantial work writes its own entry, in its own PR.** Since 2026-09-07 a
+PR that changes something a user will notice, or builds a framework or
+subsystem worth reconstructing later, adds its entry under `## [Unreleased]`
+as part of the change. A typo fix or a lint change still needs none.
+
+The changelog still describes *the product's* history rather than the
+repository's. One user-visible fix that took two PRs to land is **one** entry:
+the follow-up PR edits the first entry rather than adding a second. At release
+cut, read the whole `[Unreleased]` section once against the PRs merged since
+the last release tag, and merge or correct entries where the history only made
+sense in hindsight:
 
 ```bash
-git log v<last>..HEAD --merges --oneline    # the PRs to describe
+git log v<last>..HEAD --merges --oneline    # the PRs the section should cover
 ```
-
-Two reasons this beats writing entries as they land: every feature PR would
-otherwise conflict on the same few lines, and — more importantly — the
-changelog describes *the product's* history rather than the repository's. One
-user-visible fix that took two PRs to land (a follow-up carrying commits that
-missed the first merge, say) is **one** changelog entry, and that is only
-visible in hindsight.
 
 - Entries accumulate under `## [Unreleased]` across the development cycle,
   including across multiple previews.
@@ -274,7 +278,7 @@ software, and why it matters — not a restatement of the diff.
 ## Unstable / Preview Release
 
 Preview releases are cut from `develop/0.5.0` and published as GitHub **pre-releases**.
-They deliberately skip the stable end-user surfaces: no `version.json` change, no website
+They deliberately skip the stable end-user surfaces: no change to `version.json` on `main`, no website
 notification, no package library, and no `.deb`/`.rpm`/AUR artifacts. Only the Linux and
 macOS tarballs are published, so testers grab the binary directly from the release. The
 stable line on `main` stays authoritative for everything user-facing.
@@ -297,7 +301,7 @@ the `.deb`/`.rpm`/AUR jobs. `website-sync.yml` never fires because it only trigg
 
 ### When the identifier is bumped
 
-`develop/0.4.7` always carries the **next** unreleased identifier, not the last
+`develop/0.5.0` always carries the **next** unreleased identifier, not the last
 released one. The bump happens immediately *after* a preview ships, not as part
 of cutting the next one, so a binary built from `develop` never falsely claims
 to be a tag that testers already hold.
@@ -313,7 +317,7 @@ line matures. Never reuse an identifier — a tag is immutable once testers have
 it.
 
 ```
-0.4.7-alpha.1 → alpha.2 → … → beta.1 → beta.2 → … → rc.1 → … → 0.4.7
+0.5.0-alpha.1 → alpha.2 → … → beta.1 → beta.2 → … → rc.1 → … → 0.5.0
 ```
 
 `-dev.N` is for throwaway internal snapshots; use `-alpha.N` onwards for
@@ -324,7 +328,7 @@ anything handed to testers.
 The workflow prefers a hand-written notes file for the exact tag:
 
 ```
-.github/release-notes/v0.4.7-alpha.1.md
+.github/release-notes/v0.5.0-alpha.1.md
 ```
 
 If that file exists it becomes the release body verbatim. Otherwise the
@@ -347,65 +351,73 @@ extraction, unchanged.
 git checkout develop/0.5.0
 git pull origin develop/0.5.0
 
-# 2. Bump the pre-release identifier in Cargo.toml, then sync the lockfile
-#    [workspace.package] version = "0.5.0-dev.N"
-#    (increment N per preview: dev.0, dev.1, …; advance to -alpha/-beta/-rc as the
+# 2. Bump every version-carrying file to the preview identifier
+#    (increment N per stage: alpha.1, alpha.2, ...; advance to -beta/-rc as the
 #    line matures)
-#    Deliberately hand-edited rather than `make bump-version`: that tool also rewrites
-#    version.json, and previews must leave the stable end-user surfaces untouched.
-#    No drift results — the base version of X.Y.Z-dev.N is X.Y.Z, which the RPM spec
-#    and PKGBUILD already carry.
-cargo update -w
+make bump-version VERSION=0.5.0-alpha.N
 ```
 
-> **Do not use `make bump-version` for a preview.** It also rewrites
-> `pkg/rpm/xearthlayer.spec`, and RPM forbids `-` in a `Version:` field (it
-> separates Version from Release), so it would commit an invalid spec. The RPM
-> job is skipped for previews so nothing fails at the time — it fails later, on
-> the next stable release built from the committed spec. Edit `Cargo.toml`
-> directly. (`build-rpm` rewrites the version from the tag at build time, so the
-> spec's committed value is only ever a latent hazard, never the source of
-> truth.)
+`make bump-version` is safe for a preview. It writes the full version to
+`Cargo.toml`, `Cargo.lock` and `version.json`, and only the base version
+(`0.5.0`) to `pkg/rpm/xearthlayer.spec` and `pkg/arch/PKGBUILD`, whose version
+fields cannot contain a hyphen. `version.json` on `develop/0.5.0` is not a
+user-facing surface: the update checker and the website both read the copy on
+`main`, which a preview never touches.
+
+> **Semver orders pre-release labels alphabetically.** `0.5.0-alpha.1` sorts
+> *below* `0.5.0-dev.2`, and Cargo reports the bump as a downgrade. That is
+> harmless, because nothing compares two previews of the same line, but it is
+> why `-dev.N` must never be handed to testers once `-alpha.N` exists.
 
 ```bash
-# 3. Compile CHANGELOG "Unreleased" from PRs merged since the last release tag
-#    (see CHANGELOG Convention above). Do NOT date a section for a preview.
+# 3. Read CHANGELOG "Unreleased" against the PRs merged since the last release
+#    tag (see CHANGELOG Convention above). Do NOT date a section for a preview.
 
 # 4. Write the tester-facing notes for this exact tag
-#    .github/release-notes/v0.5.0-dev.N.md
+#    .github/release-notes/v0.5.0-alpha.N.md
 
 # 5. Verify, commit, and push on develop
 make pre-commit
-git add Cargo.toml Cargo.lock CHANGELOG.md .github/release-notes/
-git commit -m "chore(release): 0.5.0-dev.N"
+git add Cargo.toml Cargo.lock version.json CHANGELOG.md .github/release-notes/
+git commit -m "chore(release): 0.5.0-alpha.N"
 git push origin develop/0.5.0
 
 # 6. Tag from develop and push — this triggers the release workflow
-git tag v0.5.0-dev.N
-git push origin v0.5.0-dev.N
+git tag v0.5.0-alpha.N
+git push origin v0.5.0-alpha.N
 ```
 
 There is no release PR and no merge step: the preview lives entirely on `develop/0.5.0`.
+
+> **Rehearse first when a release job has changed.** `release.yml` runs only on a
+> tag push, so no PR check exercises it, and a tag handed to testers can never be
+> reused. When a release job has changed since the last tag, or a platform is
+> shipping for the first time, tag a throwaway `-dev.N` from the same commit
+> first, verify its assets (on the target platform, downloaded the way testers
+> will download them), then delete it with
+> `gh release delete v<version>-dev.N --cleanup-tag --yes`. `v0.5.0-dev.2` did
+> this for the first macOS tarball.
 
 Confirm the binary agrees with the tag before announcing it — nothing in CI
 cross-checks them, and the version testers paste into bug reports comes from
 `Cargo.toml`, not from the tag:
 
 ```bash
-xearthlayer --version   # must match the tag, e.g. 0.4.7-alpha.1
+xearthlayer --version   # must match the tag, e.g. 0.5.0-alpha.1
 ```
 
 ### Verify
 
 ```bash
-# Confirm it is a pre-release and NOT marked latest
-gh release view v0.5.0-dev.N --json isPrerelease,isLatest
-# Expect: {"isPrerelease": true, "isLatest": false}
+# Confirm it is a pre-release (gh has no isLatest field; the list shows it)
+gh release view v0.5.0-dev.N --json isPrerelease
+# Expect: {"isPrerelease": true}
 
 # Confirm the stable release is still "Latest"
 gh release list --limit 5
 
-# Confirm only the tarballs were attached (no .deb/.rpm/AUR)
+# Confirm only the four tarballs were attached (no .deb/.rpm/AUR):
+# xearthlayer and xearthlayer-publish, each for x86_64-linux and arm64-macos
 gh release view v0.5.0-dev.N --json assets --jq '.assets[].name'
 
 # Confirm the notes file was used, not the one-line fallback

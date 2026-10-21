@@ -44,13 +44,44 @@ ls /usr/local/lib/libfuse* /Library/Filesystems/macfuse.fs 2>/dev/null
 
 If the approval prompt never appeared, re-run the macFUSE installer after completing the Recovery steps.
 
-### 3. Build and run XEarthLayer
+### 3. Install XEarthLayer
+
+#### From a release build (Apple Silicon)
+
+Each release carries an `arm64-macos.tar.gz` tarball for Apple Silicon Macs.
+There is no Intel build; on an Intel Mac, build from source as below.
+
+The binary is not signed with an Apple Developer ID. A file downloaded in a
+browser is marked as quarantined, and macOS refuses to run an unsigned
+quarantined program, reporting that it cannot verify the developer. Clearing
+the mark once after extracting is enough:
+
+```bash
+cd ~/Downloads
+tar xzf xearthlayer-<version>-arm64-macos.tar.gz
+xattr -c xearthlayer                 # clear the download quarantine
+mkdir -p ~/.local/bin
+mv xearthlayer ~/.local/bin/
+xearthlayer --version
+```
+
+If `xearthlayer` is not found, `~/.local/bin` is not on your `PATH`. Add
+`export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` and open a new terminal.
+A tarball downloaded with `curl` instead of a browser is never quarantined, so
+the `xattr` step does nothing there.
+
+#### From source
 
 Building from source works exactly as on Linux:
 
 ```bash
 make release
 make install   # installs to ~/.local/bin
+```
+
+#### Then
+
+```bash
 xearthlayer setup
 ```
 
