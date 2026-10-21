@@ -10,6 +10,7 @@ use super::packs::PackEntry;
 
 const O4XP_SUFFIX: &str = "_O4XP-Mesh";
 const XP12_SUFFIX: &str = "_XP12-Mesh";
+const OVERLAY_ENTRY: &str = "yzXEL_overlay";
 const SEASONS: [&str; 4] = ["spr", "sum", "fal", "win"];
 
 /// An XEarthLayer entry loading above an X-World Pro layer.
@@ -33,18 +34,21 @@ impl OrderViolation {
     }
 }
 
-/// Every enabled XEarthLayer entry must load after every enabled X-World Pro
-/// layer. The library is not checked: it has no terrain.
+/// Every enabled XEarthLayer entry that will load must come after every enabled
+/// X-World Pro layer that will load. The library is not checked: it has no terrain.
 pub fn order_violation(d: &Detection) -> Option<OrderViolation> {
     let xel = d
         .xel_entries
         .iter()
         .filter(|e| e.enabled)
+        // XEarthLayer removes yzXEL_overlay itself (whole planet, disabled
+        // overlays); an absent folder is not loaded, so it cannot be misplaced.
+        .filter(|e| e.name() != OVERLAY_ENTRY || d.custom_scenery.join(OVERLAY_ENTRY).is_dir())
         .min_by_key(|e| e.line)?;
     let xwp = d
         .layers
         .iter()
-        .filter(|l| l.entry.enabled)
+        .filter(|l| l.entry.enabled && l.resolved)
         .map(|l| &l.entry)
         .max_by_key(|e| e.line)?;
     (xel.line < xwp.line).then(|| OrderViolation {
@@ -84,7 +88,8 @@ impl Finding {
             ),
             Finding::MissingInstallLink { expected } => format!(
                 "X-World Pro install link missing: {}. Run the library's install \
-                 script again from Custom Scenery (X-Plane updates can remove these links)",
+                 script (install_XWP_Linux_Mac.sh) again in the X-World Pro library folder \
+                 inside Custom Scenery (X-Plane updates can remove these links)",
                 expected.display()
             ),
             Finding::BrokenEntry { name, line } => format!(
@@ -244,6 +249,36 @@ mod tests {
         let ini = line(true, "zzXEL_ortho") + &line(false, EU09);
         let (_d, cs) = root(&[EU09], &ini);
         assert!(super::order_violation(&detect(&cs)).is_none());
+    }
+
+    #[test]
+    fn an_unresolved_layer_below_xel_is_not_a_violation() {
+        let ini = line(true, "zzXEL_ortho") + &line(true, EU09);
+        let (_d, cs) = root(&[], &ini);
+        assert!(super::order_violation(&detect(&cs)).is_none());
+    }
+
+    #[test]
+    fn a_missing_overlay_folder_is_not_a_violation() {
+        let ini = line(true, "yzXEL_overlay") + &line(true, EU09);
+        let (_d, cs) = root(&[EU09], &ini);
+        assert!(super::order_violation(&detect(&cs)).is_none());
+        std::fs::create_dir_all(cs.join("yzXEL_overlay")).unwrap();
+        let v = super::order_violation(&detect(&cs)).unwrap();
+        assert_eq!(v.xel.name(), "yzXEL_overlay");
+    }
+
+    #[test]
+    fn several_xel_entries_name_the_topmost_and_the_lowest_layer() {
+        let am = "simHeaven_X-WORLD-Pro_America-09-scenery";
+        let ini = line(true, "zzXEL_ortho")
+            + &line(true, EU09)
+            + &line(true, "yzXEL_overlay")
+            + &line(true, am);
+        let (_d, cs) = root(&[EU09, am, "yzXEL_overlay"], &ini);
+        let v = super::order_violation(&detect(&cs)).unwrap();
+        assert_eq!((v.xel.name(), v.xel.line), ("zzXEL_ortho", 1));
+        assert_eq!((v.xwp.name(), v.xwp.line), (am, 4));
     }
 
     #[test]

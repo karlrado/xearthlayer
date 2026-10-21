@@ -277,6 +277,26 @@ mod tests {
     }
 
     #[test]
+    fn xel_entries_are_recorded_including_the_overlay() {
+        let ini = line(true, EU09) + &line(true, "zzXEL_ortho") + &line(true, "yzXEL_overlay");
+        let (_d, cs) = root(&[EU09], &[], &ini);
+        let names: Vec<_> = detect(&cs)
+            .xel_entries
+            .iter()
+            .map(|e| e.name().to_string())
+            .collect();
+        assert_eq!(names, vec!["zzXEL_ortho", "yzXEL_overlay"]);
+    }
+
+    #[test]
+    fn a_disabled_entry_with_a_missing_folder_is_not_broken() {
+        let (_d, cs) = root(&[], &[], &line(false, EU09));
+        let d = detect(&cs);
+        assert!(d.is_present());
+        assert!(d.broken().is_empty());
+    }
+
+    #[test]
     fn antarctica_counts_as_australia_oceania() {
         let (_d, cs) = root(&[AN09], &[], &line(true, AN09));
         assert!(detect(&cs)
