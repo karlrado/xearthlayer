@@ -161,7 +161,7 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
 
     // Create ServiceOrchestrator configuration
     // This consolidates all config needed for backend services
-    let orch_config = OrchestratorConfig::from_config_file(
+    let mut orch_config = OrchestratorConfig::from_config_file(
         config,
         provider_config.clone(),
         service_config.clone(),
@@ -169,6 +169,11 @@ pub fn run(args: RunArgs, ctx: &BootstrapContext) -> Result<(), CliError> {
         install_location.clone(),
         use_tui,
     );
+    // X-World Pro (#213): preflight contributed the detection when
+    // packages.xworld_pro is on; overlay consolidation leaves those continents out.
+    orch_config.xworld_pro = ctx
+        .xworld_pro()
+        .map(xearthlayer::xworld_pro::OverlayCoverage::from_detection);
 
     // Start ServiceOrchestrator - this initializes:
     // - Cache services (CacheLayer with internal GC daemon)
