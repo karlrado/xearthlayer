@@ -25,13 +25,11 @@ pub struct PrefetchStatsSnapshot {
 /// GPS/telemetry connection status for UI display.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpsStatus {
-    /// XGPS2 configured and receiving data from X-Plane.
+    /// Receiving position data from X-Plane's Web API.
     Connected,
-    /// XGPS2 configured but not yet receiving data.
+    /// Waiting for the Web API: not yet connected, or its data is stale.
     #[default]
     Acquiring,
-    /// XGPS2 not configured; using FUSE-based position inference.
-    Inferred,
 }
 
 impl std::fmt::Display for GpsStatus {
@@ -39,7 +37,6 @@ impl std::fmt::Display for GpsStatus {
         match self {
             Self::Connected => write!(f, "Connected"),
             Self::Acquiring => write!(f, "Acquiring..."),
-            Self::Inferred => write!(f, "Inferred"),
         }
     }
 }
@@ -203,27 +200,6 @@ impl SharedPrefetchStatus {
     pub fn update_gps_status(&self, status: GpsStatus) {
         if let Ok(mut inner) = self.inner.write() {
             inner.gps_status = status;
-        }
-    }
-
-    /// Update the aircraft position from FUSE inference.
-    ///
-    /// This is a fallback when telemetry is unavailable - we infer
-    /// approximate position from DSF tile loading patterns.
-    /// Sets GPS status to Inferred.
-    pub fn update_inferred_position(&self, latitude: f64, longitude: f64) {
-        if let Ok(mut inner) = self.inner.write() {
-            // Only update if we don't have real telemetry
-            if inner.gps_status != GpsStatus::Connected {
-                inner.aircraft = Some(AircraftSnapshot {
-                    latitude,
-                    longitude,
-                    heading: 0.0,      // Unknown without telemetry
-                    ground_speed: 0.0, // Unknown without telemetry
-                    altitude: 0.0,     // Unknown without telemetry
-                });
-                inner.gps_status = GpsStatus::Inferred;
-            }
         }
     }
 

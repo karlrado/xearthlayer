@@ -9,8 +9,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
-
 use crate::config::defaults::{
     DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
 };
@@ -24,7 +22,6 @@ use crate::ortho_union::{
 use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use crate::scene_tracker::{DefaultSceneTracker, FuseAccessEvent};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use xearthlayer_package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
@@ -130,12 +127,6 @@ pub struct MountManager {
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
-    /// Scene Tracker for empirical X-Plane request tracking.
-    ///
-    /// This serves as the single source of truth for:
-    /// - Tile tracking (which DDS tiles X-Plane has requested)
-    /// - Burst detection (identifying loading patterns)
-    scene_tracker: Arc<DefaultSceneTracker>,
     /// Active patches union filesystem mount (if any).
     patches_session: Option<SpawnedMountHandle>,
     /// Patches mount info for display.
@@ -148,10 +139,6 @@ pub struct MountManager {
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
     consolidated_service: Option<XEarthLayerService>,
-    /// Scene Tracker event receiver for empirical scenery tracking.
-    /// This is populated when mounting consolidated ortho and can be retrieved
-    /// by the Scene Tracker via `take_scene_tracker_receiver()`.
-    scene_tracker_rx: Option<mpsc::UnboundedReceiver<FuseAccessEvent>>,
     /// OrthoUnionIndex for DSF tile enumeration (tile-based prefetch).
     /// This is populated when mounting consolidated ortho.
     ortho_union_index: Option<Arc<OrthoUnionIndex>>,
@@ -180,14 +167,12 @@ impl MountManager {
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
-            scene_tracker: Arc::new(DefaultSceneTracker::with_defaults()),
             patches_session: None,
             patches_mount: None,
             patches_service: None,
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
-            scene_tracker_rx: None,
             ortho_union_index: None,
             geo_index: None,
             fuse_max_background: DEFAULT_FUSE_MAX_BACKGROUND,
@@ -564,10 +549,6 @@ impl MountManager {
         let expected_dds_size = service.expected_dds_size();
         let runtime_handle = service.runtime_handle().clone();
 
-        // Create Scene Tracker event channel for empirical scenery tracking
-        // The sender goes to FUSE, the receiver goes to the Scene Tracker
-        let (scene_tracker_tx, scene_tracker_rx) = mpsc::unbounded_channel();
-
         // Store the index for tile-based prefetcher to use later
         let index_for_prefetch = Arc::new(index);
 
@@ -583,7 +564,6 @@ impl MountManager {
         let state_observer = Arc::new(state_observer);
 
         // Create and mount the consolidated ortho union filesystem with DDS access channel
-        // Wire Scene Tracker channel for empirical scenery tracking
         // Wire FUSE kernel limits for concurrent background request control
         // The client carries the pinned-tile budget it reports FUSE demand from,
         // so the filesystem accounts against the same one prefetch reads (#246).
@@ -593,7 +573,6 @@ impl MountManager {
             Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_state_observer(state_observer)
-                .with_scene_tracker_channel(scene_tracker_tx)
                 .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
                 .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
@@ -637,9 +616,6 @@ impl MountManager {
                 self.ortho_union_index = Some(index_for_prefetch);
                 self.geo_index = Some(geo_index);
 
-                // Store Scene Tracker receiver for empirical scenery tracking
-                self.scene_tracker_rx = Some(scene_tracker_rx);
-
                 tracing::info!(
                     mountpoint = %mountpoint.display(),
                     sources = source_count,
@@ -669,22 +645,6 @@ impl MountManager {
     /// Get consolidated ortho mount info (if mounted).
     pub fn consolidated_mount(&self) -> Option<&ActiveMount> {
         self.consolidated_mount.as_ref()
-    }
-
-    /// Take the Scene Tracker event receiver for empirical scenery tracking.
-    ///
-    /// This method takes ownership of the receiver, so it can only be called once.
-    /// The receiver is created when mounting consolidated ortho and is used by
-    /// the Scene Tracker to receive FUSE access events.
-    ///
-    /// # Returns
-    ///
-    /// `Some(receiver)` if consolidated ortho is mounted and receiver hasn't been taken,
-    /// `None` otherwise.
-    pub fn take_scene_tracker_receiver(
-        &mut self,
-    ) -> Option<mpsc::UnboundedReceiver<FuseAccessEvent>> {
-        self.scene_tracker_rx.take()
     }
 
     /// Get a reference to the OrthoUnionIndex for tile-based prefetching.
@@ -776,9 +736,6 @@ impl MountManager {
         // Clear tile-based prefetch resources
         self.ortho_union_index = None;
         self.geo_index = None;
-
-        // Clear Scene Tracker resources
-        self.scene_tracker_rx = None;
     }
 
     /// Get a reference to a mounted service (if any).
@@ -791,18 +748,6 @@ impl MountManager {
             .as_ref()
             .or(self.patches_service.as_ref())
             .or_else(|| self.services.values().next())
-    }
-
-    /// Get the Scene Tracker for empirical X-Plane request tracking.
-    ///
-    /// The Scene Tracker maintains an empirical model of what X-Plane has
-    /// requested, including:
-    /// - Which DDS tiles have been accessed
-    /// - Burst detection for loading patterns
-    /// - Geographic region tracking
-    ///
-    pub fn scene_tracker(&self) -> Arc<DefaultSceneTracker> {
-        Arc::clone(&self.scene_tracker)
     }
 
     /// Get aggregated telemetry from all mounted services.

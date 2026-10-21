@@ -258,12 +258,12 @@ Names ending `_LIT.dds` are lit textures for night lighting. They get their own 
 ### Open Flags for Virtual DDS Files
 
 The ortho union filesystem sets `VIRTUAL_DDS_OPEN_FLAGS` (single source of truth in
-`fuse/fuse3/shared.rs`) on virtual DDS inodes in `open()`. The value is
+`fuse/fuse3/ortho_union_fs.rs`) on virtual DDS inodes in `open()`. The value is
 platform-dependent:
 
 **Linux: `FOPEN_DIRECT_IO`** -- bypasses the kernel page cache for generated textures:
 
-- **Full observability** -- every X-Plane DDS read goes through the FUSE handler, visible to `FuseLoadMonitor` and `SceneTracker`
+- **Exact read counters** -- every X-Plane DDS read goes through the FUSE handler, so the `FuseRead` metrics count every read
 - **No stale data** -- page cache cannot serve outdated DDS data after provider changes or cache clears
 - **Reduced kernel memory** -- no page cache duplication of data already in the moka memory cache
 - Real passthrough files use default kernel caching (unchanged)
@@ -272,7 +272,7 @@ platform-dependent:
 texture loading under macFUSE (`EXC_BAD_ACCESS` in the sim's texture loader),
 so generated textures use normal kernel caching. Consequences:
 
-- **Reduced observability** -- once the kernel caches a DDS file, repeat reads never reach FUSE. `SceneTracker` and `DdsAccessEvent` only see the *cold first read* of each tile; `InferenceAdapter` position inference degrades to "tiles seen once since mount", so steady-state position tracking is effectively **Web API-only** on macOS
+- **Read counters under-report** -- once the kernel caches a DDS file, repeat reads never reach FUSE, so the `FuseRead` metrics count each tile's *cold first read* only. Nothing functional depends on per-read visibility: the position-inference and scene-tracker consumers that once did were deleted in #204, having had no production caller on any platform
 - **Prefetch is unaffected** in practice: the adaptive prefetcher is driven by Web API telemetry, and cold reads (the ones that matter for generation) always reach FUSE
 - Stale-data risk is acceptable: generated DDS content for a given tile/provider is immutable within a run
 ### Ranged Reads and Handle Reuse (#233, #234)
@@ -297,9 +297,6 @@ memory, so past `MAX_PINNED_TILE_BYTES` `open()` stops handing out memoising
 handles and reads fall back to resolving per call -- a throughput bound, never a
 correctness one. `open_dds_handles()` and `pinned_tile_bytes()` report the live
 figures.
-
-Because a tile is now produced once per open, `FuseAccessEvent` fires once per
-texture rather than once per ranged read.
 
 ### Synthesized DDS Attributes
 

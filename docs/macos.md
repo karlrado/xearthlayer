@@ -67,11 +67,11 @@ simulator), so generated textures are served through the normal kernel page
 cache instead.
 
 This is safe and transparent, with one side effect: once a texture is cached by
-the kernel, repeat reads never reach XEarthLayer. Position inference from file
-access patterns (`InferenceAdapter`) therefore only sees the *first* read of
-each tile, so in steady flight XEarthLayer relies on the X-Plane **Web API**
-for aircraft position. The Web API connection is automatic and requires no
-configuration — just make sure X-Plane's Web API is not disabled. Prefetching
+the kernel, repeat reads never reach XEarthLayer, so the FUSE read counters on
+the dashboard count each texture's first read only and under-report on macOS.
+Nothing else depends on seeing every read. Aircraft position comes from the
+X-Plane **Web API** on every platform. The connection is automatic and requires
+no configuration, just make sure X-Plane's Web API is not disabled. Prefetching
 and adaptive scenery loading work normally through it.
 
 ### The mount's name in Finder
