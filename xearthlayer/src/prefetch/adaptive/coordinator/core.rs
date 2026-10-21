@@ -61,7 +61,6 @@ use super::super::phase_detector::{FlightPhase, PhaseDetector};
 use super::super::prefetch_box::PrefetchBox;
 use super::super::strategy::PrefetchPlan;
 use super::super::transition_throttle::TransitionThrottle;
-use crate::scene_tracker::SceneTracker;
 
 use super::status::CoordinatorStatus;
 use super::telemetry::extract_track;
@@ -174,9 +173,6 @@ pub struct AdaptivePrefetchCoordinator {
     /// Sliding prefetch box for cruise-phase region detection.
     prefetch_box: PrefetchBox,
 
-    /// Scene tracker for observing X-Plane tile requests.
-    scene_tracker: Option<Arc<dyn SceneTracker>>,
-
     /// Scenery index for tile lookup (actual installed zoom levels).
     ///
     /// Used by the boundary prefetch path to discover which zoom levels
@@ -271,7 +267,6 @@ impl AdaptivePrefetchCoordinator {
             geo_index: None,
             boundary_strategy,
             prefetch_box,
-            scene_tracker: None,
             scenery_index: None,
             pending_tiles: Vec::new(),
             dds_disk_checker: None,
@@ -367,12 +362,6 @@ impl AdaptivePrefetchCoordinator {
     /// Tiles found on disk trigger promotion; tiles not found trigger demotion.
     pub fn with_dds_disk_checker(mut self, checker: Arc<dyn DdsDiskCacheChecker>) -> Self {
         self.dds_disk_checker = Some(checker);
-        self
-    }
-
-    /// Set the scene tracker for observing X-Plane tile requests.
-    pub fn with_scene_tracker(mut self, tracker: Arc<dyn SceneTracker>) -> Self {
-        self.scene_tracker = Some(tracker);
         self
     }
 
@@ -894,10 +883,6 @@ impl AdaptivePrefetchCoordinator {
         // if this cycle defers too.
         self.status.deferred_last_cycle = false;
 
-        // Always update shared status with current position to show TUI we're receiving telemetry
-        // This fixes the bug where prefetch status stayed "Idle" when no plan was generated
-        self.update_shared_status_position(position);
-
         // Drain pending tiles from a previous partial submission before generating
         // a new plan. This prevents the "fire-and-forget" bug where large boundary
         // plans lose tiles when the channel is full.
@@ -1042,7 +1027,7 @@ impl AdaptivePrefetchCoordinator {
         self.total_cache_hits += (plan.skipped_cached + total_filtered) as u64;
 
         // Update shared status for TUI
-        self.update_shared_status(position, &plan, submitted);
+        self.update_shared_status(&plan, submitted);
 
         tracing::debug!(
             tiles = submitted,
@@ -1344,22 +1329,15 @@ impl AdaptivePrefetchCoordinator {
         }
     }
 
-    fn update_shared_status(&self, position: (f64, f64), plan: &PrefetchPlan, submitted: usize) {
+    fn update_shared_status(&self, plan: &PrefetchPlan, submitted: usize) {
         if let Some(ref status) = self.shared_status {
             super::status_updater::update_status_with_plan(
                 status,
                 &self.status,
-                position,
                 plan,
                 submitted,
                 &self.cycle_stats(),
             );
-        }
-    }
-
-    fn update_shared_status_position(&self, position: (f64, f64)) {
-        if let Some(ref status) = self.shared_status {
-            super::status_updater::update_status_position(status, position);
         }
     }
 
@@ -1391,8 +1369,7 @@ mod tests {
     use crate::prefetch::adaptive::coordinator::test_support::{
         ground_state, make_scenery_index, make_scenery_index_covering, patched_region_area,
         test_calibration, test_plan, AlwaysHitDiskChecker, AlwaysHitMemoryCache,
-        BackpressureMockLane, CapLimitedLane, DummyTracker, HighLoadLane, MockDiskChecker,
-        StableBoundsTracker,
+        BackpressureMockLane, CapLimitedLane, HighLoadLane, MockDiskChecker,
     };
     // ─────────────────────────────────────────────────────────────────────────
     // Creation tests
@@ -1771,12 +1748,6 @@ mod tests {
         // Status should be updated to show Disabled
         let snapshot = shared_status.snapshot();
         assert_eq!(snapshot.coordinator_state(), PrefetchState::Disabled);
-
-        // Position should be updated
-        assert!(snapshot.aircraft.is_some());
-        let ac = snapshot.aircraft.unwrap();
-        assert!((ac.latitude - 53.5).abs() < 0.001);
-        assert!((ac.longitude - 9.5).abs() < 0.001);
     }
 
     // test_process_telemetry_updates_status_when_throttled was removed
@@ -1893,13 +1864,6 @@ mod tests {
     // ─────────────────────────────────────────────────────────────────────────
     // Boundary-driven prefetch integration tests (#58)
     // ─────────────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_coordinator_with_scene_tracker() {
-        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> = Arc::new(DummyTracker);
-        let coord = AdaptivePrefetchCoordinator::with_defaults().with_scene_tracker(tracker);
-        assert!(coord.scene_tracker.is_some());
-    }
 
     #[test]
     fn test_throttle_resets_on_landing() {
@@ -3097,9 +3061,6 @@ mod tests {
     fn test_region_maintenance_runs_when_no_plan_generated() {
         use crate::geo_index::{DsfRegion, GeoIndex, PrefetchedRegion};
 
-        // Wide window so center is far from edges
-        let tracker: Arc<dyn crate::scene_tracker::SceneTracker> =
-            Arc::new(StableBoundsTracker::with_bounds(45.0, 55.0, 0.0, 14.0));
         let geo_index = Arc::new(GeoIndex::new());
 
         // Pre-populate InProgress regions (simulating a previous boundary cycle)
@@ -3120,7 +3081,6 @@ mod tests {
             ..Default::default()
         };
         let mut coord = AdaptivePrefetchCoordinator::new(config)
-            .with_scene_tracker(tracker)
             .with_geo_index(Arc::clone(&geo_index))
             .with_scenery_index(Arc::clone(&scenery_index));
 

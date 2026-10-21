@@ -94,7 +94,7 @@ The findings are X-Plane's measured behaviour and still hold. The **Design Impac
 | No turn detection — purely position vs. loaded area | No TurnDetector needed; monitors handle turns naturally |
 | Window biased toward departure/heading direction | AC not always centered; bias affects which edge is closest |
 | Post-turn radius fill over 10-20 minutes | Low-priority lateral gap filling |
-| Initial load reveals window dimensions | Derive window size from SceneTracker during initial load |
+| Initial load reveals window dimensions | Window size is a measured constant; live derivation from FUSE reads was never wired, and its SceneTracker was deleted in #204 |
 | Diagonal flight fires both monitors independently | Both monitors check independently each cycle |
 | Map grid squares are ~0.5°, NOT 1° DSF tiles | Don't confuse X-Plane map grid with DSF boundaries |
 
@@ -339,7 +339,7 @@ Direction of flight →
 │                                                                     │
 │   ┌───────────────────────────────┐                                 │
 │   │   X-Plane Window              │   ┌───────────────────┐        │
-│   │   (inferred from SceneTracker)│   │  Target Window     │        │
+│   │   (assumed from measurements) │   │  Target Window     │        │
 │   │                               │   │  (what X-Plane     │        │
 │   │          ✈ aircraft           │───▶  will load next)   │        │
 │   │                               │   │                    │        │
@@ -357,7 +357,7 @@ Direction of flight →
 
 | Window | Source of Truth | Purpose |
 |--------|-----------------|---------|
-| **X-Plane Window** | SceneTracker (`loaded_regions()`, `loaded_bounds()`) + retention inference with buffer | What X-Plane currently holds in memory (inferred) |
+| **X-Plane Window** | `PrefetchBox::update_retention` (`RetainedRegion` layer): a box around the aircraft with a buffer. Inference from FUSE reads was deleted in #204 | What X-Plane currently holds in memory (assumed) |
 | **XEL Window** | GeoIndex `PrefetchedRegion` layer | What XEL has confirmed as cached (DSF region granularity) |
 | **Target Window** | The prefetch box (`PrefetchBox::bounds_with_shape`) | Everything X-Plane may load next; deliberately larger than the next row/column, so it contains them whichever edge the aircraft approaches |
 
@@ -1022,15 +1022,13 @@ budget plan completion time.
 
 ## Integration Points
 
-### SceneTracker Integration
+### SceneTracker Integration (removed)
 
-The `SceneryWindow` reads from the `SceneTracker` to:
-
-1. **Derive window dimensions**: `loaded_bounds()` during initial load
-2. **Track loaded regions**: `loaded_regions()` to update X-Plane Window
-3. **Detect bursts**: `subscribe_bursts()` for window derivation stability check
-
-The SceneTracker remains unchanged — it is a pure observer. The `SceneryWindow` is the interpretive layer.
+The `SceneTracker` that was to supply `loaded_bounds()` and `loaded_regions()`
+to a `SceneryWindow` was deleted in #204: nothing read it, and `SceneryWindow`
+itself has no live constructor. The X-Plane window is a retention box around
+the aircraft (`PrefetchBox::update_retention`), not an observation of FUSE
+reads.
 
 ### GeoIndex Integration
 

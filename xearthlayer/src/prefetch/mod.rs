@@ -55,9 +55,8 @@ pub use condition::{
 pub use error::PrefetchError;
 pub use listener::TelemetryListener;
 pub use state::{
-    resolve_state, AircraftSnapshot, AircraftState, BoxBoundsSnapshot, DetailedPrefetchStats,
-    GpsStatus, PrefetchState, PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus,
-    StateInputs,
+    resolve_state, AircraftState, BoxBoundsSnapshot, DetailedPrefetchStats, PrefetchState,
+    PrefetchStatsSnapshot, PrefetchStatusSnapshot, SharedPrefetchStatus, StateInputs,
 };
 pub use strategy::Prefetcher;
 

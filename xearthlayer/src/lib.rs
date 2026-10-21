@@ -44,7 +44,6 @@ pub mod prefetch;
 pub mod preflight;
 pub mod provider;
 pub mod runtime;
-pub mod scene_tracker;
 pub mod service;
 pub mod system;
 pub mod tasks;
