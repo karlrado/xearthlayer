@@ -52,6 +52,7 @@ pub mod texture;
 pub mod time;
 pub mod update;
 pub mod xplane;
+pub mod xworld_pro;
 
 /// Version of the XEarthLayer library and CLI.
 ///

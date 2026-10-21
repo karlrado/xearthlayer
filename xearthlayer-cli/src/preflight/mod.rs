@@ -19,6 +19,7 @@ pub mod migrate;
 pub mod paths;
 pub mod proposal;
 pub mod system;
+pub mod xworld;
 
 pub mod names {
     pub const LAYOUT_MIGRATION: &str = "layout-migration";
@@ -30,6 +31,9 @@ pub mod names {
     pub const PACKAGES_INSTALLED: &str = "packages-installed";
     pub const RESOLVE_CUSTOM_SCENERY: &str = "resolve-custom-scenery";
     pub const CUSTOM_SCENERY_EXISTS: &str = "custom-scenery-exists";
+    pub const XWORLD_PRO_DETECT: &str = "xworld-pro-detect";
+    pub const XWORLD_PRO_ORDER: &str = "xworld-pro-order";
+    pub const XWORLD_PRO_SETUP: &str = "xworld-pro-setup";
     pub const AIRPORT_ICAO: &str = "airport-icao";
     pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
     pub const NO_RUNNING_INSTANCE: &str = "no-running-instance";
@@ -136,6 +140,13 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
         detect_custom_scenery,
     )));
     runner.register(Box::new(paths::CustomSceneryExists));
+    // X-World Pro (#213): detection contributes what X-Plane will load, then the
+    // order (which may stop startup) and the setup advice read it.
+    runner.register(Box::new(xworld::XWorldProDetect));
+    runner.register(Box::new(xworld::XWorldProOrder::new(Box::new(
+        xworld::AskUserOrder,
+    ))));
+    runner.register(Box::new(xworld::XWorldProSetup));
     runner.register(Box::new(system::AirportIcao));
     runner.register(Box::new(system::MacFuseAvailable::with_probe(
         macfuse_probe,
@@ -342,6 +353,26 @@ mod tests {
             ctx.custom_scenery_path().is_some(),
             "no check contributed the Custom Scenery path"
         );
+        // With packages.xworld_pro off (the fixture's default) no detection is
+        // contributed; the X-World Pro checks only report.
+        assert!(ctx.xworld_pro().is_none());
+    }
+
+    #[test]
+    fn with_xworld_pro_on_the_pipeline_contributes_the_detection() {
+        let (_dir, env) = fabricate_complete_environment();
+        let text = std::fs::read_to_string(&env.config_path).unwrap();
+        assert!(text.contains("[packages]\n"));
+        std::fs::write(
+            &env.config_path,
+            text.replacen("[packages]\n", "[packages]\nxworld_pro = true\n", 1),
+        )
+        .unwrap();
+        let mut registry = build_registry_with(env);
+        let mut ctx = BootstrapContext::new("run", None);
+        let outcome = registry.enforce(&mut ctx).expect("no remediation failure");
+        assert!(matches!(outcome, RunOutcome::AllSatisfied), "{outcome:?}");
+        assert!(ctx.xworld_pro().is_some(), "detection contributed");
     }
 
     #[test]
@@ -382,6 +413,9 @@ mod tests {
                 names::PACKAGES_INSTALLED,
                 names::RESOLVE_CUSTOM_SCENERY,
                 names::CUSTOM_SCENERY_EXISTS,
+                names::XWORLD_PRO_DETECT,
+                names::XWORLD_PRO_ORDER,
+                names::XWORLD_PRO_SETUP,
                 names::AIRPORT_ICAO,
                 names::MACFUSE_AVAILABLE,
                 names::NO_RUNNING_INSTANCE,
@@ -455,6 +489,9 @@ mod tests {
             names::PACKAGES_INSTALLED,
             names::RESOLVE_CUSTOM_SCENERY,
             names::CUSTOM_SCENERY_EXISTS,
+            names::XWORLD_PRO_DETECT,
+            names::XWORLD_PRO_ORDER,
+            names::XWORLD_PRO_SETUP,
             names::AIRPORT_ICAO,
             names::MACFUSE_AVAILABLE,
             names::NO_RUNNING_INSTANCE,

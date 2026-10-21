@@ -202,6 +202,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `inspect` is pure and `remediate` acts, so the registry can also be run as a report; remediation is verified by a second inspection
     - Checks never call one another. A check reading an absent contributed value returns `Unsatisfied` **naming** it rather than unwrapping
     - Platform exclusion uses `cfg!` in `applies()`, not `#[cfg]`, so macOS-only checks are still compiled and tested on Linux
+    - X-World Pro (#213): `xworld-pro-detect` contributes `xearthlayer::xworld_pro::Detection` when `packages.xworld_pro` is on (hint only when off), `xworld-pro-order` stops or continues on a bad `scenery_packs.ini` order via an injected `ConfirmOrder`, `xworld-pro-setup` warns; overlay consolidation leaves active continents out via `OrchestratorConfig.xworld_pro`. See `docs/x-world-pro.md`
     - See `docs/dev/preflight-design.md`
 
 18. **GeoIndex** (`xearthlayer/src/geo_index/`)
@@ -429,6 +430,8 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer-cli/src/preflight/migrate.rs` | Layout migration check |
 | `xearthlayer-cli/src/preflight/proposal.rs` | Migration decision table and guidance (pure) |
 | `xearthlayer/src/preflight/` | Preflight framework: trait, Runner, BootstrapContext |
+| `xearthlayer/src/xworld_pro/` | SimHeaven X-World Pro detection, continent coverage, order rule, setup findings |
+| `xearthlayer-cli/src/preflight/xworld.rs` | The three `xworld-pro-*` checks and `ConfirmOrder` |
 | `xearthlayer-cli/src/preflight/` | The concrete startup checks and the registry |
 | `xearthlayer/src/geo_index/` | GeoIndex geospatial reference database |
 | `xearthlayer/src/ortho_union/` | Ortho union index module |

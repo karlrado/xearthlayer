@@ -41,6 +41,11 @@ pub(super) fn to_config_string(config: &ConfigFile) -> String {
     } else {
         "false"
     };
+    let xworld_pro = if config.packages.xworld_pro {
+        "true"
+    } else {
+        "false"
+    };
     let temp_dir = config
         .packages
         .temp_dir
@@ -149,6 +154,11 @@ auto_install_overlays = {}
 ; X-Plane reads is suppressed. Use this when running third-party overlay
 ; scenery (e.g., SimHeaven) that conflicts with XEL overlays. (default: false)
 disable_overlays = {}
+; Give SimHeaven X-World Pro priority over XEarthLayer overlays. On every
+; `xearthlayer run`, overlays are left out where X-World Pro is active and the
+; scenery order and X-World Pro setup are checked. Set by `xearthlayer setup`.
+; (default: false)
+xworld_pro = {}
 ; Temporary directory for package downloads
 ; Default: {temp_default}
 ; Large packages are downloaded here before extraction
@@ -277,6 +287,7 @@ brightness = {}
         custom_scenery_path,
         auto_install_overlays,
         disable_overlays,
+        xworld_pro,
         temp_dir,
         config.packages.concurrent_downloads,
         path_to_string(&config.logging.file),
@@ -375,5 +386,17 @@ mod tests {
         assert!(config.patches.directory.is_some());
         let dir = config.patches.directory.unwrap();
         assert!(dir.ends_with("patches"));
+    }
+
+    #[test]
+    fn xworld_pro_survives_a_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        config.packages.xworld_pro = true;
+        config.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("xworld_pro = true"), "{text}");
+        assert!(ConfigFile::load_from(&path).unwrap().packages.xworld_pro);
     }
 }

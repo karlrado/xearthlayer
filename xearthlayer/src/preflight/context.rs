@@ -35,6 +35,8 @@ pub struct BootstrapContext {
     config: Option<ConfigFile>,
     install_location: Option<PathBuf>,
     custom_scenery_path: Option<PathBuf>,
+    xworld_pro: Option<crate::xworld_pro::Detection>,
+    xworld_order_accepted: bool,
 }
 
 impl BootstrapContext {
@@ -46,6 +48,8 @@ impl BootstrapContext {
             config: None,
             install_location: None,
             custom_scenery_path: None,
+            xworld_pro: None,
+            xworld_order_accepted: false,
         }
     }
 
@@ -88,6 +92,27 @@ impl BootstrapContext {
     pub fn set_custom_scenery_path(&mut self, path: PathBuf) {
         self.custom_scenery_path = Some(path);
     }
+
+    /// SimHeaven X-World Pro detection, contributed when `packages.xworld_pro`
+    /// is on.
+    pub fn xworld_pro(&self) -> Option<&crate::xworld_pro::Detection> {
+        self.xworld_pro.as_ref()
+    }
+
+    /// Contribute the X-World Pro detection.
+    pub fn set_xworld_pro(&mut self, detection: crate::xworld_pro::Detection) {
+        self.xworld_pro = Some(detection);
+    }
+
+    /// The user chose to continue despite an X-World Pro order problem.
+    pub fn xworld_order_accepted(&self) -> bool {
+        self.xworld_order_accepted
+    }
+
+    /// Record that the user chose to continue despite the order problem.
+    pub fn accept_xworld_order(&mut self) {
+        self.xworld_order_accepted = true;
+    }
 }
 
 #[cfg(test)]
@@ -102,6 +127,17 @@ mod tests {
         assert!(ctx.config().is_none());
         assert!(ctx.install_location().is_none());
         assert!(ctx.custom_scenery_path().is_none());
+        assert!(ctx.xworld_pro().is_none());
+        assert!(!ctx.xworld_order_accepted());
+    }
+
+    #[test]
+    fn the_xworld_pro_detection_and_order_answer_are_contributed() {
+        let mut ctx = BootstrapContext::new("run", None);
+        ctx.set_xworld_pro(crate::xworld_pro::Detection::default());
+        ctx.accept_xworld_order();
+        assert!(ctx.xworld_pro().is_some());
+        assert!(ctx.xworld_order_accepted());
     }
 
     #[test]

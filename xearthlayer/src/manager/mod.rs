@@ -69,8 +69,9 @@ pub use installer::{InstallObserver, InstallResult, InstallStage, PackageInstall
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
 pub use symlinks::{
-    consolidated_overlay_exists, create_consolidated_overlay, remove_consolidated_overlay,
-    remove_overlay_symlink, ConsolidatedOverlayResult, CONSOLIDATED_OVERLAY_NAME,
+    consolidated_overlay_exists, create_consolidated_overlay, create_consolidated_overlay_except,
+    remove_consolidated_overlay, remove_overlay_symlink, ConsolidatedOverlayResult,
+    CONSOLIDATED_OVERLAY_NAME,
 };
 pub use traits::{ArchiveExtractor, LibraryClient, PackageDownloader, ProgressCallback};
 pub use updates::{PackageInfo, PackageStatus, UpdateChecker};

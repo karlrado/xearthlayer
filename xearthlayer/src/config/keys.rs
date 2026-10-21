@@ -71,6 +71,7 @@ pub enum ConfigKey {
     PackagesCustomSceneryPath,
     PackagesAutoInstallOverlays,
     PackagesDisableOverlays,
+    PackagesXworldPro,
     PackagesTempDir,
     PackagesConcurrentDownloads,
 
@@ -149,6 +150,7 @@ impl FromStr for ConfigKey {
             "packages.custom_scenery_path" => Ok(ConfigKey::PackagesCustomSceneryPath),
             "packages.auto_install_overlays" => Ok(ConfigKey::PackagesAutoInstallOverlays),
             "packages.disable_overlays" => Ok(ConfigKey::PackagesDisableOverlays),
+            "packages.xworld_pro" => Ok(ConfigKey::PackagesXworldPro),
             "packages.temp_dir" => Ok(ConfigKey::PackagesTempDir),
             "packages.concurrent_downloads" => Ok(ConfigKey::PackagesConcurrentDownloads),
 
@@ -216,6 +218,7 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath => "packages.custom_scenery_path",
             ConfigKey::PackagesAutoInstallOverlays => "packages.auto_install_overlays",
             ConfigKey::PackagesDisableOverlays => "packages.disable_overlays",
+            ConfigKey::PackagesXworldPro => "packages.xworld_pro",
             ConfigKey::PackagesTempDir => "packages.temp_dir",
             ConfigKey::PackagesConcurrentDownloads => "packages.concurrent_downloads",
             ConfigKey::LoggingFile => "logging.file",
@@ -327,6 +330,7 @@ impl ConfigKey {
                 config.packages.auto_install_overlays.to_string()
             }
             ConfigKey::PackagesDisableOverlays => config.packages.disable_overlays.to_string(),
+            ConfigKey::PackagesXworldPro => config.packages.xworld_pro.to_string(),
             ConfigKey::PackagesTempDir => config
                 .packages
                 .temp_dir
@@ -468,6 +472,10 @@ impl ConfigKey {
                 config.packages.disable_overlays =
                     v == "true" || v == "1" || v == "yes" || v == "on";
             }
+            ConfigKey::PackagesXworldPro => {
+                let v = value.to_lowercase();
+                config.packages.xworld_pro = v == "true" || v == "1" || v == "yes" || v == "on";
+            }
             ConfigKey::PackagesTempDir => {
                 config.packages.temp_dir = optional_path(value);
             }
@@ -598,6 +606,7 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath => Box::new(OptionalPathSpec),
             ConfigKey::PackagesAutoInstallOverlays => Box::new(BooleanSpec),
             ConfigKey::PackagesDisableOverlays => Box::new(BooleanSpec),
+            ConfigKey::PackagesXworldPro => Box::new(BooleanSpec),
             ConfigKey::PackagesTempDir => Box::new(OptionalPathSpec),
             ConfigKey::PackagesConcurrentDownloads => Box::new(IntegerRangeSpec::new(1, 10)),
             ConfigKey::LoggingFile => Box::new(PathSpec),
@@ -667,6 +676,7 @@ impl ConfigKey {
             ConfigKey::PackagesCustomSceneryPath,
             ConfigKey::PackagesAutoInstallOverlays,
             ConfigKey::PackagesDisableOverlays,
+            ConfigKey::PackagesXworldPro,
             ConfigKey::PackagesTempDir,
             ConfigKey::PackagesConcurrentDownloads,
             ConfigKey::LoggingFile,
@@ -1281,6 +1291,32 @@ mod tests {
 
         // Listed in all()
         assert!(ConfigKey::all().contains(&ConfigKey::PackagesDisableOverlays));
+    }
+
+    #[test]
+    fn test_packages_xworld_pro_round_trip() {
+        let key = ConfigKey::from_str("packages.xworld_pro").unwrap();
+        assert_eq!(key.name(), "packages.xworld_pro");
+        assert_eq!(key.section(), "packages");
+        assert!(!key.is_sensitive());
+
+        let mut config = ConfigFile::default();
+        assert_eq!(key.get(&config), "false");
+        assert!(!config.packages.xworld_pro);
+
+        for truthy in &["true", "1", "yes", "on", "TRUE"] {
+            key.set(&mut config, truthy).unwrap();
+            assert!(
+                config.packages.xworld_pro,
+                "Expected '{}' to set true",
+                truthy
+            );
+        }
+        key.set(&mut config, "false").unwrap();
+        assert!(!config.packages.xworld_pro);
+
+        assert!(key.validate("maybe").is_err());
+        assert!(ConfigKey::all().contains(&ConfigKey::PackagesXworldPro));
     }
 
     #[test]
