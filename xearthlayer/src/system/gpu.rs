@@ -105,6 +105,15 @@ impl fmt::Display for GpuAdapter {
     }
 }
 
+/// The adapter the encoder selected, with every adapter the host offered,
+/// so an [`EncoderPolicy`](super::EncoderPolicy) can judge the choice
+/// without enumerating again (#203).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuSelection {
+    pub adapter: GpuAdapter,
+    pub host: super::HardwareProfile,
+}
+
 /// Errors from [`find_adapter`] and related selection helpers.
 #[derive(Debug, Error)]
 pub enum GpuSelectError {

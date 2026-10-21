@@ -370,8 +370,9 @@ mod inner {
     /// Create a [`GpuEncoderChannel`] with a full-tile streaming worker.
     ///
     /// Initializes GPU resources and spawns the worker thread. Returns the
-    /// channel handle, the worker `JoinHandle`, and the adapter that was
-    /// selected (for display; the worker owns the device).
+    /// channel handle, the worker `JoinHandle`, and the selection: the
+    /// adapter chosen (for display; the worker owns the device) with the
+    /// host's other adapters for the encoder policy.
     ///
     /// # Errors
     ///
@@ -383,17 +384,17 @@ mod inner {
         (
             GpuEncoderChannel,
             tokio::task::JoinHandle<()>,
-            crate::system::GpuAdapter,
+            crate::system::GpuSelection,
         ),
         DdsError,
     > {
-        let (device, queue, compressor, adapter) = crate::dds::create_gpu_resources(gpu_device)?;
+        let (device, queue, compressor, selection) = crate::dds::create_gpu_resources(gpu_device)?;
 
-        tracing::info!(adapter = %adapter, "GPU pipeline worker starting");
+        tracing::info!(adapter = %selection.adapter, "GPU pipeline worker starting");
 
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
         let handle = spawn_gpu_worker(device, queue, compressor, rx, shutdown);
-        Ok((GpuEncoderChannel::new(tx), handle, adapter))
+        Ok((GpuEncoderChannel::new(tx), handle, selection))
     }
 }
 

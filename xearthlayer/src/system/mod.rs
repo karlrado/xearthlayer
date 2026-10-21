@@ -26,6 +26,7 @@
 //! - GTK4 desktop application (future)
 //! - Any other UI that needs hardware detection
 
+pub mod encoder_policy;
 pub mod filesystem;
 pub mod gpu;
 mod hardware;
@@ -34,10 +35,13 @@ mod recommendations;
 mod storage_detect;
 pub mod unmount;
 
+pub use encoder_policy::{
+    CompressorKind, DefaultEncoderPolicy, EncoderDecision, EncoderPolicy, HardwareProfile,
+};
 pub use filesystem::{fs_info, is_immutable_os, FilesystemInfo};
 pub use gpu::{
     enumerate as enumerate_gpus, enumerate_raw as enumerate_gpus_raw, find_adapter as find_gpu,
-    GpuAdapter, GpuKind, GpuSelectError,
+    GpuAdapter, GpuKind, GpuSelectError, GpuSelection,
 };
 pub use hardware::{detect_cpu_cores, detect_total_memory, StorageType, SystemInfo};
 pub use recommendations::{

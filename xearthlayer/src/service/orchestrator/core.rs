@@ -600,6 +600,12 @@ impl ServiceOrchestrator {
         self.service().and_then(|s| s.gpu_adapter())
     }
 
+    /// The encoder policy's warning that GPU encoding shares the GPU X-Plane
+    /// renders with, or `None` (#203).
+    pub fn gpu_warning(&self) -> Option<&str> {
+        self.service().and_then(|s| s.gpu_warning())
+    }
+
     /// What night lighting is doing this session, decided when the ortho
     /// mount was built.
     pub fn night_lighting(&self) -> crate::night::NightLighting {

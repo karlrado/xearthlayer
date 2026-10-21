@@ -20,6 +20,9 @@ use xearthlayer::xworld_pro::Detection;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EncoderStatus {
     Gpu(GpuAdapter),
+    /// `texture.compressor = gpu` honoured on a host whose only GPU is the
+    /// one X-Plane renders with, so encoding competes with the sim (#203).
+    GpuSharedWithSim(GpuAdapter),
     /// The `texture.compressor` value (`ispc` or `software`).
     Cpu(String),
 }
@@ -110,6 +113,14 @@ impl<'a> FeatureStatusWidget<'a> {
                     adapter.kind.display().to_lowercase()
                 ),
             ),
+            EncoderStatus::GpuSharedWithSim(adapter) => line(
+                Mark::Warn,
+                format!(
+                    "GPU acceleration on the GPU X-Plane renders with, {} ({})",
+                    adapter.name,
+                    adapter.kind.display().to_lowercase()
+                ),
+            ),
             EncoderStatus::Cpu(compressor) => line(
                 Mark::Off,
                 format!("GPU acceleration off, encoding on CPU ({compressor})"),
@@ -146,7 +157,7 @@ impl<'a> FeatureStatusWidget<'a> {
 
 /// The marker in front of each line: working (green check, green text), not
 /// set or not present (grey cross, grey text), or asked for but not working
-/// (amber).
+/// as intended, or working at a cost worth knowing about (amber).
 #[derive(Clone, Copy)]
 enum Mark {
     On,
@@ -311,6 +322,25 @@ mod tests {
         assert_eq!(rows[0], "  ✗ X-Plane frame rate: not connected");
         assert_eq!(marker(&buf, 0), Color::DarkGray);
         assert_eq!(text(&buf, 0), Color::DarkGray);
+    }
+
+    #[test]
+    fn gpu_encoding_on_the_sims_own_gpu_is_a_warning() {
+        let status = FeatureStatus {
+            encoder: EncoderStatus::GpuSharedWithSim(GpuAdapter {
+                name: "Apple M2 Max".to_string(),
+                kind: GpuKind::Integrated,
+                backend: "metal".to_string(),
+            }),
+            ..all_on()
+        };
+        let (buf, rows) = render(&status);
+        assert_eq!(
+            rows[1],
+            "  ! GPU acceleration on the GPU X-Plane renders with, Apple M2 Max (integrated)"
+        );
+        assert_eq!(marker(&buf, 1), Color::Yellow);
+        assert_eq!(text(&buf, 1), Color::Yellow);
     }
 
     #[test]
