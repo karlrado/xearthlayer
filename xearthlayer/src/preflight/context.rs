@@ -89,12 +89,17 @@ impl BootstrapContext {
     }
 
     /// Contribute the resolved Custom Scenery path.
+    pub fn set_custom_scenery_path(&mut self, path: PathBuf) {
+        self.custom_scenery_path = Some(path);
+    }
+
     /// SimHeaven X-World Pro detection, contributed when `packages.xworld_pro`
     /// is on.
     pub fn xworld_pro(&self) -> Option<&crate::xworld_pro::Detection> {
         self.xworld_pro.as_ref()
     }
 
+    /// Contribute the X-World Pro detection.
     pub fn set_xworld_pro(&mut self, detection: crate::xworld_pro::Detection) {
         self.xworld_pro = Some(detection);
     }
@@ -104,12 +109,9 @@ impl BootstrapContext {
         self.xworld_order_accepted
     }
 
+    /// Record that the user chose to continue despite the order problem.
     pub fn accept_xworld_order(&mut self) {
         self.xworld_order_accepted = true;
-    }
-
-    pub fn set_custom_scenery_path(&mut self, path: PathBuf) {
-        self.custom_scenery_path = Some(path);
     }
 }
 
