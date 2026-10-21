@@ -22,25 +22,6 @@ pub struct PrefetchStatsSnapshot {
     pub tiles_predicted: u64,
 }
 
-/// GPS/telemetry connection status for UI display.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum GpsStatus {
-    /// Receiving position data from X-Plane's Web API.
-    Connected,
-    /// Waiting for the Web API: not yet connected, or its data is stale.
-    #[default]
-    Acquiring,
-}
-
-impl std::fmt::Display for GpsStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Connected => write!(f, "Connected"),
-            Self::Acquiring => write!(f, "Acquiring..."),
-        }
-    }
-}
-
 /// What the prefetcher is doing right now, in one word for the dashboard.
 ///
 /// Resolved in precedence order by [`resolve_state`]: the first condition
@@ -158,7 +139,7 @@ pub struct DetailedPrefetchStats {
 /// Shared prefetch status for display in the UI.
 ///
 /// This provides a thread-safe way to share the current prefetch state
-/// (aircraft position and statistics) with the dashboard.
+/// (state inputs, box geometry and statistics) with the dashboard.
 #[derive(Debug, Default)]
 pub struct SharedPrefetchStatus {
     inner: RwLock<PrefetchStatusSnapshot>,
@@ -172,34 +153,10 @@ impl SharedPrefetchStatus {
         })
     }
 
-    /// Update the aircraft state from telemetry.
-    ///
-    /// This also sets GPS status to Connected since we received data.
-    pub fn update_aircraft(&self, state: &AircraftState) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.aircraft = Some(AircraftSnapshot {
-                latitude: state.latitude,
-                longitude: state.longitude,
-                heading: state.heading,
-                ground_speed: state.ground_speed,
-                altitude: state.altitude,
-            });
-            // Receiving telemetry means GPS is connected
-            inner.gps_status = GpsStatus::Connected;
-        }
-    }
-
     /// Update the prefetch statistics.
     pub fn update_stats(&self, stats: PrefetchStatsSnapshot) {
         if let Ok(mut inner) = self.inner.write() {
             inner.stats = stats;
-        }
-    }
-
-    /// Update the GPS connection status.
-    pub fn update_gps_status(&self, status: GpsStatus) {
-        if let Ok(mut inner) = self.inner.write() {
-            inner.gps_status = status;
         }
     }
 
@@ -261,12 +218,8 @@ impl SharedPrefetchStatus {
 /// Snapshot of prefetch status for display.
 #[derive(Debug, Clone, Default)]
 pub struct PrefetchStatusSnapshot {
-    /// Current aircraft state (if telemetry is active).
-    pub aircraft: Option<AircraftSnapshot>,
     /// Prefetch statistics.
     pub stats: PrefetchStatsSnapshot,
-    /// GPS/telemetry connection status.
-    pub gps_status: GpsStatus,
     /// Raw inputs to [`resolve_state`], as last published by the coordinator.
     pub state_inputs: StateInputs,
     /// Detailed prefetch statistics for dashboard display.
@@ -294,32 +247,10 @@ pub struct BoxBoundsSnapshot {
     pub lon_max: f64,
 }
 
-/// Aircraft state snapshot for display (without Instant which can't be cloned easily).
-#[derive(Debug, Clone)]
-pub struct AircraftSnapshot {
-    pub latitude: f64,
-    pub longitude: f64,
-    pub heading: f32,
-    pub ground_speed: f32,
-    pub altitude: f32,
-}
-
 impl PrefetchStatusSnapshot {
     /// The state as the coordinator alone sees it (no demand pause).
     pub fn coordinator_state(&self) -> PrefetchState {
         resolve_state(self.state_inputs)
-    }
-
-    /// Format the aircraft state as a single line.
-    pub fn aircraft_line(&self) -> String {
-        if let Some(ref ac) = self.aircraft {
-            format!(
-                "Pos: {:.4}°, {:.4}° | Hdg: {:.0}° | GS: {:.0}kt | Alt: {:.0}ft",
-                ac.latitude, ac.longitude, ac.heading, ac.ground_speed, ac.altitude
-            )
-        } else {
-            "Waiting for X-Plane telemetry...".to_string()
-        }
     }
 
     /// Format the prefetch stats as a single line.
