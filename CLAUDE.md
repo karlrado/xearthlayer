@@ -41,6 +41,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - Parallel download of 256 chunks (16×16) per tile
    - Configurable concurrency, timeout, and retry logic
    - Failed chunks are not cached (retry on next request); see Cache System for tile-level rules
+   - Retry classification lives in `executor/adapters/provider.rs` `map_provider_error`: transport failures and non-404 statuses are retryable, HTTP 404 is permanent (one attempt) because every shipped provider answers 404 only for "no tile here" (#301). The HTTP clients emit `ProviderError::HttpStatus { status, url }` for non-success responses, so callers match on the code, never on message text
+   - A killed job (FUSE timeout, error policy, shutdown) aborts its in-flight chunk downloads and returns their permits before reporting `Cancelled`; chunks already downloaded keep their cache writes (#300)
 
 4. **DDS Compression** (`xearthlayer/src/dds/`)
    - BC1/BC3 (DXT1/DXT5) compression

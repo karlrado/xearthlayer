@@ -234,7 +234,7 @@ Controls the per-chunk download behaviour of the job executor, the engine that d
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `request_timeout_secs` | integer | `10` | HTTP request timeout for a single chunk (seconds) |
-| `max_retries` | integer | `3` | Retry attempts per failed chunk |
+| `max_retries` | integer | `3` | Attempts per failed chunk. An HTTP 404 (no imagery there) fails on the first attempt and is never retried |
 
 **Example:**
 ```ini
