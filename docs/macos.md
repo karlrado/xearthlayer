@@ -53,12 +53,27 @@ There is no Intel build; on an Intel Mac, build from source as below.
 
 The binary is not signed with an Apple Developer ID. A file downloaded in a
 browser is marked as quarantined, and macOS refuses to run an unsigned
-quarantined program, reporting that it cannot verify the developer. Clearing
-the mark once after extracting is enough:
+quarantined program. Running it shows **"xearthlayer" Not Opened: Apple could
+not verify "xearthlayer" is free of malware**. Click **Done**, not Move to
+Trash. Clearing the mark once is enough.
+
+Safari unpacks the tarball for you into a folder of the same name. In that
+case go straight to the folder:
+
+```bash
+cd ~/Downloads/xearthlayer-<version>-arm64-macos
+```
+
+With any other browser, unpack it first:
 
 ```bash
 cd ~/Downloads
 tar xzf xearthlayer-<version>-arm64-macos.tar.gz
+```
+
+Then, in either case:
+
+```bash
 xattr -c xearthlayer                 # clear the download quarantine
 mkdir -p ~/.local/bin
 mv xearthlayer ~/.local/bin/
