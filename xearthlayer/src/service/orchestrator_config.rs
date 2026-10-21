@@ -55,6 +55,12 @@ pub struct OrchestratorConfig {
     /// X-Plane reads is suppressed. See `packages.disable_overlays` config key.
     pub disable_overlays: bool,
 
+    /// Where SimHeaven X-World Pro is active (`packages.xworld_pro`). Startup
+    /// leaves the overlay packages of those continents out of
+    /// `yzXEL_overlay/`. Set by the run command from preflight, not by
+    /// `from_config_file`; `disable_overlays` still wins.
+    pub xworld_pro: Option<crate::xworld_pro::OverlayCoverage>,
+
     /// Prefetch configuration.
     pub prefetch: PrefetchConfig,
 
@@ -209,6 +215,7 @@ impl OrchestratorConfig {
             patches_enabled: config.patches.enabled,
             packages_install_location,
             disable_overlays: config.packages.disable_overlays,
+            xworld_pro: None,
             prefetch,
             prewarm,
             fuse,

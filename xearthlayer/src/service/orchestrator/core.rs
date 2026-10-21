@@ -10,8 +10,8 @@ use tracing::info;
 use crate::aircraft_position::{SharedAircraftPosition, StateAggregator};
 use crate::geo_index::GeoIndex;
 use crate::manager::{
-    create_consolidated_overlay, remove_consolidated_overlay, InstalledPackage, LocalPackageStore,
-    MountManager, ServiceBuilder,
+    create_consolidated_overlay, create_consolidated_overlay_except, remove_consolidated_overlay,
+    InstalledPackage, LocalPackageStore, MountManager, ServiceBuilder,
 };
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::OrthoUnionIndex;
@@ -255,6 +255,21 @@ impl ServiceOrchestrator {
                     (false, Some(e.to_string()))
                 }
             }
+        } else if let Some(coverage) = self.config.xworld_pro.as_ref().filter(|c| !c.is_empty()) {
+            let overlay_result = create_consolidated_overlay_except(
+                store,
+                &self.config.custom_scenery_path,
+                &|region: &str| coverage.suppresses(region),
+            );
+            tracing::info!(
+                covered = %coverage.describe(),
+                excluded = ?overlay_result.excluded_regions,
+                "X-World Pro active: XEarthLayer overlays left out there"
+            );
+            if let Some(ref error) = overlay_result.error {
+                tracing::warn!(error = %error, "Failed to create consolidated overlay");
+            }
+            (overlay_result.success, overlay_result.error.clone())
         } else {
             let overlay_result =
                 create_consolidated_overlay(store, &self.config.custom_scenery_path);
