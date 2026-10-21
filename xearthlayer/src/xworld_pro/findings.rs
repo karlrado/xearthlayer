@@ -130,8 +130,10 @@ pub fn setup_findings(d: &Detection) -> Vec<Finding> {
         }
     }
     for ((continent, base), (o4xp, xp12)) in pairs {
-        if o4xp != Some(true) || xp12 == Some(true) {
-            out.push(Finding::MeshVariant { continent, base });
+        if let (Some(o4xp), Some(xp12)) = (o4xp, xp12) {
+            if !o4xp || xp12 {
+                out.push(Finding::MeshVariant { continent, base });
+            }
         }
     }
 
@@ -338,5 +340,19 @@ mod tests {
             super::manual_path(&detect(&cs)),
             Some(cs.join(LIB).join("simHeaven_X-WORLD-Pro_Manual_v1.1.pdf"))
         );
+    }
+
+    #[test]
+    fn a_layer_with_one_mesh_variant_is_not_flagged() {
+        let lone_xp12 = "simHeaven_X-WORLD-Pro_Europe-02-roads_XP12-Mesh";
+        let eu09 = EU09;
+        let ini = line(true, eu09) + &line(true, lone_xp12);
+        let f = mesh_findings(&ini, &[eu09, lone_xp12]);
+        assert!(f.is_empty());
+
+        let lone_o4xp = "simHeaven_X-WORLD-Pro_Europe-03-cities_O4XP-Mesh";
+        let ini = line(true, eu09) + &line(false, lone_o4xp);
+        let f = mesh_findings(&ini, &[eu09, lone_o4xp]);
+        assert!(f.is_empty());
     }
 }
