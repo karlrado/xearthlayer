@@ -2,7 +2,7 @@
 
 High-quality satellite imagery for X-Plane, streamed on demand.
 
-![X-Plane Earth Layer flying over northern Spain](docs/images/xearthlayer-v0.2.8-iberia.jpg)
+![X-Plane Earth Layer flying California at dusk](docs/images/xearthlayer-github-hero-v0.5.0.webp)
 
 ## What It Does
 
