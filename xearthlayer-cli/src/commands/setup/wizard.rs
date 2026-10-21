@@ -139,8 +139,8 @@ pub fn run_wizard() -> Result<(), CliError> {
         xworld_pro,
     };
 
-    write_config(&setup_config)?;
-    print_completion_message();
+    let written = write_config(&setup_config)?;
+    print_completion_message(&written);
     Ok(())
 }
 
@@ -173,20 +173,33 @@ fn print_step_header(title: &str) {
 /// directory, so "where is my stuff" never came up. It now spans three or four,
 /// and the end of the wizard is where that question gets answered rather than
 /// left for the user to discover.
-fn print_layout() {
-    use xearthlayer::paths;
+/// Where things live, from the configuration setup just wrote, so the summary
+/// shows the user's choices rather than the role defaults. The package
+/// location falls back to its default when the configuration leaves it unset.
+fn layout_rows(config: &ConfigFile) -> Vec<(&'static str, PathBuf)> {
+    vec![
+        ("Configuration", config_file_path()),
+        ("Tile cache", config.cache.directory.clone()),
+        (
+            "Scenery packages",
+            config
+                .packages
+                .install_location
+                .clone()
+                .unwrap_or_else(xearthlayer::paths::packages_dir),
+        ),
+        ("Log file", config.logging.file.clone()),
+    ]
+}
+
+fn print_layout(config: &ConfigFile) {
     println!("{}:", style("Where things live").bold());
-    for (label, path) in [
-        ("Configuration", paths::config_file()),
-        ("Tile cache", paths::tile_cache_dir()),
-        ("Scenery packages", paths::packages_dir()),
-        ("Log file", paths::log_file()),
-    ] {
+    for (label, path) in layout_rows(config) {
         println!("  {:<18}{}", label, style(path.display()).cyan());
     }
 }
 
-fn print_completion_message() {
+fn print_completion_message(config: &ConfigFile) {
     println!();
     println!(
         "{}",
@@ -206,7 +219,7 @@ fn print_completion_message() {
         style(config_file_path().display()).cyan()
     );
     println!();
-    print_layout();
+    print_layout(config);
     println!();
     println!("{}:", style("Next Steps").bold());
     println!("  1. View your configuration:");
@@ -214,7 +227,10 @@ fn print_completion_message() {
     println!();
     println!("  2. Install a scenery package:");
     println!("     {} packages list", style("xearthlayer").cyan());
-    println!("     {} packages install na", style("xearthlayer").cyan());
+    println!(
+        "     {} packages install <region code from the list>",
+        style("xearthlayer").cyan()
+    );
     println!();
     println!("  3. Start XEarthLayer:");
     println!("     {}", style("xearthlayer").cyan());
@@ -786,7 +802,8 @@ fn enumerate_with_spinner() -> Vec<GpuAdapter> {
 }
 
 /// Write the setup configuration to config.ini.
-fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
+/// Write the setup choices into the configuration and return what was saved.
+fn write_config(setup: &SetupConfig) -> Result<ConfigFile, CliError> {
     let mut config = ConfigFile::load().unwrap_or_default();
 
     if let Some(ref scenery_dir) = setup.xplane_scenery_dir {
@@ -826,7 +843,7 @@ fn write_config(setup: &SetupConfig) -> Result<(), CliError> {
         .save()
         .map_err(|e| CliError::Config(format!("Failed to save config: {}", e)))?;
 
-    Ok(())
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -913,5 +930,39 @@ mod tests {
     #[test]
     fn an_empty_entry_with_nothing_existing_stays_unset() {
         assert_eq!(resolve_credential("   ".to_string(), None), None);
+    }
+
+    fn row<'a>(rows: &'a [(&'static str, PathBuf)], label: &str) -> &'a PathBuf {
+        &rows.iter().find(|(l, _)| *l == label).unwrap().1
+    }
+
+    #[test]
+    fn the_layout_shows_the_configured_locations() {
+        let mut config = ConfigFile::default();
+        config.cache.directory = PathBuf::from("/media/Cache/xearthlayer-cache");
+        config.packages.install_location =
+            Some(PathBuf::from("/media/FlightSim/XEarthLayer Packages"));
+        config.logging.file = PathBuf::from("/var/log/xel.log");
+        let rows = layout_rows(&config);
+        assert_eq!(
+            row(&rows, "Tile cache"),
+            &PathBuf::from("/media/Cache/xearthlayer-cache")
+        );
+        assert_eq!(
+            row(&rows, "Scenery packages"),
+            &PathBuf::from("/media/FlightSim/XEarthLayer Packages")
+        );
+        assert_eq!(row(&rows, "Log file"), &PathBuf::from("/var/log/xel.log"));
+        assert_eq!(row(&rows, "Configuration"), &config_file_path());
+    }
+
+    #[test]
+    fn an_unset_package_location_shows_the_default() {
+        let mut config = ConfigFile::default();
+        config.packages.install_location = None;
+        assert_eq!(
+            row(&layout_rows(&config), "Scenery packages"),
+            &xearthlayer::paths::packages_dir()
+        );
     }
 }
