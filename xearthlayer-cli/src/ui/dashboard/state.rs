@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 
 use xearthlayer::config::DEFAULT_GENERATION_TIMEOUT_SECS;
 
+use crate::ui::symbols::SymbolPreference;
+
 /// Events that can occur in the dashboard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DashboardEvent {
@@ -239,6 +241,8 @@ pub struct DashboardConfig {
     pub provider_name: String,
     /// Prefetch lane sizing and the FUSE generation timeout, for the prefetch panel.
     pub prefetch_lane: PrefetchLaneConfig,
+    /// Status pane symbols, from `tui.symbols`.
+    pub symbols: SymbolPreference,
 }
 
 /// What the prefetch panel needs to size and colour its lane and latency lines.
@@ -261,6 +265,7 @@ impl Default for DashboardConfig {
                 group: 0,
                 generation_timeout: Duration::from_secs(DEFAULT_GENERATION_TIMEOUT_SECS),
             },
+            symbols: SymbolPreference::default(),
         }
     }
 }

@@ -117,6 +117,9 @@ pub enum ConfigKey {
     // Night lighting settings
     NightEnabled,
     NightBrightness,
+
+    // Terminal dashboard settings
+    TuiSymbols,
 }
 
 impl FromStr for ConfigKey {
@@ -187,6 +190,7 @@ impl FromStr for ConfigKey {
             "fuse.max_background" => Ok(ConfigKey::FuseMaxBackground),
             "fuse.congestion_threshold" => Ok(ConfigKey::FuseCongestionThreshold),
             "night.enabled" => Ok(ConfigKey::NightEnabled),
+            "tui.symbols" => Ok(ConfigKey::TuiSymbols),
             "night.brightness" => Ok(ConfigKey::NightBrightness),
 
             _ => Err(ConfigKeyError::UnknownKey(s.to_string())),
@@ -252,6 +256,7 @@ impl ConfigKey {
             ConfigKey::FuseMaxBackground => "fuse.max_background",
             ConfigKey::FuseCongestionThreshold => "fuse.congestion_threshold",
             ConfigKey::NightEnabled => "night.enabled",
+            ConfigKey::TuiSymbols => "tui.symbols",
             ConfigKey::NightBrightness => "night.brightness",
         }
     }
@@ -384,6 +389,7 @@ impl ConfigKey {
             ConfigKey::FuseMaxBackground => config.fuse.max_background.to_string(),
             ConfigKey::FuseCongestionThreshold => config.fuse.congestion_threshold.to_string(),
             ConfigKey::NightEnabled => config.night.enabled.to_string(),
+            ConfigKey::TuiSymbols => config.tui.symbols.clone(),
             ConfigKey::NightBrightness => config.night.brightness.to_string(),
         }
     }
@@ -568,6 +574,11 @@ impl ConfigKey {
             ConfigKey::NightBrightness => {
                 config.night.brightness = value.parse().unwrap();
             }
+
+            // Terminal dashboard settings
+            ConfigKey::TuiSymbols => {
+                config.tui.symbols = value.to_lowercase();
+            }
         }
     }
 
@@ -646,6 +657,7 @@ impl ConfigKey {
             ConfigKey::FuseCongestionThreshold => Box::new(IntegerRangeSpec::new(1, 1024)),
             ConfigKey::NightEnabled => Box::new(BooleanSpec),
             ConfigKey::NightBrightness => Box::new(FloatRangeSpec::new(0.5, 1.5)),
+            ConfigKey::TuiSymbols => Box::new(OneOfSpec::new(super::defaults::TUI_SYMBOLS_VALUES)),
         }
     }
 
@@ -709,6 +721,8 @@ impl ConfigKey {
             // Night lighting settings
             ConfigKey::NightEnabled,
             ConfigKey::NightBrightness,
+            // Terminal dashboard settings
+            ConfigKey::TuiSymbols,
         ]
     }
 }
@@ -1458,6 +1472,28 @@ mod tests {
                 "{key} should no longer resolve to a ConfigKey"
             );
         }
+    }
+
+    #[test]
+    fn tui_symbols_parses_enumerates_and_validates() {
+        assert_eq!(
+            "tui.symbols".parse::<ConfigKey>().unwrap(),
+            ConfigKey::TuiSymbols
+        );
+        assert!(ConfigKey::all().contains(&ConfigKey::TuiSymbols));
+        let mut config = ConfigFile::default();
+        assert_eq!(ConfigKey::TuiSymbols.get(&config), "auto");
+        for value in ["emoji", "plain", "auto"] {
+            ConfigKey::TuiSymbols.set(&mut config, value).unwrap();
+            assert_eq!(ConfigKey::TuiSymbols.get(&config), value);
+        }
+        ConfigKey::TuiSymbols.set(&mut config, "PLAIN").unwrap();
+        assert_eq!(config.tui.symbols, "plain");
+        assert!(ConfigKey::TuiSymbols.set(&mut config, "ascii").is_err());
+        assert_eq!(
+            config.tui.symbols, "plain",
+            "a rejected value changes nothing"
+        );
     }
 
     #[test]

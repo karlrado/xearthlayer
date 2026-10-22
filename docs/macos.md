@@ -126,8 +126,8 @@ Apple Silicon has one GPU, shared with X-Plane's Metal renderer, and no
 Apple-native BC1/BC3 encoder. XEarthLayer therefore encodes DDS textures with
 the ISPC backend by default (`texture.compressor = ispc`), which ships prebuilt
 Apple Silicon kernels. Setting `texture.compressor = gpu` is honoured, but
-XEarthLayer logs a warning at startup and the dashboard's Status pane shows the
-GPU line in amber, because encoding would then compete with the simulator for
+XEarthLayer logs a warning at startup and the dashboard's Status pane marks the
+Tile Processing Engine line with an amber `!`, because encoding would then compete with the simulator for
 the GPU. The setup wizard never selects `gpu` on a Mac.
 
 ### The mount's name in Finder

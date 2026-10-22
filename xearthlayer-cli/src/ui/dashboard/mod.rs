@@ -35,6 +35,7 @@ use xearthlayer::prefetch::SharedPrefetchStatus;
 use xearthlayer::runtime::{SharedRuntimeHealth, SharedTileProgressTracker};
 use xearthlayer::update::UpdateInfo;
 
+use crate::ui::symbols::{self, SymbolSet, SystemTerminal};
 use crate::ui::widgets::{CacheConfig, DiskHistory, FeatureStatus, NetworkHistory, SceneryHistory};
 
 // Re-export public types from state module
@@ -80,6 +81,8 @@ pub struct Dashboard {
     feature_status: Option<FeatureStatus>,
     /// X-Plane sim state from the Web API, for the live frame rate.
     sim_state: Option<SharedSimState>,
+    /// Emoji or plain marks on the Status pane, resolved once at start.
+    symbols: SymbolSet,
 }
 
 impl Dashboard {
@@ -92,8 +95,13 @@ impl Dashboard {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        // Resolved on the alternate screen, which the clear below wipes, so
+        // the width probe's glyph is never seen.
+        let (symbols, reason) = symbols::resolve(config.symbols, &mut SystemTerminal);
+        tracing::info!(?symbols, reason, "Status pane symbols");
         let backend = CrosstermBackend::new(stdout);
-        let terminal = Terminal::new(backend)?;
+        let mut terminal = Terminal::new(backend)?;
+        terminal.clear()?;
 
         let now = Instant::now();
         Ok(Self {
@@ -116,6 +124,7 @@ impl Dashboard {
             update_info: None,
             feature_status: None,
             sim_state: None,
+            symbols,
         })
     }
 
@@ -292,6 +301,7 @@ impl Dashboard {
                 update_info,
                 self.config.prefetch_lane,
                 self.feature_status.as_ref(),
+                self.symbols,
                 frame_rate,
             );
         })?;

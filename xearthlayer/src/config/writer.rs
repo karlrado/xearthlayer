@@ -263,6 +263,11 @@ congestion_threshold = {}
 enabled = {}
 ; Overall lit brightness, 0.5 to 1.5. A development setting.
 brightness = {}
+
+[tui]
+; Status pane symbols: auto, emoji or plain (default: auto).
+; auto uses emoji when the terminal can draw them and plain symbols otherwise.
+symbols = {}
 "#,
         update_check,
         config.general.layout_version,
@@ -320,6 +325,8 @@ brightness = {}
         // Night lighting settings
         config.night.enabled,
         config.night.brightness,
+        // Terminal dashboard settings
+        config.tui.symbols,
         packages_default = path_to_string(&crate::paths::packages_dir()),
         temp_default = path_to_string(&crate::paths::temp_dir()),
         log_default = path_to_string(&crate::paths::log_file()),

@@ -26,10 +26,12 @@ use xearthlayer::executor::LaneSizing;
 use xearthlayer::manager::{InstalledPackage, LocalPackageStore};
 use xearthlayer::prefetch::{PrewarmHandle, SharedPrefetchStatus};
 use xearthlayer::service::{PrewarmOrchestrator, ServiceOrchestrator, StartupProgress};
+use xearthlayer::system::CompressorKind;
 use xearthlayer::update::{RemoteUpdateChecker, UpdateChecker, UpdateInfo};
 use xearthlayer::xplane::XPlaneEnvironment;
 
 use crate::error::CliError;
+use crate::ui::symbols::SymbolPreference;
 use crate::ui::{
     self, Dashboard, DashboardConfig, DashboardEvent, DashboardState, EncoderStatus, FeatureStatus,
     LoadingPhase, LoadingProgress, PrefetchLaneConfig, PrewarmProgress, XworldProStatus,
@@ -96,6 +98,7 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
                 .prefetch_tile_generation,
             generation_timeout: Duration::from_secs(cfg.generation.timeout),
         },
+        symbols: SymbolPreference::from_config(&cfg.tui.symbols),
     };
 
     // Create initial loading progress
@@ -183,7 +186,12 @@ pub fn run_tui(config: TuiAppConfig) -> Result<CancellationToken, CliError> {
         encoder: match (orchestrator.gpu_adapter(), orchestrator.gpu_warning()) {
             (Some(adapter), Some(_)) => EncoderStatus::GpuSharedWithSim(adapter.clone()),
             (Some(adapter), None) => EncoderStatus::Gpu(adapter.clone()),
-            (None, _) => EncoderStatus::Cpu(cfg.texture.compressor.clone()),
+            // No adapter means a CPU encoder: a GPU that fails to start
+            // stops the service rather than falling back.
+            (None, _) => match CompressorKind::parse(&cfg.texture.compressor) {
+                Some(CompressorKind::Software) => EncoderStatus::Software,
+                _ => EncoderStatus::Ispc,
+            },
         },
         night: orchestrator.night_lighting(),
         xworld_pro,

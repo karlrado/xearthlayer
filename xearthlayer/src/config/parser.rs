@@ -6,6 +6,7 @@
 use ini::Ini;
 use std::path::PathBuf;
 
+use super::defaults::TUI_SYMBOLS_VALUES;
 use super::file::ConfigFileError;
 use super::settings::ConfigFile;
 use super::size::parse_size;
@@ -470,6 +471,22 @@ pub(super) fn parse_ini(ini: &Ini) -> Result<ConfigFile, ConfigFileError> {
         }
     }
 
+    // [tui] section
+    if let Some(section) = ini.section(Some("tui")) {
+        if let Some(v) = section.get("symbols") {
+            let v = v.trim().to_lowercase();
+            if !TUI_SYMBOLS_VALUES.contains(&v.as_str()) {
+                return Err(ConfigFileError::InvalidValue {
+                    section: "tui".to_string(),
+                    key: "symbols".to_string(),
+                    value: v,
+                    reason: "must be 'auto', 'emoji', or 'plain'".to_string(),
+                });
+            }
+            config.tui.symbols = v;
+        }
+    }
+
     Ok(config)
 }
 
@@ -593,6 +610,30 @@ mod tests {
                 "{bad} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_tui_symbols_round_trips_and_defaults_to_auto() {
+        let temp_dir = TempDir::new().unwrap();
+        let config_path = temp_dir.path().join("config.ini");
+        let mut config = ConfigFile::default();
+        assert_eq!(config.tui.symbols, "auto");
+        config.tui.symbols = "plain".to_string();
+        config.save_to(&config_path).unwrap();
+        assert_eq!(
+            ConfigFile::load_from(&config_path).unwrap().tui.symbols,
+            "plain"
+        );
+    }
+
+    #[test]
+    fn test_tui_symbols_is_case_insensitive_and_rejects_unknown_values() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("config.ini");
+        std::fs::write(&path, "[tui]\nsymbols = Emoji\n").unwrap();
+        assert_eq!(ConfigFile::load_from(&path).unwrap().tui.symbols, "emoji");
+        std::fs::write(&path, "[tui]\nsymbols = ascii\n").unwrap();
+        assert!(ConfigFile::load_from(&path).is_err());
     }
 
     #[test]
