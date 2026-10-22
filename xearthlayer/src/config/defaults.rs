@@ -169,6 +169,12 @@ pub const DEFAULT_NIGHT_ENABLED: bool = true;
 /// Default night lighting brightness multiplier.
 pub const DEFAULT_NIGHT_BRIGHTNESS: f64 = 1.0;
 
+/// Status pane symbols: emoji when the terminal is found able to draw them.
+pub const DEFAULT_TUI_SYMBOLS: &str = "auto";
+
+/// The values `tui.symbols` accepts.
+pub const TUI_SYMBOLS_VALUES: &[&str] = &["auto", "emoji", "plain"];
+
 // =============================================================================
 // Control plane defaults
 // =============================================================================
@@ -310,6 +316,9 @@ impl Default for ConfigFile {
             night: NightSettings {
                 enabled: DEFAULT_NIGHT_ENABLED,
                 brightness: DEFAULT_NIGHT_BRIGHTNESS,
+            },
+            tui: TuiSettings {
+                symbols: DEFAULT_TUI_SYMBOLS.to_string(),
             },
         }
     }

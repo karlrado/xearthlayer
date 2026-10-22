@@ -42,6 +42,7 @@ use xearthlayer::update::UpdateInfo;
 use super::render_sections::inner_rect;
 use super::state::{PrefetchLaneConfig, PrewarmProgress};
 use super::utils::format_duration;
+use crate::ui::symbols::SymbolSet;
 use crate::ui::widgets::{
     AircraftPositionWidget, CacheConfig, CacheWidgetCompact, DiskHistory, FeatureStatus,
     FeatureStatusWidget, FuseLatencyWidget, InputOutputWidget, LaneView, NetworkHistory,
@@ -75,6 +76,7 @@ pub fn render_ui(
     update_info: Option<&UpdateInfo>,
     prefetch_lane: PrefetchLaneConfig,
     feature_status: Option<&FeatureStatus>,
+    symbols: SymbolSet,
     frame_rate: Option<u16>,
 ) {
     let size = frame.area();
@@ -170,7 +172,9 @@ pub fn render_ui(
     frame.render_widget(status_block, chunks[6]);
     if let Some(status) = feature_status {
         frame.render_widget(
-            FeatureStatusWidget::new(status).with_frame_rate(frame_rate),
+            FeatureStatusWidget::new(status)
+                .with_symbols(symbols)
+                .with_frame_rate(frame_rate),
             inner_rect(chunks[6], 1, 2),
         );
     }

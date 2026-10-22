@@ -39,6 +39,8 @@ pub struct ConfigFile {
     pub fuse: FuseSettings,
     /// Night lighting settings
     pub night: NightSettings,
+    /// Terminal dashboard settings
+    pub tui: TuiSettings,
 }
 
 /// General application settings.
@@ -280,6 +282,14 @@ pub struct NightSettings {
     /// Overall lit brightness multiplier, 0.5 to 1.5 (default: 1.0).
     /// A development setting while the gain curve is tuned.
     pub brightness: f64,
+}
+
+/// Terminal dashboard settings.
+#[derive(Debug, Clone)]
+pub struct TuiSettings {
+    /// Symbols on the Status pane: `auto` (default) uses emoji when the
+    /// terminal can draw them, `emoji` and `plain` force one set.
+    pub symbols: String,
 }
 
 /// FUSE filesystem settings for kernel background request limits.

@@ -55,6 +55,7 @@ pub use file::{
     PrewarmSettings,
     ProviderSettings,
     TextureSettings,
+    TuiSettings,
     XPlaneSettings,
     // Pipeline defaults
     // Control plane defaults

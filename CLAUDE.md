@@ -488,6 +488,7 @@ Key sections:
 - `[executor]` - Per-chunk download behaviour only: `request_timeout_secs` and `max_retries`, which reach the executor through `ServiceConfig::chunk_download_config()`. Concurrency is NOT configurable: pool capacities, task dispatch limits and channel capacities are derived from logical core count by `ResourcePoolConfig::default()`. `max_concurrent_jobs` and `retry_base_delay_ms` were removed in #249; the backoff base is a literal in `tasks/download_chunks.rs`
 - `[fuse]` - FUSE kernel limits (max_background, congestion_threshold)
 - `[night]` - Night lighting (enabled, default true)
+- `[tui]` - Dashboard display (symbols: auto/emoji/plain; `auto` detection in `xearthlayer-cli/src/ui/symbols.rs`)
 - `[packages]` - Package manager settings (concurrent_downloads: parallel part downloads 1-10)
 
 See `docs/configuration.md` for full reference.

@@ -9,6 +9,7 @@
 //! - `widgets` - Reusable UI widget components
 
 pub mod dashboard;
+pub mod symbols;
 pub mod widgets;
 
 pub use dashboard::{

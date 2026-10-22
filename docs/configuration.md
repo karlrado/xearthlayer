@@ -189,7 +189,7 @@ gpu_device = integrated
 
 The `gpu` backend is ideal for systems with both an integrated and discrete GPU. Configure `gpu_device = integrated` to use the iGPU for encoding while the discrete GPU handles X-Plane rendering. This eliminates CPU contention between encoding and the simulator.
 
-On a machine with one GPU, X-Plane renders on that GPU, so `gpu` encoding competes with the simulator for it. That covers every Apple Silicon Mac (one unified GPU, and no Apple-native BC1/BC3 encoder to make the contention worthwhile) and any PC with only an integrated or only a discrete GPU. XEarthLayer honours the setting, but logs a warning at startup and shows the GPU line on the dashboard's Status pane in amber; the setup wizard never selects `gpu` on such a machine. The ISPC default ships prebuilt kernels for x86-64 and Apple Silicon, so it needs nothing extra on either.
+On a machine with one GPU, X-Plane renders on that GPU, so `gpu` encoding competes with the simulator for it. That covers every Apple Silicon Mac (one unified GPU, and no Apple-native BC1/BC3 encoder to make the contention worthwhile) and any PC with only an integrated or only a discrete GPU. XEarthLayer honours the setting, but logs a warning at startup and marks the Tile Processing Engine line on the dashboard's Status pane with an amber `!`; the setup wizard never selects `gpu` on such a machine. The ISPC default ships prebuilt kernels for x86-64 and Apple Silicon, so it needs nothing extra on either.
 
 **GPU Device Selection:**
 - `integrated` — Use the integrated GPU (e.g., AMD Radeon on Ryzen). Recommended when
@@ -504,6 +504,22 @@ enabled = true
 brightness = 1.0
 ```
 
+### [tui]
+
+Controls the terminal dashboard.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `symbols` | auto | Symbols on the Status pane: `auto`, `emoji` or `plain` |
+
+The Status pane leads each feature line with an emoji: 🌐 for the tile processing engine, 🌙 or 🌑 for night lighting, 🌍 for X-World Pro. A terminal without a colour emoji font draws those as empty boxes, so `plain` replaces them with check, cross and warning marks, which carry the same states. `auto` picks emoji only when every check it can make says they will draw: the terminal is not the text console, the locale is UTF-8 (or unset), the session is not over SSH, a colour font covers all four emoji (on Linux, asked of fontconfig; macOS always has one), and the terminal moves the cursor two columns for one emoji. Over SSH the fonts that matter are on the machine you type at, which XEarthLayer cannot see, so set `emoji` there if your terminal draws them. The choice and the reason for it are logged at startup.
+
+**Example:**
+```ini
+[tui]
+symbols = auto
+```
+
 ## Complete Example
 
 ```ini
@@ -587,6 +603,10 @@ congestion_threshold = 192
 enabled = true
 ; Overall lit brightness, 0.5 to 1.5 (development setting)
 brightness = 1.0
+
+[tui]
+; Status pane symbols: auto, emoji or plain
+symbols = auto
 ```
 
 ## Config CLI Commands
@@ -702,6 +722,7 @@ Run 'xearthlayer config upgrade' to update your configuration.
 | `logging.file` | path | Log file location |
 | `night.enabled` | `true`, `false` | Serve generated night lighting textures |
 | `night.brightness` | 0.5 to 1.5 | Overall lit brightness (development setting) |
+| `tui.symbols` | `auto`, `emoji`, `plain` | Status pane symbols (default `auto`) |
 
 ## CLI Overrides
 
