@@ -7,7 +7,7 @@ use semver::Version;
 
 use xearthlayer_package::{self as package, parse_package_metadata, PackageMetadata, PackageType};
 
-use super::{ManagerError, ManagerResult};
+use super::{aside, ManagerError, ManagerResult};
 
 /// Mount status for ortho packages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +153,9 @@ impl LocalPackageStore {
             if !path.is_dir() {
                 continue;
             }
+            if aside::is_transient(&entry.file_name()) {
+                continue;
+            }
 
             // Check for XEarthLayer package marker
             let metadata_path = path.join("xearthlayer_scenery_package.txt");
@@ -196,21 +199,50 @@ impl LocalPackageStore {
     /// # Safety
     ///
     /// This permanently deletes the package directory and all its contents.
+    /// The folder is first renamed to its removed name, which the startup
+    /// sweep only ever deletes, so a remove that is killed part way through
+    /// its delete never leaves a half-deleted package behind.
     pub fn remove(&self, region: &str, package_type: PackageType) -> ManagerResult<()> {
         let mountpoint = package_mountpoint(region, package_type);
         let package_dir = self.root.join(&mountpoint);
+        let not_found = || ManagerError::PackageNotFound {
+            region: region.to_string(),
+            package_type: package_type.to_string(),
+        };
 
         if !package_dir.exists() {
-            return Err(ManagerError::PackageNotFound {
-                region: region.to_string(),
-                package_type: package_type.to_string(),
-            });
+            return Err(not_found());
+        }
+        // An aside left by an earlier swap is stale, because the queue runs
+        // one operation at a time. Delete it while the package is still in
+        // place, or once the package is gone the sweep would rename it back.
+        // If it cannot be deleted, stop: the package stays installed rather
+        // than leaving the aside behind as its only copy.
+        let stale_aside = aside::aside_path(&package_dir);
+        if stale_aside.exists() {
+            aside::discard(&stale_aside);
+            if stale_aside.exists() {
+                return Err(ManagerError::WriteFailed {
+                    path: stale_aside,
+                    source: std::io::Error::other(
+                        "a folder left by an earlier update could not be deleted",
+                    ),
+                });
+            }
         }
 
-        fs::remove_dir_all(&package_dir).map_err(|e| ManagerError::WriteFailed {
-            path: package_dir,
-            source: e,
-        })
+        let removed = match aside::set_removed(&package_dir) {
+            Ok(removed) => removed,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_found()),
+            Err(e) => {
+                return Err(ManagerError::WriteFailed {
+                    path: package_dir,
+                    source: e,
+                })
+            }
+        };
+        aside::discard(&removed);
+        Ok(())
     }
 
     /// Get the expected install path for a package.
@@ -409,6 +441,142 @@ mod tests {
 
         store.remove("na", PackageType::Ortho).unwrap();
         assert!(!store.is_installed("na", PackageType::Ortho));
+    }
+
+    #[test]
+    fn a_folder_set_aside_is_not_listed_as_a_package() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let aside = crate::manager::aside::aside_path(&install_path);
+        fs::create_dir_all(&aside).unwrap();
+        fs::copy(
+            install_path.join("xearthlayer_scenery_package.txt"),
+            aside.join("xearthlayer_scenery_package.txt"),
+        )
+        .unwrap();
+
+        let packages = store.list().unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].region(), "EU");
+        assert_eq!(packages[0].path, install_path);
+    }
+
+    #[test]
+    fn a_staging_folder_is_not_listed_as_a_package() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let staging = crate::manager::aside::staging_path(&install_path);
+        fs::create_dir_all(&staging).unwrap();
+        fs::copy(
+            install_path.join("xearthlayer_scenery_package.txt"),
+            staging.join("xearthlayer_scenery_package.txt"),
+        )
+        .unwrap();
+
+        let packages = store.list().unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].path, install_path);
+    }
+
+    #[test]
+    fn remove_leaves_neither_the_package_nor_an_aside_folder() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+
+        store.remove("eu", PackageType::Ortho).unwrap();
+
+        assert!(!install_path.exists());
+        assert!(!crate::manager::aside::aside_path(&install_path).exists());
+    }
+
+    #[test]
+    fn a_removed_folder_is_not_listed_as_a_package() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let removed = temp.path().join(".xel-removed-zzXEL_eu_ortho");
+        fs::create_dir_all(&removed).unwrap();
+        fs::copy(
+            install_path.join("xearthlayer_scenery_package.txt"),
+            removed.join("xearthlayer_scenery_package.txt"),
+        )
+        .unwrap();
+
+        let packages = store.list().unwrap();
+
+        assert_eq!(packages.len(), 1);
+        assert_eq!(packages[0].path, install_path);
+    }
+
+    /// A remove renames the package straight to its removed name, which the
+    /// sweep only ever deletes. A stale aside beside it (an earlier swap's
+    /// old version that could not be deleted) goes too, or the next sweep
+    /// would rename it back as the package.
+    #[test]
+    fn remove_leaves_no_package_and_no_transient_folder() {
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        create_mock_package(temp.path(), "na", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        let stale_aside = temp.path().join(".xel-aside-zzXEL_eu_ortho");
+        let stale_removed = temp.path().join(".xel-removed-zzXEL_eu_ortho");
+        fs::create_dir_all(stale_aside.join("terrain")).unwrap();
+        fs::create_dir_all(stale_removed.join("terrain")).unwrap();
+
+        store.remove("eu", PackageType::Ortho).unwrap();
+
+        assert!(!install_path.exists());
+        let left: Vec<String> = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(left, ["zzXEL_na_ortho"]);
+    }
+
+    /// A stale aside that cannot be deleted must stop the remove. Removing
+    /// the package anyway would leave the aside as the only folder of that
+    /// name, and the startup sweep restores such an aside as the package.
+    #[test]
+    fn a_stale_aside_that_cannot_be_deleted_stops_the_remove() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let store = LocalPackageStore::new(temp.path());
+        create_mock_package(temp.path(), "eu", PackageType::Ortho, "1.0.0");
+        let install_path = store.install_path("eu", PackageType::Ortho);
+        // A read-only folder inside the aside keeps its files undeletable.
+        let locked = temp.path().join(".xel-aside-zzXEL_eu_ortho/terrain");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("tile.ter"), "old").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let deletable = fs::remove_file(locked.join("tile.ter")).is_ok();
+
+        let result = if deletable {
+            None // running as root: permissions cannot induce the failure
+        } else {
+            Some(store.remove("eu", PackageType::Ortho))
+        };
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(result) = result else { return };
+        assert!(
+            matches!(result, Err(ManagerError::WriteFailed { .. })),
+            "{result:?}"
+        );
+        assert!(store.is_installed("eu", PackageType::Ortho));
+        assert!(install_path
+            .join("xearthlayer_scenery_package.txt")
+            .exists());
     }
 
     #[test]

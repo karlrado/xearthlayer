@@ -178,6 +178,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `dds_tile_exists(row, col, zoom)` - Checks if DDS tile exists on disk (used by prefetch)
     - `resolve_lazy_filtered(path, predicate)` - Source-filtered lazy resolution (used by FUSE with GeoIndex)
 
+14. **Package Install Queue** (`xearthlayer/src/manager/queue/`)
+    - `InstallQueue`: a downloader thread and an installer thread; downloads run ahead of installs, installs run one at a time in order. `PackageInstaller` does the work as its `Stages`. A panicking stage fails only its own job
+    - `DiskLedger` budgets two filesystems: a package's parts (`s`) on temp until it installs or fails, and its estimated tree (`TREE_MULTIPLIER` = 3, times `s`) on the packages filesystem, which stays charged once installed. `Capacity::Split` waits on temp and refuses on packages; `Capacity::Shared` (one device) admits only if `installed + sum(3*s before j) + 3*s[j] + sum(s from j)` fits for every admitted j. The installer never waits, so the threads cannot deadlock. `Stages::capacity` is read once per busy period, never mid-install
+    - Removes (`packages remove` too) skip the downloader; `submit` refuses a second job for the same package
+    - `CancelToken` per job, checked per buffer and per tar entry; the tree is extracted from the verified parts straight into `.xel-staging-*` beside its destination (no joined archive; each part is deleted once read), then the swap (`manager/aside.rs`: rename old aside, rename staged in, delete old after `end_swap`) is the only step that cannot be cancelled. A cancelled job finishes only after its temp tree is deleted (a downloaded one waits in `Phase::Cancelling`), so `wait_for` returning means temp is clean; `abandon` does not wait
+    - `flock` on `{temp_dir}/.queue.lock` allows one package operation at a time; `sweep` at start deletes `install_*`, `.xel-staging-*` and `.xel-removed-*` leftovers, and renames a `.xel-aside-*` back when its package folder is missing (else deletes it). A remove renames straight to `.xel-removed-<name>` before its slow delete, so an interrupted remove is never restored as a half-deleted package; the aside rule applies only between a swap's two renames
+    - CLI signals (`xearthlayer-cli/src/signals.rs`): first SIGINT cancels, a second one or SIGTERM/SIGHUP abandons (exit 130, 143, 129 by the first signal); a stop request is remembered across the per-package queues of a multi-package remove; with no queue running, the default action. `run` is not on it yet (#314)
+
 15. **Version Update Checker** (`xearthlayer/src/update/`)
     - `VersionManifest` - Serde model for remote `version.json`
     - `UpdateInfo` - Update notification data (current version, latest version, homepage)
@@ -372,9 +380,9 @@ xearthlayer scenery-index clear     # Delete the cache file
 
 # Package management (<reg> may be the start of a code: NA, NA-CANADA; #293)
 xearthlayer packages list           # List installed/available packages
-xearthlayer packages install <reg>  # Install every package <reg> selects
+xearthlayer packages install <reg>... # Install every package the codes select (or --all)
 xearthlayer packages update [reg]   # Update packages
-xearthlayer packages remove <reg>   # Remove packages (whole set validated, one prompt)
+xearthlayer packages remove <reg>...  # Remove packages (or --all; whole set validated, one prompt)
 xearthlayer packages info <reg>     # Show installed package details
 xearthlayer packages check          # Check for updates
 
@@ -454,6 +462,7 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/update/checker.rs` | UpdateChecker trait and RemoteUpdateChecker |
 | `xearthlayer/src/config/file.rs` | Configuration loading |
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
+| `xearthlayer/src/manager/queue/` | InstallQueue, DiskLedger, Stages, lock and sweep |
 | `xearthlayer-package/src/` | Scenery package format: metadata, library index, naming, spec version gate (shared by runtime and publisher) |
 | `xearthlayer-publisher/src/` | Package publisher library |
 | `xearthlayer-publisher/src/dedupe/` | Zoom level overlap detection and gap analysis |

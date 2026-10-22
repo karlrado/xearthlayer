@@ -71,6 +71,19 @@ A full code is still the start of every longer code, so `EU` selects `EU`,
 `EU-WEST` and `EU-EAST` together. There is no way to name only the shorter
 one while the longer ones are installed.
 
+`install` and `remove` take several codes at once and act on everything any of
+them selects, each package once, so `xearthlayer packages install NA-CANADA
+AF` installs both halves of Canada and every Africa package as one batch. If
+any of the codes selects nothing, the command stops before downloading or
+removing anything. `--all` selects every package of the chosen type instead:
+the whole library for `install`, everything installed for `remove`. It works
+with every other option, and like any selection of several packages it is
+listed and confirmed first (`remove --force` skips the confirmation).
+`install --all` treats each package exactly as if you had named it, so a
+package already installed at the library's version reports "already
+installed" and the command ends with an error, while an older installed
+version is replaced.
+
 ### Check Available Packages
 
 See what packages are available and their update status:
@@ -273,6 +286,7 @@ All package commands support these common options:
 
 `<REGION>` is a region code or the start of one; see
 [Selecting Packages by Region Code](#selecting-packages-by-region-code).
+`install` and `remove` take one or more, or `--all` instead.
 
 | Option | Description |
 |--------|-------------|
@@ -283,11 +297,13 @@ All package commands support these common options:
 ### install
 
 ```bash
-xearthlayer packages install <REGION> [OPTIONS]
+xearthlayer packages install <REGION>... [OPTIONS]
+xearthlayer packages install --all [OPTIONS]
 ```
 
 | Option | Description |
 |--------|-------------|
+| `--all` | Install every package of the type in the library |
 | `--type <TYPE>` | Package type (default: ortho) |
 | `--temp-dir <PATH>` | Temporary download directory |
 
@@ -305,25 +321,35 @@ xearthlayer packages update [REGION] [OPTIONS]
 ### remove
 
 ```bash
-xearthlayer packages remove <REGION> [OPTIONS]
+xearthlayer packages remove <REGION>... [OPTIONS]
+xearthlayer packages remove --all [OPTIONS]
 ```
 
 | Option | Description |
 |--------|-------------|
+| `--all` | Remove every installed package of the type |
 | `-f, --force` | Skip confirmation prompt |
 | `--type <TYPE>` | Package type (default: ortho) |
 
 ## Disk Space
 
-Large packages are split into multiple parts for easier downloading. While a package installs, its temp directory holds the reassembled archive and the extracted tree together, which can take up to four times the size of the download. Temporary files are removed as soon as each package finishes, whether it succeeds or fails.
+Large packages are split into multiple parts for easier downloading. The parts download into the temp folder and are deleted as they are extracted, so the temp folder needs at least room for the largest download in a batch; more space lets downloads run further ahead of installs. Each package is extracted straight into a hidden folder beside the place it installs, so the disk holding your packages needs room for the extracted package, which XEarthLayer estimates at three times its download. An update needs room for the new version beside the old one until the swap. Temporary files are removed as soon as each package finishes, whether it succeeds or fails.
 
-When a command installs or updates several packages, each package installs while the next one downloads, so a batch takes about as long as its downloads rather than its downloads plus its installs. That overlap needs room for one package's install and the next package's download at the same time. XEarthLayer checks the whole batch once, before downloading anything:
+When a command installs or updates several packages, they download one after another without waiting for installs, while a second stage installs them in order, one at a time. A batch therefore takes about as long as its downloads. Each package is checked against both disks when its turn to download comes, counting the packages installed earlier in the same batch, which stay on the packages disk. When the temp folder is short of space for the moment, the download waits, shown as "waiting for disk space", and starts as soon as an install finishes. A package that the packages disk cannot hold, or whose download alone is larger than the temp folder's free space, fails before it downloads, and the rest of the batch continues.
 
-- If the overlap fits, packages download and install side by side.
-- If only one package at a time fits, the batch runs one package at a time instead, exactly as earlier versions did.
-- If not even that fits, nothing is downloaded and the command reports how much space it needs.
+When the temp folder and the packages folder are on the same disk, both needs add up on it.
+
+The free space is measured when a batch starts. Other programs writing to the same disks during a long batch, including XEarthLayer's own tile cache when it shares a disk, are not seen until the next batch. A package that runs out of space anyway fails cleanly: its temporary files are removed and any version of it already installed is untouched.
+
+Only one package command runs at a time. A second one, or one started while another is running, stops with "another package operation is running".
 
 No external tools are needed to unpack a package: archives are extracted inside XEarthLayer itself.
+
+## Stopping an Install
+
+Press Ctrl+C once to cancel: downloads stop, a package being replaced is left at its old version, and temporary files are removed before the command exits. Press Ctrl+C again to quit at once and leave the cleanup for the next package command. A system shutdown, `kill`, or closing the terminal also quits at once. In every case an installed package is always complete, either the old version or the new one, never neither, and the next package command removes whatever an interrupted one left behind. When a command removes several packages, the first Ctrl+C stops the rest of them too.
+
+The one step that is never interrupted is the final swap of the new version for the old one, which takes moments. A forced quit (a second Ctrl+C, a shutdown, or a closed terminal) can leave a hidden, half-written folder beside the package, which the next package command removes.
 
 ## Network Issues
 

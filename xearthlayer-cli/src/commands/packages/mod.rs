@@ -32,13 +32,16 @@ pub use handlers::{
 pub use services::{ConsoleInteraction, ConsoleOutput, DefaultPackageManagerService};
 pub use traits::CommandHandler;
 
+use std::io::Write;
 use std::path::PathBuf;
 
 use args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
+use selector::Selection;
 use traits::CommandContext;
 use xearthlayer::config::ConfigFile;
 
 use crate::error::CliError;
+use crate::signals::{ActiveQueue, SignalWatch};
 
 /// Load config or return default.
 fn load_config() -> ConfigFile {
@@ -114,12 +117,23 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
 
     // Create production context
     let output = ConsoleOutput::new();
-    let manager = DefaultPackageManagerService::new();
+    let active = ActiveQueue::default();
+    let manager = DefaultPackageManagerService::with_active_queue(active.clone());
     let interaction = ConsoleInteraction::new();
     let ctx = CommandContext::new(&output, &manager, &interaction);
 
+    // Signals stop a running package operation cleanly; with none running
+    // they keep their default action.
+    let watch = SignalWatch::start(active, |notice| {
+        // A closed stderr must not panic the signal thread.
+        if !crate::signals::terminal_gone() {
+            let _ = writeln!(std::io::stderr(), "{notice}");
+        }
+    })
+    .map_err(|e| CliError::Packages(format!("could not install signal handlers: {e}")))?;
+
     // Dispatch to appropriate handler
-    match command {
+    let result = match command {
         PackagesCommands::List {
             install_dir,
             verbose,
@@ -143,14 +157,15 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
         ),
 
         PackagesCommands::Install {
-            region,
+            regions,
+            all,
             r#type,
             library_url,
             install_dir,
             temp_dir,
         } => InstallHandler::execute(
             InstallArgs {
-                region,
+                selection: Selection::from_args(regions, all),
                 package_type: r#type.into(),
                 library_url: require_library_url(library_url, &config)?,
                 install_dir: install_dir.unwrap_or_else(|| default_install_dir(&config)),
@@ -188,15 +203,17 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
         ),
 
         PackagesCommands::Remove {
-            region,
+            regions,
+            all,
             r#type,
             install_dir,
             force,
         } => RemoveHandler::execute(
             RemoveArgs {
-                region,
+                selection: Selection::from_args(regions, all),
                 package_type: r#type.into(),
                 install_dir: install_dir.unwrap_or_else(|| default_install_dir(&config)),
+                temp_dir: default_temp_dir(&config),
                 force,
                 custom_scenery_path: default_custom_scenery_dir(&config),
                 disable_overlays: config.packages.disable_overlays,
@@ -217,5 +234,10 @@ pub fn run(command: PackagesCommands) -> Result<(), CliError> {
             },
             &ctx,
         ),
+    };
+
+    match watch.received() {
+        Some(signal) => Err(CliError::Interrupted(signal)),
+        None => result,
     }
 }

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use xearthlayer::manager::{ArchiveExtractor, TarGzExtractor};
+use xearthlayer::manager::{ArchiveExtractor, CancelToken, TarGzExtractor};
 
 /// A package-shaped tree: nested directories, a name with spaces (as in
 /// `Earth nav data`), and binary content.
@@ -89,7 +89,7 @@ fn an_archive_built_by_system_tar_extracts_to_the_same_tree() {
 }
 
 #[test]
-fn split_parts_reassemble_and_extract_to_the_source_tree() {
+fn split_parts_extract_to_the_source_tree() {
     let temp = TempDir::new().unwrap();
     let pkg = write_package(&temp.path().join("src"));
     let parts_dir = temp.path().join("parts");
@@ -112,11 +112,15 @@ fn split_parts_reassemble_and_extract_to_the_source_tree() {
     parts.sort();
     assert!(parts.len() > 2, "fixture should span several parts");
 
-    let extractor = TarGzExtractor::new();
-    let reassembled = temp.path().join("reassembled.tar.gz");
-    extractor.reassemble(&parts, &reassembled).unwrap();
     let dest = temp.path().join("dest");
-    extractor.extract(&reassembled, &dest).unwrap();
+    TarGzExtractor::new()
+        .extract_parts(&parts, &dest, &CancelToken::new())
+        .unwrap();
 
+    assert_eq!(
+        fs::read_dir(&parts_dir).unwrap().count(),
+        0,
+        "every part is deleted once read"
+    );
     assert_eq!(tree(&dest), tree(pkg.parent().unwrap()));
 }

@@ -38,7 +38,9 @@
 //! let installed = manager.list_installed()?;
 //! ```
 
+mod aside;
 mod cache;
+mod cancel;
 mod client;
 mod config;
 mod disk_check;
@@ -49,25 +51,28 @@ mod install_guard;
 mod installer;
 mod local;
 mod mounts;
-mod pipeline;
+mod queue;
 mod symlinks;
 mod traits;
 mod updates;
 
 pub use cache::{CacheStats, CachedLibraryClient};
+pub use cancel::CancelToken;
 pub use client::HttpLibraryClient;
 pub use config::ManagerConfig;
-pub use disk_check::{
-    available_bytes, FsInfoProvider, RealFsInfoProvider, SPACE_BUFFER_MULTIPLIER,
-};
+pub use disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider, TREE_MULTIPLIER};
 pub use download::{
     DownloadProgress, DownloadProgressCallback, DownloadState, MultiPartDownloader, PartState,
 };
 pub use error::{ManagerError, ManagerResult};
 pub use extractor::TarGzExtractor;
-pub use installer::{InstallObserver, InstallResult, InstallStage, PackageInstaller};
+pub use installer::{InstallResult, InstallStage, PackageInstaller};
 pub use local::{InstalledPackage, LocalPackageStore, MountStatus};
 pub use mounts::{ActiveMount, ConsolidatedOrthoMountResult, MountManager, ServiceBuilder};
+pub use queue::{
+    CancelResult, Canceller, Capacity, InstallContext, InstallQueue, Job, JobEvent, JobId, JobKind,
+    JobOutcome, JobSummary, QueueControl, QueueObserver, Stages,
+};
 pub use symlinks::{
     consolidated_overlay_exists, create_consolidated_overlay, create_consolidated_overlay_except,
     remove_consolidated_overlay, remove_overlay_symlink, ConsolidatedOverlayResult,

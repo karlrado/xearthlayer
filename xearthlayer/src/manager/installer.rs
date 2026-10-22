@@ -4,13 +4,14 @@
 //!
 //! 1. **Download** (network bound): fetch every archive part into the
 //!    package's own temp directory, verifying checksums as parts arrive.
-//! 2. **Install** (disk bound): reassemble the parts, extract the archive and
-//!    move the extracted tree into the package store.
+//! 2. **Install** (disk bound): extract the parts into a staging folder beside
+//!    the install path, then swap it in.
 //!
-//! [`PackageInstaller::install_all`] runs a batch through the [`pipeline`], so
-//! one package installs while the next one downloads (#292). Installing a
-//! single package is a batch of one.
+//! [`PackageInstaller`] does the work of each stage as the [`Stages`] of an
+//! [`InstallQueue`](super::InstallQueue), which downloads packages one after
+//! another while installing them in order (#292).
 
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -19,14 +20,15 @@ use tracing::info;
 
 use xearthlayer_package::{PackageMetadata, PackageType};
 
+use super::aside;
+use super::cancel::CancelToken;
 use super::disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider};
 use super::download::{DownloadProgressCallback, DownloadState, MultiPartDownloader};
 use super::error::{ManagerError, ManagerResult};
 use super::extractor::TarGzExtractor;
 use super::install_guard::InstallTempGuard;
 use super::local::LocalPackageStore;
-use super::pipeline;
-use super::traits::ArchiveExtractor;
+use super::queue::{Capacity, InstallContext, Stages};
 
 /// Timeout for downloading a single archive part.
 const PART_TIMEOUT: Duration = Duration::from_secs(300);
@@ -34,43 +36,29 @@ const PART_TIMEOUT: Duration = Duration::from_secs(300);
 /// Parts downloaded in parallel unless `with_parallel_downloads` says otherwise.
 const DEFAULT_PARALLEL_DOWNLOADS: usize = 4;
 
+/// The file every published package carries at its top, naming its version.
+const PACKAGE_METADATA_FILE: &str = "xearthlayer_scenery_package.txt";
+
+/// Start of the name of each package's temp directory.
+pub(crate) const INSTALL_TEMP_PREFIX: &str = "install_";
+
 /// Stages of installing a package whose parts have downloaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallStage {
-    /// Joining the downloaded parts into one archive.
-    Reassembling,
-    /// Extracting archive contents.
+    /// Extracting the archive parts into the staging folder.
     Extracting,
-    /// Moving the extracted tree into the package store.
+    /// Swapping the staged package into place.
     Installing,
-    /// Installation complete.
-    Complete,
 }
 
 impl InstallStage {
     /// Get a human-readable name for the stage.
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Reassembling => "Reassembling",
             Self::Extracting => "Extracting",
             Self::Installing => "Installing",
-            Self::Complete => "Complete",
         }
     }
-}
-
-/// Receives progress from [`PackageInstaller::install_all`].
-///
-/// A package's download reports from the calling thread while an earlier
-/// package installs on a worker thread, so both methods can be called at the
-/// same time.
-pub trait InstallObserver: Send + Sync {
-    /// `package` is about to download. The returned callback, if any,
-    /// receives its per-part progress.
-    fn download_started(&self, package: &PackageMetadata) -> Option<DownloadProgressCallback>;
-
-    /// `package`'s install has reached `stage`.
-    fn install_stage(&self, package: &PackageMetadata, stage: InstallStage);
 }
 
 /// The network half of a download: sizing and fetching archive parts.
@@ -86,6 +74,7 @@ pub(crate) trait PartTransfer: Send + Sync {
         &self,
         state: &mut DownloadState,
         on_progress: Option<DownloadProgressCallback>,
+        cancel: &CancelToken,
     ) -> ManagerResult<()>;
 }
 
@@ -98,8 +87,9 @@ impl PartTransfer for MultiPartDownloader {
         &self,
         state: &mut DownloadState,
         on_progress: Option<DownloadProgressCallback>,
+        cancel: &CancelToken,
     ) -> ManagerResult<()> {
-        MultiPartDownloader::download_all(self, state, on_progress)
+        MultiPartDownloader::download_all(self, state, on_progress, cancel)
     }
 }
 
@@ -122,15 +112,15 @@ pub struct InstallResult {
 
 /// A package ready to download: validated, its temp directory created and
 /// its parts sized.
-struct Prepared<'a> {
-    metadata: &'a PackageMetadata,
+pub struct PreparedPackage {
+    metadata: PackageMetadata,
     temp: InstallTempGuard,
     state: DownloadState,
 }
 
 /// A package whose parts are all on disk with verified checksums.
-struct Downloaded<'a> {
-    metadata: &'a PackageMetadata,
+pub struct DownloadedPackage {
+    metadata: PackageMetadata,
     temp: InstallTempGuard,
     parts: Vec<PathBuf>,
     bytes_downloaded: u64,
@@ -197,89 +187,46 @@ impl PackageInstaller {
         self
     }
 
-    /// Install every package in `packages`, returning one result per package
-    /// in the same order.
-    ///
-    /// Each package is validated and sized first, then the peak disk usage of
-    /// the whole batch is checked once, before anything downloads. Packages
-    /// then install while the next one downloads, or one at a time when only
-    /// that fits (see [`pipeline::schedule_for`]). A package that fails at any
-    /// point fails alone.
-    pub fn install_all(
-        &self,
-        packages: &[PackageMetadata],
-        observer: &dyn InstallObserver,
-    ) -> Vec<ManagerResult<InstallResult>> {
-        let mut ready = Vec::new();
-        let refusals: Vec<Option<ManagerError>> = packages
-            .iter()
-            .map(|metadata| match self.prepare(metadata) {
-                Ok(prepared) => {
-                    ready.push(prepared);
-                    None
-                }
-                Err(e) => Some(e),
-            })
-            .collect();
+    /// The device and free bytes of the filesystem holding `folder`,
+    /// creating the folder first so a fresh install can be measured.
+    fn filesystem_of(&self, folder: &Path) -> ManagerResult<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
 
-        let mut installed = self.run_ready(ready, observer).into_iter();
-        refusals
-            .into_iter()
-            .map(|refusal| match refusal {
-                None => installed.next().expect("one result per prepared package"),
-                Some(e) => Err(e),
-            })
-            .collect()
+        fs::create_dir_all(folder).map_err(|e| ManagerError::CreateDirFailed {
+            path: folder.to_path_buf(),
+            source: e,
+        })?;
+        let device = fs::metadata(folder)
+            .map_err(|e| ManagerError::ReadFailed {
+                path: folder.to_path_buf(),
+                source: e,
+            })?
+            .dev();
+        let free = available_bytes(self.fs_info_provider.as_ref(), folder)?;
+        Ok((device, free))
+    }
+}
+
+impl Stages for PackageInstaller {
+    type Prepared = PreparedPackage;
+    type Downloaded = DownloadedPackage;
+
+    fn temp_dir(&self) -> &Path {
+        &self.temp_dir
     }
 
-    /// Check the batch's disk peak, then download and install every prepared
-    /// package. Results are in `ready` order.
-    fn run_ready(
-        &self,
-        ready: Vec<Prepared<'_>>,
-        observer: &dyn InstallObserver,
-    ) -> Vec<ManagerResult<InstallResult>> {
-        if ready.is_empty() {
-            return Vec::new();
-        }
+    fn packages_root(&self) -> &Path {
+        self.store.root()
+    }
 
-        let refuse_all =
-            |reason: &dyn Fn() -> ManagerError| ready.iter().map(|_| Err(reason())).collect();
-        let available = match available_bytes(self.fs_info_provider.as_ref(), &self.temp_dir) {
-            Ok(available) => available,
-            Err(e) => {
-                let reason = e.to_string();
-                return refuse_all(&|| ManagerError::InvalidPath(reason.clone()));
-            }
-        };
-        let sizes: Vec<u64> = ready.iter().map(|p| p.state.total_size).collect();
-        let schedule = match pipeline::schedule_for(&sizes, available) {
-            Ok(schedule) => schedule,
-            Err(required_bytes) => {
-                return refuse_all(&|| ManagerError::InsufficientDiskSpace {
-                    path: self.temp_dir.clone(),
-                    required_bytes,
-                    available_bytes: available,
-                });
-            }
-        };
-
-        info!(
-            packages = ready.len(),
-            ?schedule,
-            available_bytes = available,
-            "batch install started"
-        );
-        pipeline::run(
-            ready,
-            schedule,
-            |prepared| self.download(prepared, observer),
-            |downloaded| self.install(downloaded, observer),
-        )
+    fn capacity(&self) -> ManagerResult<Capacity> {
+        let temp = self.filesystem_of(&self.temp_dir)?;
+        let packages = self.filesystem_of(self.store.root())?;
+        Ok(Capacity::from_filesystems(temp, packages))
     }
 
     /// Validate `metadata`, create its temp directory and size its parts.
-    fn prepare<'a>(&self, metadata: &'a PackageMetadata) -> ManagerResult<Prepared<'a>> {
+    fn prepare(&self, metadata: &PackageMetadata) -> ManagerResult<PreparedPackage> {
         let region = &metadata.title;
         // The title becomes the install directory name, and metadata reaches
         // us over HTTP. The parser refuses an unusable title, but
@@ -308,7 +255,7 @@ impl PackageInstaller {
         }
 
         let install_temp = self.temp_dir.join(format!(
-            "install_{}_{}_{}",
+            "{INSTALL_TEMP_PREFIX}{}_{}_{}",
             region.to_lowercase(),
             package_type,
             version
@@ -333,20 +280,25 @@ impl PackageInstaller {
         );
         self.transfer.query_sizes(&mut state);
 
-        Ok(Prepared {
-            metadata,
+        Ok(PreparedPackage {
+            metadata: metadata.clone(),
             temp,
             state,
         })
     }
 
+    fn download_size(&self, prepared: &PreparedPackage) -> u64 {
+        prepared.state.total_size
+    }
+
     /// Download every part of a prepared package.
-    fn download<'a>(
+    fn download(
         &self,
-        prepared: Prepared<'a>,
-        observer: &dyn InstallObserver,
-    ) -> ManagerResult<Downloaded<'a>> {
-        let Prepared {
+        prepared: PreparedPackage,
+        cancel: &CancelToken,
+        progress: DownloadProgressCallback,
+    ) -> ManagerResult<DownloadedPackage> {
+        let PreparedPackage {
             metadata,
             temp,
             mut state,
@@ -360,7 +312,7 @@ impl PackageInstaller {
         );
         let started = Instant::now();
         self.transfer
-            .download_all(&mut state, observer.download_started(metadata))?;
+            .download_all(&mut state, Some(progress), cancel)?;
         info!(
             region = %metadata.title,
             bytes_downloaded = state.bytes_downloaded,
@@ -368,7 +320,7 @@ impl PackageInstaller {
             "download phase completed"
         );
 
-        Ok(Downloaded {
+        Ok(DownloadedPackage {
             metadata,
             temp,
             parts: state.destinations,
@@ -376,49 +328,49 @@ impl PackageInstaller {
         })
     }
 
-    /// Reassemble, extract and install a downloaded package. Its temp
-    /// directory is removed when this returns, whatever the outcome.
+    /// Extract and install a downloaded package. Its temp directory is
+    /// removed when this returns, whatever the outcome.
     fn install(
         &self,
-        downloaded: Downloaded<'_>,
-        observer: &dyn InstallObserver,
+        downloaded: DownloadedPackage,
+        ctx: &dyn InstallContext,
     ) -> ManagerResult<InstallResult> {
-        let Downloaded {
+        let DownloadedPackage {
             metadata,
-            temp,
+            temp: _temp,
             parts,
             bytes_downloaded,
         } = downloaded;
-        let report = |stage| observer.install_stage(metadata, stage);
         let region = &metadata.title;
         let package_type = metadata.package_type;
 
-        report(InstallStage::Reassembling);
-        let extractor = TarGzExtractor::new();
-        let archive = temp.path().join(&metadata.filename);
-        extractor.reassemble(&parts, &archive)?;
-        // Free the parts before extracting rather than at cleanup. They are
-        // redundant now and extraction is where peak disk usage lives, so
-        // holding them through it costs a full extra copy of the download
-        // (#260).
-        let freed_bytes = free_downloaded_parts(&parts);
-        info!(region = %region, freed_bytes, "reassembly completed, archive parts freed");
-
-        report(InstallStage::Extracting);
-        let extract_dir = temp.path().join("extracted");
-        let files_extracted = extractor.extract(&archive, &extract_dir)?;
-        info!(region = %region, files_extracted, "extraction completed");
-
-        report(InstallStage::Installing);
+        ctx.stage(InstallStage::Extracting);
         let install_path = self.store.install_path(region, package_type);
-        if install_path.exists() {
-            fs::remove_dir_all(&install_path).map_err(|e| ManagerError::WriteFailed {
-                path: install_path.clone(),
-                source: e,
-            })?;
+        let staged = stage(&install_path)?;
+        let files_extracted =
+            TarGzExtractor::new().extract_parts(&parts, staged.path(), ctx.cancel_token())?;
+        info!(region = %region, files_extracted, "extraction completed");
+        let source = package_source(staged.path(), install_path.file_name())?;
+        // An archive that is empty or was cut short must not replace a
+        // working install: refuse before anything is set aside. `staged`
+        // drops and the old version is untouched.
+        if !source.join(PACKAGE_METADATA_FILE).is_file() {
+            return Err(ManagerError::ExtractionFailed {
+                path: staged.path().to_path_buf(),
+                reason: format!("the archive holds no package (no {PACKAGE_METADATA_FILE})"),
+            });
         }
-        move_extracted_contents(&extract_dir, &install_path)?;
-        report(InstallStage::Complete);
+        if !ctx.begin_swap() {
+            // `staged` drops here, which removes its folder.
+            return Err(ManagerError::Cancelled);
+        }
+        ctx.stage(InstallStage::Installing);
+        let replaced = swap_in(staged, &source, &install_path)?;
+        // The renames are done; deleting the old version may be abandoned.
+        ctx.end_swap();
+        if let Some(old) = replaced {
+            aside::discard(&old);
+        }
 
         info!(
             region = %region,
@@ -438,6 +390,10 @@ impl PackageInstaller {
             files_extracted,
         })
     }
+
+    fn remove(&self, region: &str, package_type: PackageType) -> ManagerResult<()> {
+        self.store.remove(region, package_type)
+    }
 }
 
 /// Refuse a metadata-supplied file name unless it is a single plain path
@@ -453,142 +409,99 @@ fn validate_file_name(name: &str) -> ManagerResult<()> {
     }
 }
 
-/// Move extracted contents to the install path.
+/// Create an empty staging folder beside `install_path`, and the packages
+/// root if it is missing, ready to extract into.
+///
+/// Extracting beside the install path writes the tree once, on the
+/// filesystem it ends up on, and makes the swap a same-filesystem rename.
+/// A staging folder left by an earlier run is deleted first; if it cannot be
+/// deleted the install stops rather than mix its leftovers into the new
+/// version.
+fn stage(install_path: &Path) -> ManagerResult<aside::Staged> {
+    if let Some(parent) = install_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
+            path: parent.to_path_buf(),
+            source: e,
+        })?;
+    }
+    let staging = aside::staging_path(install_path);
+    if staging.exists() {
+        aside::discard(&staging);
+        if staging.exists() {
+            return Err(ManagerError::WriteFailed {
+                path: staging,
+                source: std::io::Error::other(
+                    "a folder left by an earlier install could not be deleted",
+                ),
+            });
+        }
+    }
+    fs::create_dir(&staging).map_err(|e| ManagerError::CreateDirFailed {
+        path: staging.clone(),
+        source: e,
+    })?;
+    Ok(aside::Staged::new(staging))
+}
+
+/// The folder inside `staged` that is the package.
 ///
 /// The archive should contain a single top-level directory, the package
 /// folder, named like the install path. A directory of that name is the
 /// package whatever else sits beside it: Finder writes a `.DS_Store` into
-/// any folder it displays, including `extracted/` mid-install (#303).
-fn move_extracted_contents(extract_dir: &Path, install_path: &Path) -> ManagerResult<()> {
-    let entries: Vec<_> = fs::read_dir(extract_dir)
+/// any folder it displays, including the staging folder mid-install (#303).
+/// Failing that, a lone directory is the package; an archive with files at
+/// its top level makes `staged` itself the package.
+fn package_source(staged: &Path, package_name: Option<&OsStr>) -> ManagerResult<PathBuf> {
+    let entries: Vec<_> = fs::read_dir(staged)
         .map_err(|e| ManagerError::ReadFailed {
-            path: extract_dir.to_path_buf(),
+            path: staged.to_path_buf(),
             source: e,
         })?
         .filter_map(|e| e.ok())
         .collect();
 
+    // `file_type` does not follow symlinks, so a link named like the package
+    // is never chosen: it could point anywhere.
+    let is_dir = |e: &fs::DirEntry| e.file_type().is_ok_and(|t| t.is_dir());
     let named_package = entries
         .iter()
-        .find(|e| Some(e.file_name().as_os_str()) == install_path.file_name() && e.path().is_dir());
-    let package_folder = match named_package {
-        Some(entry) => Some(entry),
-        None if entries.len() == 1 && entries[0].path().is_dir() => Some(&entries[0]),
-        None => None,
+        .find(|e| Some(e.file_name().as_os_str()) == package_name && is_dir(e));
+    let source = match named_package {
+        Some(entry) => entry.path(),
+        None if entries.len() == 1 && is_dir(&entries[0]) => entries[0].path(),
+        None => staged.to_path_buf(),
     };
+    Ok(source)
+}
 
-    if let Some(package_folder) = package_folder {
-        let source = package_folder.path();
-
-        // Create parent directory
-        if let Some(parent) = install_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
-
-        // Try rename first (fast path if same filesystem)
-        if fs::rename(&source, install_path).is_err() {
-            // Fall back to recursive copy
-            copy_dir_recursive(&source, install_path)?;
-        }
-    } else {
-        // Multiple entries or files at root - move them all
-        if let Some(parent) = install_path.parent() {
-            fs::create_dir_all(parent).map_err(|e| ManagerError::CreateDirFailed {
-                path: parent.to_path_buf(),
-                source: e,
-            })?;
-        }
-
-        fs::create_dir_all(install_path).map_err(|e| ManagerError::CreateDirFailed {
+/// Swap the package at `source`, inside `staged`, into `install_path`,
+/// replacing any older version so that one of the two is always in place.
+///
+/// Returns where the replaced version was set aside, if there was one. The
+/// caller discards it: that delete is slow and need not hold up the swap.
+/// `staged` drops on return and removes what is left of the staging folder
+/// (nothing, or files that sat beside the package folder).
+fn swap_in(
+    staged: aside::Staged,
+    source: &Path,
+    install_path: &Path,
+) -> ManagerResult<Option<PathBuf>> {
+    let replaced = aside::set_aside(install_path)?;
+    if let Err(e) = fs::rename(source, install_path) {
+        aside::restore(install_path, replaced.as_deref());
+        return Err(ManagerError::WriteFailed {
             path: install_path.to_path_buf(),
             source: e,
-        })?;
-
-        for entry in entries {
-            let source = entry.path();
-            let dest = install_path.join(entry.file_name());
-
-            if fs::rename(&source, &dest).is_err() {
-                if source.is_dir() {
-                    copy_dir_recursive(&source, &dest)?;
-                } else {
-                    fs::copy(&source, &dest).map_err(|e| ManagerError::WriteFailed {
-                        path: dest,
-                        source: e,
-                    })?;
-                }
-            }
-        }
+        });
     }
-
-    Ok(())
-}
-
-/// Recursively copy a directory.
-fn copy_dir_recursive(source: &Path, dest: &Path) -> ManagerResult<()> {
-    fs::create_dir_all(dest).map_err(|e| ManagerError::CreateDirFailed {
-        path: dest.to_path_buf(),
-        source: e,
-    })?;
-
-    for entry in fs::read_dir(source).map_err(|e| ManagerError::ReadFailed {
-        path: source.to_path_buf(),
-        source: e,
-    })? {
-        let entry = entry.map_err(|e| ManagerError::ReadFailed {
-            path: source.to_path_buf(),
-            source: e,
-        })?;
-
-        let source_path = entry.path();
-        let dest_path = dest.join(entry.file_name());
-
-        if source_path.is_dir() {
-            copy_dir_recursive(&source_path, &dest_path)?;
-        } else {
-            fs::copy(&source_path, &dest_path).map_err(|e| ManagerError::WriteFailed {
-                path: dest_path,
-                source: e,
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
-/// Remove the downloaded archive parts, returning the bytes reclaimed.
-///
-/// Called once reassembly has succeeded, when the parts are redundant: their
-/// checksums were verified during download and their contents are now in the
-/// reassembled archive. Leaving them in place meant the temp filesystem held
-/// the parts, the archive and the extracted tree at the same time, which is a
-/// whole extra copy of the download at the point of peak usage (#260).
-///
-/// Best effort. A part that cannot be removed is logged and skipped: the
-/// archive is already built, and `InstallTempGuard` removes whatever survives
-/// when the install finishes or fails. Failing an otherwise good install
-/// because a file could not be unlinked would be the wrong trade.
-fn free_downloaded_parts(parts: &[PathBuf]) -> u64 {
-    let mut freed = 0u64;
-    for part in parts {
-        let size = fs::metadata(part).map(|m| m.len()).unwrap_or(0);
-        match fs::remove_file(part) {
-            Ok(()) => freed += size,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => {
-                info!(part = %part.display(), error = %e, "could not free archive part");
-            }
-        }
-    }
-    freed
+    drop(staged);
+    Ok(replaced)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::HashMap;
     use std::io;
     use std::sync::{Arc, Mutex};
@@ -596,6 +509,9 @@ mod tests {
     use tempfile::TempDir;
     use xearthlayer_package::ArchivePart;
 
+    use crate::manager::queue::{
+        InstallContext, InstallQueue, JobEvent, JobId, QueueObserver, Stages, LOCK_FILE_NAME,
+    };
     use crate::system::FilesystemInfo;
 
     /// Serves archive parts from memory instead of the network.
@@ -627,6 +543,7 @@ mod tests {
             &self,
             state: &mut DownloadState,
             _on_progress: Option<DownloadProgressCallback>,
+            _cancel: &CancelToken,
         ) -> ManagerResult<()> {
             for (url, dest) in state.urls.iter().zip(&state.destinations) {
                 if self.failing.contains(url) {
@@ -644,31 +561,64 @@ mod tests {
         }
     }
 
-    /// Records every observer event as "<event> <title>".
+    /// Records the events each job passes through as "<event> <region>".
     #[derive(Default)]
-    struct Recorder(Mutex<Vec<String>>);
+    struct Recorder(Mutex<(HashMap<JobId, String>, Vec<String>)>);
 
     impl Recorder {
         fn events(&self) -> Vec<String> {
-            self.0.lock().unwrap().clone()
+            self.0.lock().unwrap().1.clone()
         }
     }
 
-    impl InstallObserver for Recorder {
-        fn download_started(&self, package: &PackageMetadata) -> Option<DownloadProgressCallback> {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("download {}", package.title));
-            None
+    impl QueueObserver for Recorder {
+        fn on_event(&self, id: JobId, event: &JobEvent<'_>) {
+            let mut recorded = self.0.lock().unwrap();
+            let (regions, events) = &mut *recorded;
+            let name = match event {
+                JobEvent::Queued(summary) => {
+                    regions.insert(id, summary.region.clone());
+                    return;
+                }
+                JobEvent::Preparing => "download",
+                JobEvent::Installing(stage) => stage.name(),
+                JobEvent::Finished(_) => "Finished",
+                _ => return,
+            };
+            let region = regions.get(&id).cloned().unwrap_or_default();
+            events.push(format!("{name} {region}"));
+        }
+    }
+
+    /// Install `batch` through a queue, one result per package.
+    fn install_all(
+        installer: PackageInstaller,
+        batch: &[PackageMetadata],
+        recorder: Arc<Recorder>,
+    ) -> Vec<ManagerResult<InstallResult>> {
+        InstallQueue::start(installer, recorder)
+            .unwrap()
+            .install_batch(batch.to_vec())
+    }
+
+    /// An install context driven by the test rather than a queue.
+    struct TestContext {
+        token: CancelToken,
+        allow_swap: bool,
+    }
+
+    impl InstallContext for TestContext {
+        fn stage(&self, _stage: InstallStage) {}
+
+        fn cancel_token(&self) -> &CancelToken {
+            &self.token
         }
 
-        fn install_stage(&self, package: &PackageMetadata, stage: InstallStage) {
-            self.0
-                .lock()
-                .unwrap()
-                .push(format!("{} {}", stage.name(), package.title));
+        fn begin_swap(&self) -> bool {
+            self.allow_swap
         }
+
+        fn end_swap(&self) {}
     }
 
     /// Reports a fixed amount of free space.
@@ -687,13 +637,33 @@ mod tests {
     /// published package, its archive holds the package's metadata file
     /// alongside its content, `<mountpoint>/terrain/tile.ter`.
     fn package(title: &str, transfer: &mut LocalTransfer) -> PackageMetadata {
+        package_at(title, semver::Version::new(1, 0, 0), transfer)
+    }
+
+    /// `package` at `version`, which its archive's metadata file records.
+    fn package_at(
+        title: &str,
+        version: semver::Version,
+        transfer: &mut LocalTransfer,
+    ) -> PackageMetadata {
+        package_archive(title, version, transfer, true)
+    }
+
+    /// `package_at`, with the archive's entries inside the package folder
+    /// when `in_folder` is set, or at the archive's root when not.
+    fn package_archive(
+        title: &str,
+        version: semver::Version,
+        transfer: &mut LocalTransfer,
+        in_folder: bool,
+    ) -> PackageMetadata {
         let mountpoint = xearthlayer_package::package_mountpoint(title, PackageType::Ortho);
         let url = format!("test://{title}");
-        let filename = format!("{mountpoint}-1.0.0.tar.gz");
+        let filename = format!("{mountpoint}-{version}.tar.gz");
         let metadata = PackageMetadata {
             spec_version: semver::Version::new(1, 0, 0),
             title: title.to_string(),
-            package_version: semver::Version::new(1, 0, 0),
+            package_version: version,
             published_at: chrono::Utc::now(),
             package_type: PackageType::Ortho,
             mountpoint: mountpoint.clone(),
@@ -719,8 +689,13 @@ mod tests {
             header.set_size(body.len() as u64);
             header.set_mode(0o644);
             header.set_cksum();
+            let entry = if in_folder {
+                format!("{mountpoint}/{name}")
+            } else {
+                name.to_string()
+            };
             builder
-                .append_data(&mut header, format!("{mountpoint}/{name}"), body.as_bytes())
+                .append_data(&mut header, entry, body.as_bytes())
                 .unwrap();
         }
         transfer
@@ -747,8 +722,7 @@ mod tests {
             package("AF-SOUTH", &mut transfer),
         ];
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+        let results = install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
 
         assert_eq!(results.len(), 2);
         for (result, title) in results.iter().zip(["AF-NORTH", "AF-SOUTH"]) {
@@ -770,9 +744,13 @@ mod tests {
             package("AF-NORTH", &mut transfer),
             package("AF-SOUTH", &mut transfer),
         ];
-        let recorder = Recorder::default();
+        let recorder = Arc::new(Recorder::default());
 
-        installer(&temp, transfer, u64::MAX).install_all(&batch, &recorder);
+        install_all(
+            installer(&temp, transfer, u64::MAX),
+            &batch,
+            Arc::clone(&recorder),
+        );
 
         let events = recorder.events();
         for title in ["AF-NORTH", "AF-SOUTH"] {
@@ -783,10 +761,9 @@ mod tests {
                     .position(|e| *e == event)
                     .unwrap_or_else(|| panic!("no '{event}' in {events:?}"))
             };
-            assert!(at("download") < at("Reassembling"));
-            assert!(at("Reassembling") < at("Extracting"));
+            assert!(at("download") < at("Extracting"));
             assert!(at("Extracting") < at("Installing"));
-            assert!(at("Installing") < at("Complete"));
+            assert!(at("Installing") < at("Finished"));
         }
     }
 
@@ -800,8 +777,7 @@ mod tests {
         ];
         transfer.failing.push("test://AF-NORTH".to_string());
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+        let results = install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
 
         assert!(
             matches!(results[0], Err(ManagerError::DownloadFailed { .. })),
@@ -828,8 +804,11 @@ mod tests {
         let south = package("AF-SOUTH", &mut transfer);
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        let results = installer(&temp, transfer, u64::MAX)
-            .install_all(&[hostile, south], &Recorder::default());
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[hostile, south],
+            Arc::default(),
+        );
 
         assert!(
             matches!(results[0], Err(ManagerError::InvalidPath(_))),
@@ -847,12 +826,18 @@ mod tests {
         let mut transfer = LocalTransfer::default();
         let north = package("AF-NORTH", &mut transfer);
         let downloaded = Arc::clone(&transfer.downloaded);
-        let first = installer(&temp, transfer.clone(), u64::MAX)
-            .install_all(std::slice::from_ref(&north), &Recorder::default());
+        let first = install_all(
+            installer(&temp, transfer.clone(), u64::MAX),
+            std::slice::from_ref(&north),
+            Arc::default(),
+        );
         assert!(first[0].is_ok(), "{:?}", first[0]);
 
-        let again =
-            installer(&temp, transfer, u64::MAX).install_all(&[north], &Recorder::default());
+        let again = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[north],
+            Arc::default(),
+        );
 
         assert!(
             matches!(again[0], Err(ManagerError::AlreadyInstalled { .. })),
@@ -860,6 +845,86 @@ mod tests {
             again[0]
         );
         assert_eq!(downloaded.lock().unwrap().len(), 1);
+    }
+
+    /// The installed package's files, to compare before and after.
+    fn snapshot(install_path: &Path) -> Vec<Vec<u8>> {
+        ["terrain/tile.ter", "xearthlayer_scenery_package.txt"]
+            .iter()
+            .map(|name| fs::read(install_path.join(name)).unwrap())
+            .collect()
+    }
+
+    /// Install v1 of AF-NORTH through a queue, then download v2 of it
+    /// without installing it. Returns the v2 download and v1's install path.
+    fn v1_installed_and_v2_downloaded(
+        temp: &TempDir,
+    ) -> (PackageInstaller, DownloadedPackage, PathBuf) {
+        let mut transfer = LocalTransfer::default();
+        let v1 = package("AF-NORTH", &mut transfer);
+        let first = install_all(
+            installer(temp, transfer.clone(), u64::MAX),
+            &[v1],
+            Arc::default(),
+        );
+        let install_path = first[0].as_ref().unwrap().install_path.clone();
+
+        let v2 = package_at("AF-NORTH", semver::Version::new(2, 0, 0), &mut transfer);
+        let installer = installer(temp, transfer, u64::MAX);
+        let prepared = Stages::prepare(&installer, &v2).unwrap();
+        let downloaded = installer
+            .download(prepared, &CancelToken::new(), Box::new(|_| {}))
+            .unwrap();
+        (installer, downloaded, install_path)
+    }
+
+    /// Spec section 3: cancelling before the swap leaves the old version untouched.
+    #[test]
+    fn a_cancelled_install_leaves_the_installed_version_byte_for_byte() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        let token = CancelToken::new();
+        token.cancel();
+        let context = TestContext {
+            token,
+            allow_swap: true,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert_eq!(snapshot(&install_path), v1);
+        assert_eq!(
+            fs::read_to_string(install_path.join("terrain/tile.ter")).unwrap(),
+            "terrain for AF-NORTH"
+        );
+        assert!(!aside::staging_path(&install_path).exists());
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name != LOCK_FILE_NAME)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// The installer calls `begin_swap` and honours a refusal.
+    #[test]
+    fn an_install_refused_its_swap_changes_nothing() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        let context = TestContext {
+            token: CancelToken::new(),
+            allow_swap: false,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        assert!(matches!(result, Err(ManagerError::Cancelled)), "{result:?}");
+        assert_eq!(snapshot(&install_path), v1);
+        assert!(!aside::staging_path(&install_path).exists());
+        assert!(!aside::aside_path(&install_path).exists());
     }
 
     #[test]
@@ -875,8 +940,8 @@ mod tests {
         ];
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        // One at a time needs 4 * 50 = 200.
-        let results = installer(&temp, transfer, 199).install_all(&batch, &Recorder::default());
+        // One at a time needs its tree, 3 * 50, plus its 50 of parts: 200.
+        let results = install_all(installer(&temp, transfer, 199), &batch, Arc::default());
 
         for result in &results {
             match result {
@@ -891,11 +956,16 @@ mod tests {
             }
         }
         assert!(downloaded.lock().unwrap().is_empty());
-        assert_eq!(fs::read_dir(temp.path().join("tmp")).unwrap().count(), 0);
+        let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name != LOCK_FILE_NAME)
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
-    fn a_batch_that_only_fits_one_package_at_a_time_still_installs() {
+    fn a_batch_whose_second_tree_the_disk_cannot_hold_installs_only_the_first() {
         let temp = TempDir::new().unwrap();
         let mut transfer = LocalTransfer {
             declared_size: Some(50),
@@ -905,12 +975,38 @@ mod tests {
             package("AF-NORTH", &mut transfer),
             package("AF-SOUTH", &mut transfer),
         ];
+        let downloaded = Arc::clone(&transfer.downloaded);
 
-        // Overlapped needs 4 * 50 + 50 = 250; one at a time needs 200.
-        let results = installer(&temp, transfer, 200).install_all(&batch, &Recorder::default());
+        // The first tree stays on the disk: 150 installed, plus the second
+        // package's 150 tree and 50 of parts, is 350.
+        let results = install_all(installer(&temp, transfer, 200), &batch, Arc::default());
 
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(Result::is_ok), "{results:?}");
+        assert!(results[0].is_ok(), "{:?}", results[0]);
+        match &results[1] {
+            Err(ManagerError::InsufficientDiskSpace {
+                required_bytes,
+                available_bytes,
+                ..
+            }) => {
+                assert_eq!((*required_bytes, *available_bytes), (350, 200));
+            }
+            other => panic!("expected InsufficientDiskSpace, got {other:?}"),
+        }
+        assert_eq!(*downloaded.lock().unwrap(), ["test://AF-NORTH"]);
+    }
+
+    #[test]
+    fn capacity_is_shared_for_folders_on_one_filesystem() {
+        let temp = TempDir::new().unwrap();
+        let installer = installer(&temp, LocalTransfer::default(), 1_234);
+
+        assert_eq!(
+            installer.capacity().unwrap(),
+            Capacity::Shared { free: 1_234 }
+        );
+        assert!(installer.temp_dir().is_dir());
+        assert!(installer.packages_root().is_dir());
     }
 
     #[test]
@@ -923,11 +1019,12 @@ mod tests {
         ];
         transfer.failing.push("test://AF-SOUTH".to_string());
 
-        installer(&temp, transfer, u64::MAX).install_all(&batch, &Recorder::default());
+        install_all(installer(&temp, transfer, u64::MAX), &batch, Arc::default());
 
         let leftovers: Vec<_> = fs::read_dir(temp.path().join("tmp"))
             .unwrap()
             .map(|e| e.unwrap().file_name())
+            .filter(|name| name != LOCK_FILE_NAME)
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
@@ -966,8 +1063,11 @@ mod tests {
         hostile.parts[0].filename = "../../escaped.aa".to_string();
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[hostile],
+            Arc::default(),
+        );
 
         assert!(
             matches!(results[0], Err(ManagerError::InvalidPath(_))),
@@ -987,8 +1087,11 @@ mod tests {
         hostile.filename = target.to_string_lossy().into_owned();
         let downloaded = Arc::clone(&transfer.downloaded);
 
-        let results =
-            installer(&temp, transfer, u64::MAX).install_all(&[hostile], &Recorder::default());
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[hostile],
+            Arc::default(),
+        );
 
         assert!(
             matches!(results[0], Err(ManagerError::InvalidPath(_))),
@@ -1000,108 +1103,434 @@ mod tests {
     }
 
     /// #303: Finder writes a `.DS_Store` into any folder it displays, so a
-    /// Finder window on the temp directory during an install puts one beside
-    /// the package folder in `extracted/`. The package must still land at the
-    /// install path, not nested inside a folder of its own name, where nothing
-    /// finds it. macOS's own files, but nothing here needs macOS to reproduce.
+    /// Finder window on the staging folder during an install puts one beside
+    /// the package folder. The package folder must still be the source, not
+    /// the staging folder, or the package would be nested inside a folder of
+    /// its own name, where nothing finds it. macOS's own files, but nothing
+    /// here needs macOS to reproduce.
     #[test]
-    fn a_finder_ds_store_beside_the_package_folder_does_not_nest_the_package() {
+    fn a_finder_ds_store_beside_the_package_folder_is_not_the_package_source() {
         let temp = TempDir::new().unwrap();
         let mountpoint = "zzXEL_af-north_ortho";
-        let extract_dir = temp.path().join("extracted");
-        let package_dir = extract_dir.join(mountpoint);
-        fs::create_dir_all(package_dir.join("terrain")).unwrap();
-        fs::write(package_dir.join("xearthlayer_scenery_package.txt"), "meta").unwrap();
-        fs::write(package_dir.join("terrain/tile.ter"), "terrain").unwrap();
-        fs::write(extract_dir.join(".DS_Store"), "finder").unwrap();
-        fs::write(extract_dir.join(format!("._{mountpoint}")), "appledouble").unwrap();
+        let staged = temp.path().join(".xel-staging-zzXEL_af-north_ortho");
+        fs::create_dir_all(staged.join(mountpoint).join("terrain")).unwrap();
+        fs::write(staged.join(".DS_Store"), "finder").unwrap();
+        fs::write(staged.join(format!("._{mountpoint}")), "appledouble").unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new(mountpoint))).unwrap();
+
+        assert_eq!(source, staged.join(mountpoint));
+    }
+
+    #[test]
+    fn a_lone_folder_of_another_name_is_the_package_source() {
+        let temp = TempDir::new().unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir_all(staged.join("renamed_package")).unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new("zzXEL_af-north_ortho"))).unwrap();
+
+        assert_eq!(source, staged.join("renamed_package"));
+    }
+
+    #[test]
+    fn files_at_the_top_level_make_the_staging_folder_the_package_source() {
+        let temp = TempDir::new().unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir_all(staged.join("terrain")).unwrap();
+        fs::write(staged.join("xearthlayer_scenery_package.txt"), "meta").unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new("zzXEL_af-north_ortho"))).unwrap();
+
+        assert_eq!(source, staged);
+    }
+
+    #[test]
+    fn staging_creates_an_empty_folder_beside_the_install_path() {
+        let temp = TempDir::new().unwrap();
+        // Neither the packages root nor the install path exists yet.
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+
+        let staged = stage(&install_path).unwrap();
+
+        assert_eq!(staged.path(), aside::staging_path(&install_path));
+        assert!(staged.path().is_dir());
+        assert_eq!(fs::read_dir(staged.path()).unwrap().count(), 0);
+        assert!(!install_path.exists());
+    }
+
+    #[test]
+    fn staging_replaces_a_stale_staging_folder_with_an_empty_one() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        let stale = aside::staging_path(&install_path);
+        fs::create_dir_all(stale.join("terrain")).unwrap();
+        fs::write(stale.join("terrain/tile.ter"), "stale").unwrap();
+
+        let staged = stage(&install_path).unwrap();
+
+        assert_eq!(fs::read_dir(staged.path()).unwrap().count(), 0);
+    }
+
+    /// A stale staging folder that cannot be deleted must stop the install,
+    /// the same rule `LocalPackageStore::remove` applies to a stale aside:
+    /// extracting into it would mix its leftovers into the new version.
+    #[test]
+    fn a_stale_staging_folder_that_cannot_be_deleted_stops_the_stage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+        // A read-only folder inside the staging folder keeps its files
+        // undeletable.
+        let locked = aside::staging_path(&install_path).join("terrain");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("tile.ter"), "stale").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+        let deletable = fs::remove_file(locked.join("tile.ter")).is_ok();
+
+        let result = if deletable {
+            None // running as root: permissions cannot induce the failure
+        } else {
+            Some(stage(&install_path))
+        };
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        let Some(result) = result else { return };
+        assert!(
+            matches!(result, Err(ManagerError::WriteFailed { .. })),
+            "{result:?}"
+        );
+        assert_eq!(
+            fs::read_to_string(install_path.join("old.txt")).unwrap(),
+            "old"
+        );
+    }
+
+    #[test]
+    fn a_swap_replaces_the_old_version_and_hands_back_its_aside_to_discard() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+
+        let staged = stage(&install_path).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        fs::create_dir_all(staged_path.join("zzXEL_af-north_ortho")).unwrap();
+        fs::write(staged_path.join("zzXEL_af-north_ortho/new.txt"), "new").unwrap();
+        let source = package_source(&staged_path, install_path.file_name()).unwrap();
+        assert!(install_path.join("old.txt").exists());
+        let replaced = swap_in(staged, &source, &install_path).unwrap();
+
+        assert!(install_path.join("new.txt").exists());
+        assert!(!install_path.join("old.txt").exists());
+        assert!(!staged_path.exists());
+        let old = replaced.expect("the old version was set aside");
+        assert_eq!(old, aside::aside_path(&install_path));
+        assert_eq!(fs::read_to_string(old.join("old.txt")).unwrap(), "old");
+        aside::discard(&old);
+        assert!(!aside::aside_path(&install_path).exists());
+    }
+
+    /// Extraction is where an install now fails, after staging and before
+    /// the swap: the old version stays and the staging folder goes.
+    #[test]
+    fn an_extraction_that_fails_leaves_the_old_version_and_no_staging_folder() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        fs::write(&downloaded.parts[0], b"this is not a gzip stream").unwrap();
+        let context = TestContext {
+            token: CancelToken::new(),
+            allow_swap: true,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        assert!(
+            matches!(result, Err(ManagerError::ExtractionFailed { .. })),
+            "{result:?}"
+        );
+        assert_eq!(snapshot(&install_path), v1);
+        assert!(!aside::staging_path(&install_path).exists());
+        assert!(!aside::aside_path(&install_path).exists());
+    }
+
+    /// Replace the downloaded part with a valid archive holding only `names`.
+    fn replace_archive_with(downloaded: &DownloadedPackage, names: &[&str]) {
+        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        let mut builder = tar::Builder::new(gz);
+        for name in names {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(4);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, name, &b"text"[..])
+                .unwrap();
+        }
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+        fs::write(&downloaded.parts[0], bytes).unwrap();
+    }
+
+    /// An archive that holds no package must not replace a working install
+    /// with an empty folder: the old version stays, the staging folder goes.
+    #[test]
+    fn an_archive_without_package_metadata_leaves_the_old_version_untouched() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let v1 = snapshot(&install_path);
+        replace_archive_with(&downloaded, &["README"]);
+        let context = TestContext {
+            token: CancelToken::new(),
+            allow_swap: true,
+        };
+
+        let result = installer.install(downloaded, &context);
+
+        match result {
+            Err(ManagerError::ExtractionFailed { path, reason }) => {
+                assert_eq!(path, aside::staging_path(&install_path));
+                assert!(reason.contains("holds no package"), "{reason}");
+            }
+            other => panic!("expected ExtractionFailed, got {other:?}"),
+        }
+        assert_eq!(snapshot(&install_path), v1);
+        assert!(!aside::staging_path(&install_path).exists());
+        assert!(!aside::aside_path(&install_path).exists());
+    }
+
+    /// A top-level symlink named like the package is not a package folder,
+    /// whatever it points at: nothing outside staging may be renamed into
+    /// the install path.
+    #[test]
+    fn a_symlink_named_like_the_package_is_not_the_package_source() {
+        let temp = TempDir::new().unwrap();
+        let mountpoint = "zzXEL_af-north_ortho";
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, staged.join(mountpoint)).unwrap();
+        fs::write(staged.join("README"), "text").unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new(mountpoint))).unwrap();
+
+        assert_eq!(source, staged);
+    }
+
+    /// A lone symlink is no more a package folder than a named one.
+    #[test]
+    fn a_lone_symlink_to_a_folder_is_not_the_package_source() {
+        let temp = TempDir::new().unwrap();
+        let elsewhere = temp.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let staged = temp.path().join("staged");
+        fs::create_dir_all(&staged).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, staged.join("renamed_package")).unwrap();
+
+        let source = package_source(&staged, Some(OsStr::new("zzXEL_af-north_ortho"))).unwrap();
+
+        assert_eq!(source, staged);
+    }
+
+    #[test]
+    fn a_swap_whose_rename_fails_puts_the_old_version_back() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+        // The old version is already set aside when this rename fails.
+        let missing = temp.path().join("Custom Scenery/.xel-staging-missing");
+        let staged = aside::Staged::new(missing.clone());
+
+        assert!(swap_in(staged, &missing, &install_path).is_err());
+
+        assert_eq!(
+            fs::read_to_string(install_path.join("old.txt")).unwrap(),
+            "old"
+        );
+        assert!(!aside::aside_path(&install_path).exists());
+    }
+
+    /// #303 through the swap: Finder's files beside the package folder in
+    /// staging neither nest the package nor reach the install path, and they
+    /// leave with the staging folder.
+    #[test]
+    fn a_staged_install_with_finder_files_beside_the_package_does_not_nest_it() {
+        let temp = TempDir::new().unwrap();
+        let mountpoint = "zzXEL_af-north_ortho";
         let install_path = temp.path().join("Custom Scenery").join(mountpoint);
+        let staged = stage(&install_path).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        let package_dir = staged_path.join(mountpoint);
+        fs::create_dir_all(&package_dir).unwrap();
+        fs::write(package_dir.join("xearthlayer_scenery_package.txt"), "meta").unwrap();
+        fs::write(staged_path.join(".DS_Store"), "finder").unwrap();
+        fs::write(staged_path.join(format!("._{mountpoint}")), "appledouble").unwrap();
 
-        move_extracted_contents(&extract_dir, &install_path).unwrap();
+        let source = package_source(&staged_path, install_path.file_name()).unwrap();
+        let replaced = swap_in(staged, &source, &install_path).unwrap();
 
+        assert_eq!(replaced, None, "nothing was installed before");
         assert_eq!(
             fs::read_to_string(install_path.join("xearthlayer_scenery_package.txt")).unwrap(),
             "meta"
         );
-        assert!(install_path.join("terrain/tile.ter").exists());
         assert!(
             !install_path.join(mountpoint).exists(),
             "package was nested"
         );
+        assert!(!install_path.join(".DS_Store").exists());
+        assert!(!staged_path.exists());
+    }
+
+    #[test]
+    fn a_staged_package_dropped_without_swapping_is_removed() {
+        let temp = TempDir::new().unwrap();
+        let install_path = temp.path().join("Custom Scenery/zzXEL_af-north_ortho");
+        fs::create_dir_all(&install_path).unwrap();
+        fs::write(install_path.join("old.txt"), "old").unwrap();
+
+        let staged = stage(&install_path).unwrap();
+        let staged_path = staged.path().to_path_buf();
+        fs::create_dir_all(staged_path.join("zzXEL_af-north_ortho")).unwrap();
+        fs::write(staged_path.join("zzXEL_af-north_ortho/new.txt"), "new").unwrap();
+        drop(staged);
+
+        assert!(!staged_path.exists());
+        assert_eq!(
+            fs::read_to_string(install_path.join("old.txt")).unwrap(),
+            "old"
+        );
+    }
+
+    /// What `PeekingContext::begin_swap` saw: whether staging held the new
+    /// version's tree, and whether the package's temp directory was empty.
+    type Peek = (bool, bool);
+
+    /// An install context that looks at the disk at the moment the swap is
+    /// claimed, then allows it.
+    struct PeekingContext {
+        token: CancelToken,
+        install_path: PathBuf,
+        package_temp: PathBuf,
+        new_metadata: String,
+        seen: RefCell<Option<Peek>>,
+    }
+
+    impl InstallContext for PeekingContext {
+        fn stage(&self, _stage: InstallStage) {}
+
+        fn cancel_token(&self) -> &CancelToken {
+            &self.token
+        }
+
+        fn begin_swap(&self) -> bool {
+            let staging = aside::staging_path(&self.install_path);
+            let package = [
+                staging.clone(),
+                staging.join(self.install_path.file_name().unwrap()),
+            ]
+            .into_iter()
+            .find(|root| root.join("terrain/tile.ter").is_file());
+            let staged_is_new = package.is_some_and(|root| {
+                fs::read_to_string(root.join("xearthlayer_scenery_package.txt")).ok()
+                    == Some(self.new_metadata.clone())
+            });
+            let temp_is_empty = fs::read_dir(&self.package_temp)
+                .map(|mut entries| entries.next().is_none())
+                .unwrap_or(false);
+            *self.seen.borrow_mut() = Some((staged_is_new, temp_is_empty));
+            true
+        }
+
+        fn end_swap(&self) {}
+    }
+
+    /// The names in the packages root that only exist mid-replacement.
+    fn transient_folders(packages_root: &Path) -> Vec<std::ffi::OsString> {
+        fs::read_dir(packages_root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| aside::is_transient(name))
+            .collect()
+    }
+
+    /// The tree is written once, beside its destination: at the moment the
+    /// swap is claimed it is complete inside the staging folder and temp holds
+    /// no extracted tree.
+    #[test]
+    fn an_install_extracts_into_staging_beside_the_install_path() {
+        let temp = TempDir::new().unwrap();
+        let (installer, downloaded, install_path) = v1_installed_and_v2_downloaded(&temp);
+        let new_metadata = xearthlayer_package::serialize_package_metadata(&downloaded.metadata);
+        let parts = downloaded.parts.clone();
+        let context = PeekingContext {
+            token: CancelToken::new(),
+            install_path: install_path.clone(),
+            package_temp: parts[0].parent().unwrap().to_path_buf(),
+            new_metadata: new_metadata.clone(),
+            seen: RefCell::new(None),
+        };
+
+        installer.install(downloaded, &context).unwrap();
+
+        let (staged_is_new, temp_is_empty) = context.seen.borrow().expect("the swap was claimed");
+        assert!(staged_is_new, "staging held the new version at the swap");
+        assert!(
+            temp_is_empty,
+            "temp held no extracted tree, archive or part at the swap"
+        );
+        assert!(parts.iter().all(|part| !part.exists()));
+        assert_eq!(
+            fs::read_to_string(install_path.join("xearthlayer_scenery_package.txt")).unwrap(),
+            new_metadata
+        );
+        assert!(install_path.join("terrain/tile.ter").is_file());
+        let left = transient_folders(install_path.parent().unwrap());
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn an_archive_with_its_files_at_the_top_level_installs() {
+        let temp = TempDir::new().unwrap();
+        let mut transfer = LocalTransfer::default();
+        let flat = package_archive(
+            "AF-NORTH",
+            semver::Version::new(1, 0, 0),
+            &mut transfer,
+            false,
+        );
+
+        let results = install_all(
+            installer(&temp, transfer, u64::MAX),
+            &[flat],
+            Arc::default(),
+        );
+
+        let result = results[0].as_ref().unwrap();
+        assert_eq!(result.files_extracted, 2);
+        let install_path = &result.install_path;
+        assert_eq!(
+            fs::read_to_string(install_path.join("terrain/tile.ter")).unwrap(),
+            "terrain for AF-NORTH"
+        );
+        assert!(install_path
+            .join("xearthlayer_scenery_package.txt")
+            .is_file());
+        assert!(!install_path
+            .join(install_path.file_name().unwrap())
+            .exists());
+        let left = transient_folders(install_path.parent().unwrap());
+        assert!(left.is_empty(), "{left:?}");
     }
 
     #[test]
     fn test_install_stage_name() {
-        assert_eq!(InstallStage::Reassembling.name(), "Reassembling");
         assert_eq!(InstallStage::Extracting.name(), "Extracting");
         assert_eq!(InstallStage::Installing.name(), "Installing");
-        assert_eq!(InstallStage::Complete.name(), "Complete");
-    }
-
-    /// #260: the parts stay on disk through reassembly and extraction, so the
-    /// temp filesystem briefly holds the parts, the reassembled archive AND the
-    /// extracted tree. Freeing the parts as soon as the archive exists removes
-    /// a whole copy of the download from the peak.
-    #[test]
-    fn free_downloaded_parts_removes_every_part_and_reports_bytes_freed() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let mut parts = Vec::new();
-        for (i, len) in [10usize, 20, 30].iter().enumerate() {
-            let path = temp.path().join(format!("archive.tar.gz.a{i}"));
-            std::fs::write(&path, vec![b'x'; *len]).expect("write part");
-            parts.push(path);
-        }
-
-        let freed = free_downloaded_parts(&parts);
-
-        assert_eq!(freed, 60, "should report the total bytes reclaimed");
-        for part in &parts {
-            assert!(
-                !part.exists(),
-                "{} should have been removed",
-                part.display()
-            );
-        }
-    }
-
-    /// A part that is already gone must not fail the install: the archive is
-    /// built and verified by this point, and the temp guard removes whatever
-    /// survives. Reclaiming space is best effort.
-    #[test]
-    fn free_downloaded_parts_tolerates_a_missing_part() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let present = temp.path().join("archive.tar.gz.aa");
-        std::fs::write(&present, vec![b'x'; 5]).expect("write part");
-        let absent = temp.path().join("archive.tar.gz.ab");
-
-        let freed = free_downloaded_parts(&[present.clone(), absent]);
-
-        assert_eq!(freed, 5, "counts only what it actually removed");
-        assert!(!present.exists());
-    }
-
-    #[test]
-    fn test_copy_dir_recursive() {
-        use tempfile::TempDir;
-
-        let source_temp = TempDir::new().unwrap();
-        let dest_temp = TempDir::new().unwrap();
-
-        // Create source structure
-        fs::write(source_temp.path().join("file1.txt"), "hello").unwrap();
-        let subdir = source_temp.path().join("subdir");
-        fs::create_dir(&subdir).unwrap();
-        fs::write(subdir.join("file2.txt"), "world").unwrap();
-
-        let dest = dest_temp.path().join("copied");
-        copy_dir_recursive(source_temp.path(), &dest).unwrap();
-
-        // Verify
-        assert!(dest.join("file1.txt").exists());
-        assert!(dest.join("subdir").is_dir());
-        assert!(dest.join("subdir/file2.txt").exists());
-
-        let content = fs::read_to_string(dest.join("file1.txt")).unwrap();
-        assert_eq!(content, "hello");
     }
 }
