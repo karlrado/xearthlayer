@@ -77,7 +77,7 @@ There is no Intel build; on an Intel Mac, build from source as below.
 The binaries are signed with the project's Apple Developer ID and notarized by
 Apple, so macOS runs them as downloaded. The first run of a browser download
 needs a network connection: a bare executable cannot carry its notarization
-ticket, so Gatekeeper fetches it once. Pre-releases up to `v0.5.0-alpha.2` were
+ticket, so Gatekeeper fetches it once. Pre-releases up to `v0.5.0-alpha.1` were
 unsigned; see the note at the end of this section if you still have one.
 
 Safari unpacks the tarball for you into a folder of the same name. In that
@@ -111,7 +111,7 @@ To confirm what you downloaded is the project's own build:
 codesign --display --verbose=2 xearthlayer   # Authority=Developer ID Application: Sam de Freyssinet (Y7DVMR5MEX)
 ```
 
-**Unsigned pre-releases (`v0.5.0-alpha.2` and earlier).** Running one shows
+**Unsigned pre-releases (`v0.5.0-alpha.1` and earlier).** Running one shows
 **"xearthlayer" Not Opened: Apple could not verify "xearthlayer" is free of
 malware**. Click **Done**, not Move to Trash, then clear the download
 quarantine once with `xattr -c xearthlayer` before moving it into place. A
