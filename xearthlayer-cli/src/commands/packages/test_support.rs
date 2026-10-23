@@ -7,12 +7,13 @@
 //! on call sequences.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::Receiver;
 use std::sync::Mutex;
 
 use semver::Version;
 use xearthlayer::manager::{
-    InstallResult, InstalledPackage, LocalPackageStore, ManagerError, ManagerResult, MountStatus,
-    PackageInfo, PackageStatus,
+    InstallResult, InstalledPackage, LocalPackageStore, ManagerError, ManagerResult, PackageInfo,
+    PackageStatus,
 };
 use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageMetadata, PackageType};
 
@@ -84,6 +85,15 @@ pub struct FakeManager {
     removals: Mutex<Vec<String>>,
     /// Titles whose removal is refused, as when the queue lock is held.
     refused_removals: Vec<String>,
+    /// The pid of a running `xearthlayer run`, when there is one.
+    running: Option<u32>,
+    /// Checking for updates fails.
+    failing_update_check: bool,
+    /// Listing the installed packages panics.
+    panicking_list: bool,
+    /// Creating a store first waits for a message on this, once, like a
+    /// slow filesystem.
+    held_store: Mutex<Option<Receiver<()>>>,
 }
 
 impl FakeManager {
@@ -101,29 +111,45 @@ impl FakeManager {
         self
     }
 
-    /// Have `titles` installed as `package_type`, none of them mounted.
+    /// Have `titles` installed as `package_type`.
     pub fn with_installed(mut self, package_type: PackageType, titles: &[&str]) -> Self {
         for title in titles {
-            self.installed
-                .push(installed(title, package_type, MountStatus::NotMounted));
+            self.installed.push(installed(title, package_type));
         }
         self
     }
 
-    /// Have `title` installed as a mounted ortho package.
-    pub fn with_mounted(mut self, title: &str) -> Self {
-        self.installed
-            .push(installed(title, PackageType::Ortho, MountStatus::Mounted));
+    /// Hold the next `create_store` until `release` is sent to or dropped.
+    pub fn holding_create_store(self, release: Receiver<()>) -> Self {
+        *self.held_store.lock().unwrap() = Some(release);
+        self
+    }
+
+    /// Report another `xearthlayer run` serving packages as process `pid`.
+    pub fn with_running_instance(mut self, pid: u32) -> Self {
+        self.running = Some(pid);
         self
     }
 
     /// Report `title` as installed at 1.0.0 with 2.0.0 available.
-    pub fn with_update(mut self, package_type: PackageType, title: &str) -> Self {
-        self = self.with_library(package_type, &[title]);
-        let status = PackageStatus::UpdateAvailable {
-            installed: Version::new(1, 0, 0),
-            available: Version::new(2, 0, 0),
-        };
+    pub fn with_update(self, package_type: PackageType, title: &str) -> Self {
+        self.with_library(package_type, &[title]).with_status(
+            package_type,
+            title,
+            PackageStatus::UpdateAvailable {
+                installed: Version::new(1, 0, 0),
+                available: Version::new(2, 0, 0),
+            },
+        )
+    }
+
+    /// Report `title` with exactly `status` when updates are checked.
+    pub fn with_status(
+        mut self,
+        package_type: PackageType,
+        title: &str,
+        status: PackageStatus,
+    ) -> Self {
         self.statuses.push((
             PackageInfo {
                 region: title.to_string(),
@@ -133,6 +159,18 @@ impl FakeManager {
             },
             status,
         ));
+        self
+    }
+
+    /// Make checking for updates fail, as an unreadable install folder does.
+    pub fn with_failing_update_check(mut self) -> Self {
+        self.failing_update_check = true;
+        self
+    }
+
+    /// Make listing the installed packages panic, as a bug in a read would.
+    pub fn panicking_on_list(mut self) -> Self {
+        self.panicking_list = true;
         self
     }
 
@@ -170,6 +208,10 @@ impl FakeManager {
 
 impl PackageManagerService for FakeManager {
     fn create_store(&self, install_dir: &Path) -> LocalPackageStore {
+        let held = self.held_store.lock().unwrap().take();
+        if let Some(release) = held {
+            let _ = release.recv();
+        }
         LocalPackageStore::new(install_dir)
     }
 
@@ -187,12 +229,18 @@ impl PackageManagerService for FakeManager {
         Ok(metadata(&entry.title, entry.package_type))
     }
 
-    fn check_updates(
+    fn try_check_updates(
         &self,
         _store: &LocalPackageStore,
         _library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)> {
-        self.statuses.clone()
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>> {
+        if self.failing_update_check {
+            return Err(ManagerError::ReadFailed {
+                path: install_dir(),
+                source: std::io::Error::other("unreadable"),
+            });
+        }
+        Ok(self.statuses.clone())
     }
 
     fn install_packages(
@@ -244,7 +292,43 @@ impl PackageManagerService for FakeManager {
     }
 
     fn list_packages(&self, _store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {
+        assert!(
+            !self.panicking_list,
+            "listing the installed packages blew up"
+        );
         Ok(self.installed.clone())
+    }
+
+    /// Unlike `list_packages` it never panics: a read of the keys is the
+    /// quick one.
+    fn list_package_keys(
+        &self,
+        _store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>> {
+        Ok(self
+            .installed
+            .iter()
+            .map(|p| (p.region().to_string(), p.package_type()))
+            .collect())
+    }
+
+    fn running_instance(&self) -> Option<u32> {
+        self.running
+    }
+
+    fn instance_lock(&self) -> PathBuf {
+        PathBuf::from(INSTANCE_LOCK)
+    }
+}
+
+/// Where the fake's instance lock is.
+pub const INSTANCE_LOCK: &str = "/nonexistent/state/xearthlayer.lock";
+
+/// The refusal a `FakeManager` running as `pid` gives.
+pub fn run_active(pid: u32) -> crate::commands::packages::actions::RunActive {
+    crate::commands::packages::actions::RunActive {
+        pid,
+        lock: PathBuf::from(INSTANCE_LOCK),
     }
 }
 
@@ -269,15 +353,10 @@ fn metadata(title: &str, package_type: PackageType) -> PackageMetadata {
     }
 }
 
-fn installed(
-    title: &str,
-    package_type: PackageType,
-    mount_status: MountStatus,
-) -> InstalledPackage {
+fn installed(title: &str, package_type: PackageType) -> InstalledPackage {
     InstalledPackage {
         metadata: metadata(title, package_type),
         path: install_dir().join(title),
         size_bytes: 1024,
-        mount_status,
     }
 }

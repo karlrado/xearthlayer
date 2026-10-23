@@ -29,7 +29,80 @@ The default `library_url` points to the official XEarthLayer package library, so
 
 When `auto_install_overlays = true`, installing an ortho package will automatically install the matching overlay package for the same region (if available). This saves time when setting up new regions.
 
-## Commands
+## The Package Manager
+
+The package manager is a terminal screen for installing, updating and removing packages. It does what the commands below do, with the library, your installed packages and the running jobs on one screen.
+
+Open it with:
+
+```bash
+xearthlayer packages
+```
+
+The setup wizard offers to open it when it finishes, so a first install can go from setup straight to choosing scenery. The package manager needs a terminal. When input or output is not a terminal (in a script, or piped), `xearthlayer packages` prints the command help instead, and the commands below work as they always have.
+
+### The Three Tabs
+
+Switch tabs with `1`, `2` and `3`, or with Tab and Shift+Tab.
+
+| Tab | Shows |
+|-----|-------|
+| 1 Local | The packages installed on this machine, with version, size and whether the library has a newer version. |
+| 2 Library | Every package the library offers, with whether it is not installed, up to date, or has an update. `t` cycles the list between all packages, ortho only and overlay only. |
+| 3 Progress | The jobs of this session: queued, downloading, extracting, installing, removing, done, failed or cancelled. The tab title counts the unfinished ones. |
+
+Local and Library have a detail pane beside the list for the selected package, which names its continent from the region code (`AF-NORTH` is Africa). Marked rows are drawn in cyan. While the installed list is first read, the Local tab shows a spinner with "Reading the installed packages…", and while either list is read again its title shows the spinner and "reading" beside the count; after the queue changes an overlay, the status line says "Rebuilding the overlay folder…" until the rebuild is done. Queuing a job never switches tabs: the status line says how many jobs are queued, and you look at Progress when you want to.
+
+### Keys
+
+Press `?` in the package manager for this list.
+
+| Keys | Where | Action |
+|------|-------|--------|
+| `1` `2` `3`, Tab, Shift+Tab | everywhere | Switch tabs |
+| Up, Down, `j`, `k`, PgUp, PgDn, Home, End | everywhere | Move the selection |
+| `r` | everywhere | Refresh the lists |
+| `?` | everywhere | Help |
+| `q`, Esc, Ctrl+C | everywhere | Quit |
+| Space | Local, Library | Mark or unmark the selected row |
+| `a` | Local, Library | Mark all rows shown, or clear the marks when all are marked |
+| `u` | Local | Update |
+| `d` | Local | Delete |
+| `t` | Library | Cycle the type filter |
+| `i` | Library | Install |
+| `c` | Progress | Cancel the selected job |
+| `C` | Progress | Cancel every unfinished job |
+| `x` | Progress | Clear finished jobs from the list |
+
+`u`, `d` and `i` act on the marked rows. With nothing marked, they act on the selected row. A confirmation asks before an install, a delete, a cancel of all jobs and a quit: `y` or Enter confirms, `n` or Esc backs out. An update starts at once, without a dialog, and leaves out packages that are already up to date.
+
+### Example: Install Two Regions
+
+1. Run `xearthlayer packages` and press `2` for the Library tab.
+2. Move to the first region you want and press Space to mark it. Move to the second and press Space again.
+3. Press `i`. A dialog lists the packages that will install and asks you to confirm. With `auto_install_overlays` on, each ortho package is followed by the overlay for the same region. Packages that are already up to date are left out, and the dialog says so.
+4. Press `y`. The status line reads "N jobs queued: see Progress".
+5. Press `3` to watch Progress. Downloads run ahead of installs, as they do on the command line, and a job waits with "waiting for disk space" when the temp folder is short of room.
+6. When the last job finishes, the lists refresh and the overlay folder is rebuilt if an overlay changed. Press `q` to leave. The package manager prints one line saying what the session did.
+
+Cancel a job with `c` on the Progress tab. As on the command line, a package being replaced keeps its old version, and temporary files are removed.
+
+### Quitting and Signals
+
+`q` asks to confirm. With jobs running, confirming cancels them and leaves when they have stopped. Press `q` again while it cancels to leave at once and let the next package command clean up.
+
+A SIGINT sent from outside (for example `kill -INT`) quits the same way as a confirmed `q`. A second one, or SIGTERM, leaves at once. SIGHUP, a closed terminal, leaves at once and stops drawing. The exit codes are 130, 143 and 129 by the first signal, and except after SIGHUP the one-line summary is still printed, to stderr. When an overlay folder rebuild is still running as you leave, the package manager says "Finishing the overlay folder…" and waits for it. In every case an installed package is complete, either the old version or the new one. See [Stopping an Install](#stopping-an-install).
+
+### Using It While XEarthLayer Runs
+
+The package manager works while `xearthlayer run` is active, with the same rules the commands follow (see [While XEarthLayer is running](#while-xearthlayer-is-running)). A banner at the top says so, with the process ID, and the Details pane of the selected package ends with the full refusal, including the lock file to delete if XEarthLayer is not running.
+
+- Installing a package that is not installed is allowed. The status line reminds you to restart `xearthlayer run` to use it.
+- Updating, deleting, and installing over an installed package are refused, with the message "XEarthLayer is running (pid N): stop it before updating or removing packages, or delete <lock file> if XEarthLayer is not running". The status line gives the short form, "XEarthLayer is running (pid N): see Details", and the full message ends the Local and Library details. At the smallest terminal size (60 by 12) the details pane has no room for it, so make the terminal taller to read it. Their keys are dimmed while the banner shows. In a batch that mixes new and installed packages, the installed ones are left out and the new ones install, and the status line keeps naming the ones left out until the line that says what was done.
+
+Only one package operation runs at a time. If a package command is already running in another terminal, the package manager says "another package operation is running" when you queue a job, and nothing is lost: your marks come back.
+
+## Command Line
 
 ### Selecting Packages by Region Code
 
@@ -135,12 +208,10 @@ Installed Packages (2)
 EU-ALPS (ortho) v2.0.0
   Path: /home/user/X-Plane 12/Custom Scenery/zzXEL_eu-alps_ortho
   Size: 4.2 GB
-  Mount: Not mounted
 
 NA-SOCAL (ortho) v1.2.0
   Path: /home/user/X-Plane 12/Custom Scenery/zzXEL_na-socal_ortho
   Size: 8.7 GB
-  Mount: Not mounted
 ```
 
 ### Install a Package
@@ -200,9 +271,6 @@ Installation:
   Path: /home/user/X-Plane 12/Custom Scenery/zzXEL_eu-paris_ortho
   Size: 1.2 GB
 
-Mount Status:
-  Not mounted
-
 Archive Parts:
   zzXEL_eu-paris_ortho-1.0.0.tar.gz.aa (500 MB)
   zzXEL_eu-paris_ortho-1.0.0.tar.gz.ab (500 MB)
@@ -228,6 +296,8 @@ The update process:
 2. Removes the old version
 3. Extracts the new version
 
+While `xearthlayer run` is active, `update` is refused (see [While XEarthLayer is running](#while-xearthlayer-is-running)).
+
 ### Remove a Package
 
 Remove an installed package:
@@ -250,8 +320,7 @@ Success: Removed eu-paris (ortho)
 ```
 
 When a code selects several packages, every one of them is listed, and the
-removal is checked as a whole before anything is deleted: if any selected
-package is mounted, nothing is removed. Then a single prompt covers the set:
+removal is checked as a whole before anything is deleted. Then a single prompt covers the set:
 
 ```
 Are you sure you want to remove these 2 packages? [y/N]:
@@ -263,7 +332,7 @@ To skip the confirmation prompt:
 xearthlayer packages remove eu-paris --force
 ```
 
-`--force` skips only the prompt. A mounted package still stops the removal.
+`--force` skips only the prompt. While `xearthlayer run` is running, nothing is removed (see below).
 
 ## Package Types
 
@@ -340,6 +409,13 @@ When a command installs or updates several packages, they download one after ano
 When the temp folder and the packages folder are on the same disk, both needs add up on it.
 
 The free space is measured when a batch starts. Other programs writing to the same disks during a long batch, including XEarthLayer's own tile cache when it shares a disk, are not seen until the next batch. A package that runs out of space anyway fails cleanly: its temporary files are removed and any version of it already installed is untouched.
+
+### While XEarthLayer is running
+
+`xearthlayer run` records its process ID in the instance lock, and the package commands read it. While that process is alive:
+
+- `update` and `remove` refuse the whole batch before doing anything, with "XEarthLayer is running (pid N): stop it before updating or removing packages, or delete <lock file> if XEarthLayer is not running". `run` serves every installed package through one filesystem, so a package cannot change under it. The instance lock stays behind when `run` exits, and on a busy machine another program can later get the same process ID; if no XEarthLayer is running, delete the lock file the message names.
+- `install` refuses each package that is already installed, at any version, with the same message, because installing over it is an update. Packages that are not installed install normally and the rest of the batch continues. A new package is picked up the next time `xearthlayer run` starts, and the command says so.
 
 Only one package command runs at a time. A second one, or one started while another is running, stops with "another package operation is running".
 

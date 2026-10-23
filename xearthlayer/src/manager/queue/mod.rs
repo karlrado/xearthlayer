@@ -12,7 +12,6 @@ mod state;
 mod worker;
 
 use std::collections::BTreeMap;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -31,6 +30,8 @@ pub(crate) use lock::LOCK_FILE_NAME;
 
 /// What a signal handler or a UI needs to stop a queue it does not own.
 pub trait QueueControl: Send + Sync {
+    /// Cancel one job. See [`CancelResult`].
+    fn cancel(&self, id: JobId) -> CancelResult;
     /// Cancel every unfinished job.
     fn cancel_all(&self);
     /// Cancel every job and stop waiting for cleanup: waiters return once
@@ -50,6 +51,10 @@ impl Canceller {
         Self(control)
     }
 
+    pub fn cancel(&self, id: JobId) -> CancelResult {
+        self.0.cancel(id)
+    }
+
     pub fn cancel_all(&self) {
         self.0.cancel_all();
     }
@@ -60,6 +65,10 @@ impl Canceller {
 }
 
 impl<S: Stages> QueueControl for state::Shared<S> {
+    fn cancel(&self, id: JobId) -> CancelResult {
+        state::Shared::cancel(self, id)
+    }
+
     fn cancel_all(&self) {
         self.cancel_every(false);
     }
@@ -77,9 +86,11 @@ pub struct InstallQueue<S: Stages = crate::manager::PackageInstaller> {
 }
 
 impl<S: Stages> InstallQueue<S> {
+    /// Take the lock and start the threads. The sweep of what a killed run
+    /// left behind runs on the downloader thread, so this returns at once;
+    /// no job starts until the sweep is done.
     pub fn start(stages: S, observer: Arc<dyn QueueObserver>) -> ManagerResult<Self> {
         let lock = lock::QueueLock::acquire(stages.temp_dir())?;
-        lock::sweep(stages.temp_dir(), stages.packages_root());
         let shared = Arc::new(state::Shared::new(stages, observer, lock));
         let spawn = |name: &str, body: fn(Arc<state::Shared<S>>)| {
             let shared = Arc::clone(&shared);
@@ -120,7 +131,7 @@ impl<S: Stages> InstallQueue<S> {
                 package_type: summary.package_type.to_string(),
             });
         }
-        let id = JobId(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
+        let id = JobId::next();
         self.shared.emit(id, JobEvent::Queued(&summary));
         let kind = summary.kind;
         state.jobs.insert(
@@ -234,9 +245,11 @@ impl<S: Stages> InstallQueue<S> {
 
 impl<S: Stages> Drop for InstallQueue<S> {
     /// Cancel everything, let a running swap finish, and join both threads.
-    /// An abandoned queue is not joined: its threads finish on their own.
+    /// An abandoned queue is not joined, nor is one still sweeping (a sweep
+    /// cannot be cut short): their threads finish on their own, and the
+    /// lock is held until they do.
     fn drop(&mut self) {
-        let abandoned = {
+        let detached = {
             let mut state = self.shared.lock();
             state.shutting_down = true;
             for entry in state.jobs.values() {
@@ -247,9 +260,9 @@ impl<S: Stages> Drop for InstallQueue<S> {
                 self.shared.finish(&mut state, id, JobOutcome::Cancelled);
             }
             self.shared.changed.notify_all();
-            state.abandoned
+            state.abandoned || !state.swept
         };
-        if abandoned {
+        if detached {
             return;
         }
         for thread in self.threads.drain(..) {

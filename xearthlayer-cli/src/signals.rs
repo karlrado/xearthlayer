@@ -182,17 +182,40 @@ pub struct SignalWatch {
     handle: Handle,
     thread: Option<JoinHandle<()>>,
     received: Arc<Mutex<Option<Signal>>>,
+    /// How many signals came, and the last of them.
+    latest: Arc<Mutex<Option<(u64, Signal)>>>,
     hangup_flag: SigId,
 }
 
 impl SignalWatch {
     pub fn start(active: ActiveQueue, notice: impl Fn(&str) + Send + 'static) -> io::Result<Self> {
+        Self::spawn(active, notice, true)
+    }
+
+    /// Like [`start`](Self::start), except that a signal with no queue
+    /// running is only recorded, never given its default action. For a
+    /// caller that must restore the terminal before it exits, and so reads
+    /// [`received`](Self::received) and leaves on its own.
+    pub fn start_handling_all(
+        active: ActiveQueue,
+        notice: impl Fn(&str) + Send + 'static,
+    ) -> io::Result<Self> {
+        Self::spawn(active, notice, false)
+    }
+
+    fn spawn(
+        active: ActiveQueue,
+        notice: impl Fn(&str) + Send + 'static,
+        default_when_idle: bool,
+    ) -> io::Result<Self> {
         // First, so the flag is set before the watch thread hears of SIGHUP.
         let hangup_flag = signal_hook::flag::register(SIGHUP, Arc::clone(terminal_gone_flag()))?;
         let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])?;
         let handle = signals.handle();
         let received = Arc::new(Mutex::new(None));
         let first = Arc::clone(&received);
+        let latest = Arc::new(Mutex::new(None));
+        let last = Arc::clone(&latest);
         let thread = std::thread::Builder::new()
             .name("xel-signals".into())
             .spawn(move || {
@@ -202,9 +225,16 @@ impl SignalWatch {
                         continue;
                     };
                     lock(&first).get_or_insert(signal);
+                    {
+                        let mut last = lock(&last);
+                        let count = last.map_or(0, |(count, _)| count);
+                        *last = Some((count + 1, signal));
+                    }
                     let Some((action, queue)) = active.request(action(signal, interrupts)) else {
                         // Nothing to protect: behave as if no handler existed.
-                        let _ = signal_hook::low_level::emulate_default_handler(raw);
+                        if default_when_idle {
+                            let _ = signal_hook::low_level::emulate_default_handler(raw);
+                        }
                         continue;
                     };
                     if signal == Signal::Interrupt {
@@ -228,6 +258,7 @@ impl SignalWatch {
             handle,
             thread: Some(thread),
             received,
+            latest,
             hangup_flag,
         })
     }
@@ -237,6 +268,12 @@ impl SignalWatch {
     /// not turn a 130 into a 143.
     pub fn received(&self) -> Option<Signal> {
         *lock(&self.received)
+    }
+
+    /// How many signals were received, and the last one, for a caller that
+    /// reacts to each: the count goes up by one per signal.
+    pub fn latest(&self) -> Option<(u64, Signal)> {
+        *lock(&self.latest)
     }
 }
 
@@ -296,6 +333,9 @@ mod tests {
         }
     }
     impl QueueControl for Recorded {
+        fn cancel(&self, _id: xearthlayer::manager::JobId) -> xearthlayer::manager::CancelResult {
+            xearthlayer::manager::CancelResult::Unknown
+        }
         fn cancel_all(&self) {
             self.cancels.fetch_add(1, Ordering::SeqCst);
             if self.hold_cancel.load(Ordering::SeqCst) {
@@ -397,5 +437,18 @@ mod tests {
             Some(Signal::Interrupt),
             "the first signal decides the exit code"
         );
+        assert_eq!(
+            watch.latest(),
+            Some((4, Signal::Hangup)),
+            "every signal is counted, the last one kept"
+        );
+        drop(watch);
+
+        // With no queue, a watch handling every signal only records it:
+        // the default action would end the test binary here.
+        let watch = SignalWatch::start_handling_all(ActiveQueue::default(), |_| {}).unwrap();
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).unwrap();
+        eventually(|| watch.received() == Some(Signal::Terminate));
+        assert_eq!(watch.latest(), Some((1, Signal::Terminate)));
     }
 }

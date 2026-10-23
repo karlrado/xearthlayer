@@ -3,16 +3,13 @@
 //! Each handler implements the `CommandHandler` trait and contains the
 //! business logic for its respective command.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xearthlayer::config::format_size;
-use xearthlayer::manager::{
-    create_consolidated_overlay, create_consolidated_overlay_except, remove_overlay_symlink,
-    InstallResult, InstalledPackage, LocalPackageStore, MountStatus, PackageStatus,
-};
-use xearthlayer::xworld_pro::{detect, overlay_plan, OverlayCoverage, OverlayPlan};
-use xearthlayer_package::{LibraryEntry, PackageLibrary, PackageType};
+use xearthlayer::manager::{InstallResult, InstalledPackage, LocalPackageStore, PackageStatus};
+use xearthlayer_package::{LibraryEntry, PackageType};
 
+use super::actions::{self, RunActive};
 use super::args::{CheckArgs, InfoArgs, InstallArgs, ListArgs, RemoveArgs, UpdateArgs};
 use super::selector::{resolve, Selection};
 use super::traits::{CommandContext, CommandHandler};
@@ -66,15 +63,6 @@ impl CommandHandler for ListHandler {
                     "Size: {}",
                     format_size(package.size_bytes as usize)
                 ));
-
-                if package.package_type() == PackageType::Ortho {
-                    let mount_status = match package.mount_status {
-                        MountStatus::Mounted => "Mounted",
-                        MountStatus::NotMounted => "Not mounted",
-                        MountStatus::Unknown => "Unknown",
-                    };
-                    ctx.output.indented(&format!("Mount: {}", mount_status));
-                }
                 ctx.output.newline();
             } else {
                 ctx.output.println(&format!(
@@ -209,6 +197,12 @@ fn select_installed(
     )
 }
 
+impl From<RunActive> for CliError {
+    fn from(run: RunActive) -> Self {
+        CliError::Packages(run.message())
+    }
+}
+
 /// Fetch each entry's metadata, then install every package whose metadata
 /// arrived as one batch, so each installs while the next downloads (#292).
 /// Shared by `install` and `update`. Returns one result per entry, in order.
@@ -257,66 +251,29 @@ fn install_entries(
         .collect()
 }
 
-/// Rebuild the consolidated overlay folder after an overlay install/remove/update.
-///
-/// This creates a single `yzXEL_overlay/` folder in Custom Scenery containing
-/// symlinks to all DSF files from installed overlay packages. Any stale per-region
-/// symlinks (e.g. `yzXEL_na_overlay`) are automatically cleaned up.
+/// Rebuild the consolidated overlay folder after an overlay install/remove/update
+/// and show what happened.
 fn rebuild_consolidated_overlay(
-    install_dir: &std::path::Path,
-    custom_scenery_path: &Option<std::path::PathBuf>,
+    install_dir: &Path,
+    custom_scenery_path: &Option<PathBuf>,
     disable_overlays: bool,
     xworld_pro: bool,
     ctx: &CommandContext<'_>,
 ) {
-    if disable_overlays {
-        // Per `packages.disable_overlays` the consolidated overlay is suppressed
-        // at runtime. We deliberately leave any existing folder alone here; the
-        // next `xearthlayer run` removes it during startup. Issue #152.
-        ctx.output.println(
-            "Note: packages.disable_overlays = true; skipping consolidated overlay rebuild. \
-             The folder will be removed on next 'xearthlayer run'.",
-        );
-        return;
+    let report = actions::rebuild_overlays(
+        ctx.manager,
+        install_dir,
+        custom_scenery_path.as_deref(),
+        disable_overlays,
+        xworld_pro,
+    );
+    for line in &report.lines {
+        ctx.output.println(line);
     }
-    let Some(ref scenery_path) = custom_scenery_path else {
-        ctx.output
-            .println("Note: No Custom Scenery path configured. Overlay symlink not created.");
-        ctx.output
-            .println("Set 'custom_scenery_path' in config to enable automatic overlay creation.");
-        return;
-    };
-
-    ctx.output.println("Rebuilding consolidated overlay...");
-    let store = ctx.manager.create_store(install_dir);
-    // The same choice `xearthlayer run` makes at startup.
-    let coverage = xworld_pro
-        .then(|| OverlayCoverage::from_detection(&detect(scenery_path)))
-        .filter(|c| !c.is_empty());
-    let result = match overlay_plan(disable_overlays, coverage.as_ref()) {
-        OverlayPlan::Except(coverage) => {
-            let result = create_consolidated_overlay_except(&store, scenery_path, &|r: &str| {
-                coverage.suppresses(r)
-            });
-            ctx.output.println(&format!(
-                "X-World Pro active ({}): left out {} overlay regions",
-                coverage.describe(),
-                result.excluded_regions.len()
-            ));
-            result
-        }
-        _ => create_consolidated_overlay(&store, scenery_path),
-    };
-    if result.success {
-        ctx.output.success(&format!(
-            "Consolidated overlay updated: {} regions, {} files",
-            result.package_count, result.file_count
-        ));
-    } else if let Some(error) = result.error {
-        ctx.output.error(&format!(
-            "Warning: Failed to create consolidated overlay: {}",
-            error
-        ));
+    match report.outcome {
+        Some(outcome) if report.failed => ctx.output.error(&outcome),
+        Some(outcome) => ctx.output.success(&outcome),
+        None => {}
     }
 }
 
@@ -328,38 +285,21 @@ fn rebuild_consolidated_overlay(
 pub struct InstallHandler;
 
 impl InstallHandler {
-    /// The packages to install: each selected entry, followed by its
-    /// region's overlay when auto-install is on and the library has one.
-    fn plan<'a>(
-        entries: &[&'a LibraryEntry],
-        library: &'a PackageLibrary,
-        auto_install_overlays: bool,
-    ) -> Vec<&'a LibraryEntry> {
-        entries
-            .iter()
-            .flat_map(|&entry| {
-                let overlay = (auto_install_overlays && entry.package_type == PackageType::Ortho)
-                    .then(|| library.find(&entry.title, PackageType::Overlay))
-                    .flatten();
-                std::iter::once(entry).chain(overlay)
-            })
-            .collect()
-    }
-
     /// Report each package's outcome, rebuild the consolidated overlay once
     /// if any overlay installed, and fail the command if any package failed.
     ///
     /// Packages succeed or fail independently: an overlay still installs
     /// when its ortho package fails.
     fn report(
-        plan: &[&LibraryEntry],
-        results: Vec<Result<InstallResult, CliError>>,
+        outcomes: Vec<(&LibraryEntry, Result<InstallResult, CliError>)>,
         args: &InstallArgs,
+        running: bool,
         ctx: &CommandContext<'_>,
     ) -> Result<(), CliError> {
+        let total = outcomes.len();
         let mut failures = Vec::new();
         let mut overlay_installed = false;
-        for (entry, result) in plan.iter().zip(results) {
+        for (entry, result) in outcomes {
             match result {
                 Ok(result) => {
                     ctx.output.success(&format!(
@@ -374,6 +314,10 @@ impl InstallHandler {
                         format_size(result.bytes_downloaded as usize),
                         result.files_extracted
                     ));
+                    if running {
+                        ctx.output
+                            .indented(&format!("Note: {}", actions::RESTART_NOTE));
+                    }
                     overlay_installed |= result.package_type == PackageType::Overlay;
                 }
                 Err(e) => failures.push((entry, e)),
@@ -393,7 +337,7 @@ impl InstallHandler {
 
         match failures.len() {
             0 => Ok(()),
-            _ if plan.len() == 1 => Err(failures.remove(0).1),
+            _ if total == 1 => Err(failures.remove(0).1),
             failed => {
                 for (entry, e) in &failures {
                     ctx.output
@@ -401,8 +345,7 @@ impl InstallHandler {
                 }
                 Err(CliError::Packages(format!(
                     "{} of {} packages failed to install",
-                    failed,
-                    plan.len()
+                    failed, total
                 )))
             }
         }
@@ -460,15 +403,53 @@ impl CommandHandler for InstallHandler {
             }
         }
 
-        let plan = Self::plan(&entries, &library, args.auto_install_overlays);
+        let plan = actions::plan_install(&entries, &library, args.auto_install_overlays);
+        // While `run` serves the packages, an install over an installed
+        // package is an update in disguise: refuse it, package by package.
+        // New packages install, and `run` picks them up on its next start.
+        let refusal = actions::check_replacement(ctx.manager).err();
+        let mut allowed: Vec<_> = plan.iter().copied().enumerate().collect();
+        let mut outcomes = Vec::new();
+        if let Some(run) = &refusal {
+            let store = ctx.manager.create_store(&args.install_dir);
+            let installed = ctx
+                .manager
+                .list_packages(&store)
+                .map_err(|e| CliError::Packages(e.to_string()))?;
+            let refused;
+            (refused, allowed) = allowed.into_iter().partition(|(_, entry)| {
+                installed.iter().any(|p| {
+                    p.region().eq_ignore_ascii_case(&entry.title)
+                        && p.package_type() == entry.package_type
+                })
+            });
+            outcomes.extend(
+                refused
+                    .into_iter()
+                    .map(|(position, entry)| (position, entry, Err(run.clone().into()))),
+            );
+        }
+
         let results = install_entries(
-            &plan,
+            &allowed.iter().map(|&(_, entry)| entry).collect::<Vec<_>>(),
             &args.install_dir,
             &args.temp_dir,
             args.concurrent_downloads,
             ctx,
         );
-        Self::report(&plan, results, &args, ctx)
+        outcomes.extend(
+            allowed
+                .into_iter()
+                .zip(results)
+                .map(|((position, entry), result)| (position, entry, result)),
+        );
+        // Report in plan order, refused and installed alike.
+        outcomes.sort_by_key(|&(position, ..)| position);
+        let outcomes = outcomes
+            .into_iter()
+            .map(|(_, entry, result)| (entry, result))
+            .collect();
+        Self::report(outcomes, &args, refusal.is_some(), ctx)
     }
 }
 
@@ -483,6 +464,7 @@ impl CommandHandler for UpdateHandler {
     type Args = UpdateArgs;
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        actions::check_replacement(ctx.manager)?;
         ctx.output.println("Checking for updates...");
         ctx.output.newline();
 
@@ -622,6 +604,7 @@ impl CommandHandler for RemoveHandler {
     type Args = RemoveArgs;
 
     fn execute(args: Self::Args, ctx: &CommandContext<'_>) -> Result<(), CliError> {
+        actions::check_removal(ctx.manager)?;
         let store = ctx.manager.create_store(&args.install_dir);
         let packages = select_installed(ctx, &store, &args.selection, args.package_type)?;
 
@@ -643,15 +626,6 @@ impl CommandHandler for RemoveHandler {
             ctx.output.newline();
         }
 
-        if let Some(mounted) = packages.iter().find(|p| {
-            p.package_type() == PackageType::Ortho && p.mount_status == MountStatus::Mounted
-        }) {
-            return Err(CliError::Packages(format!(
-                "Cannot remove a mounted package ({}). Unmount it first.",
-                mounted.region()
-            )));
-        }
-
         // Phase two: one confirmation for the whole set, unless --force.
         let prompt = match packages.len() {
             1 => "Are you sure you want to remove this package?".to_string(),
@@ -670,22 +644,13 @@ impl CommandHandler for RemoveHandler {
                 .remove_package(&store, region, args.package_type, &args.temp_dir)
                 .map_err(|e| CliError::Packages(e.to_string()))?;
 
-            // Clean up stale per-region overlay symlink if one exists. Only now:
-            // a refused remove (e.g. the queue lock is held) leaves the package
-            // installed, and it must keep its symlink.
-            if args.package_type == PackageType::Overlay {
-                if let Some(ref custom_scenery_path) = args.custom_scenery_path {
-                    match remove_overlay_symlink(region, custom_scenery_path) {
-                        Ok(true) => {
-                            tracing::info!(region = %region, "Removed stale per-region overlay symlink");
-                        }
-                        Ok(false) => {}
-                        Err(e) => {
-                            tracing::warn!(region = %region, error = %e, "Failed to remove per-region overlay symlink");
-                        }
-                    }
-                }
-            }
+            // Only now: a refused remove (e.g. the queue lock is held) leaves the
+            // package installed, and it must keep its overlay symlink.
+            actions::after_removal(
+                region,
+                args.package_type,
+                args.custom_scenery_path.as_deref(),
+            );
 
             ctx.output
                 .success(&format!("Removed {} ({})", region, args.package_type));
@@ -757,17 +722,6 @@ impl CommandHandler for InfoHandler {
                 format_size(package.size_bytes as usize)
             ));
             ctx.output.newline();
-
-            if package.package_type() == PackageType::Ortho {
-                ctx.output.println("Mount Status:");
-                let mount_status = match package.mount_status {
-                    MountStatus::Mounted => "Mounted (FUSE filesystem active)",
-                    MountStatus::NotMounted => "Not mounted",
-                    MountStatus::Unknown => "Unknown",
-                };
-                ctx.output.indented(mount_status);
-                ctx.output.newline();
-            }
 
             ctx.output.println("Archive Parts:");
             for part in &package.metadata.parts {
@@ -962,15 +916,19 @@ mod tests {
     }
 
     #[test]
-    fn one_mounted_package_aborts_the_batch_before_anything_is_removed() {
+    fn a_running_instance_refuses_the_whole_remove_batch() {
         let manager = FakeManager::default()
-            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST"])
-            .with_mounted("NA-CANADA-EAST");
+            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"])
+            .with_running_instance(4242);
 
         let run = remove(&manager, true, "NA-CANADA", true);
 
         let message = packages_error(run.result);
-        assert!(message.contains("NA-CANADA-EAST"), "{message}");
+        assert!(message.contains("pid 4242"), "{message}");
+        assert!(
+            message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
         assert!(manager.removals().is_empty());
         assert!(run.interaction.prompts().is_empty());
     }
@@ -1056,14 +1014,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_all_refuses_when_any_package_is_mounted() {
+    fn remove_all_refuses_while_run_is_serving_packages() {
         let manager = FakeManager::default()
             .with_installed(PackageType::Ortho, &["EU-WEST", "AF-SOUTH"])
-            .with_mounted("AF-SOUTH");
+            .with_running_instance(7);
 
         let run = remove_selection(&manager, true, Selection::All, true);
 
-        assert!(packages_error(run.result).contains("mounted"));
+        assert!(packages_error(run.result).contains("XEarthLayer is running (pid 7)"));
         assert!(manager.removals().is_empty());
     }
 
@@ -1490,6 +1448,115 @@ mod tests {
         let text = run.output.text();
         assert!(text.contains("Failed to update NA-CANADA-WEST"), "{text}");
         assert!(text.contains("1 succeeded, 1 failed"), "{text}");
+    }
+
+    #[test]
+    fn a_running_instance_refuses_an_update_and_installs_nothing() {
+        let manager = FakeManager::default()
+            .with_update(PackageType::Ortho, "NA-CANADA-WEST")
+            .with_running_instance(4242);
+
+        let run = update(&manager, "NA-CANADA");
+
+        let message = packages_error(run.result);
+        assert!(message.contains("pid 4242"), "{message}");
+        assert!(
+            message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
+        assert!(manager.batches().is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // install while `xearthlayer run` is serving packages
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn a_running_instance_still_installs_packages_that_are_not_installed() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-GREENLAND"]);
+        let text = run.output.text();
+        assert!(text.contains("restart xearthlayer run to use it"), "{text}");
+    }
+
+    #[test]
+    fn a_running_instance_refuses_a_package_that_is_already_installed() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_installed(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        let message = packages_error(run.result);
+        assert!(
+            message.contains("XEarthLayer is running (pid 4242)"),
+            "{message}"
+        );
+        assert!(
+            message.contains("stop it before updating or removing packages"),
+            "{message}"
+        );
+        assert!(manager.installs().is_empty());
+    }
+
+    /// Installed metadata may carry a legacy lower-case title; it is the
+    /// same package folder, so it is still refused while `run` serves it.
+    #[test]
+    fn a_running_instance_refuses_an_installed_package_whose_title_differs_in_case() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_installed(PackageType::Ortho, &["na-greenland"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        let message = packages_error(run.result);
+        assert!(
+            message.contains("XEarthLayer is running (pid 4242)"),
+            "{message}"
+        );
+        assert!(manager.installs().is_empty());
+    }
+
+    #[test]
+    fn a_running_instance_refuses_per_package_and_the_rest_of_the_batch_continues() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-CANADA-WEST", "NA-CANADA-EAST"])
+            .with_installed(PackageType::Ortho, &["NA-CANADA-WEST"])
+            .with_running_instance(4242);
+
+        let run = install(&manager, true, "NA-CANADA", false);
+
+        assert_eq!(manager.installs(), ["NA-CANADA-EAST"]);
+        let text = run.output.text();
+        assert!(text.contains("Installed NA-CANADA-EAST"), "{text}");
+        assert!(
+            text.contains("NA-CANADA-WEST (ortho): ")
+                && text.contains("XEarthLayer is running (pid 4242)"),
+            "{text}"
+        );
+        assert!(text.contains("restart xearthlayer run to use it"), "{text}");
+        assert!(packages_error(run.result).contains("1 of 2"));
+    }
+
+    #[test]
+    fn without_a_running_instance_an_installed_package_installs_again() {
+        let manager = FakeManager::default()
+            .with_library(PackageType::Ortho, &["NA-GREENLAND"])
+            .with_installed(PackageType::Ortho, &["NA-GREENLAND"]);
+
+        let run = install(&manager, true, "NA-G", false);
+
+        run.result.unwrap();
+        assert_eq!(manager.installs(), ["NA-GREENLAND"]);
+        assert!(!run.output.text().contains("restart xearthlayer run"));
     }
 
     // ------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 //! This module defines the interfaces that handlers depend on, enabling
 //! dependency injection and testability.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use xearthlayer::manager::{
     InstallResult, InstalledPackage, LocalPackageStore, ManagerResult, PackageInfo, PackageStatus,
@@ -85,12 +85,22 @@ pub trait PackageManagerService: Send + Sync {
     /// Fetch package metadata from a URL.
     fn fetch_metadata(&self, url: &str) -> ManagerResult<PackageMetadata>;
 
-    /// Check for package updates.
+    /// Check every installed and library package against the library.
+    fn try_check_updates(
+        &self,
+        store: &LocalPackageStore,
+        library: &PackageLibrary,
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>>;
+
+    /// Check for package updates. A failed check gives no packages, which
+    /// the CLI reports as nothing to update.
     fn check_updates(
         &self,
         store: &LocalPackageStore,
         library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)>;
+    ) -> Vec<(PackageInfo, PackageStatus)> {
+        self.try_check_updates(store, library).unwrap_or_default()
+    }
 
     /// Install a batch of packages, each installing while the next one
     /// downloads. Returns one result per package, in order.
@@ -113,6 +123,24 @@ pub trait PackageManagerService: Send + Sync {
 
     /// List all installed packages.
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>>;
+
+    /// The region and type of every installed package. Unlike
+    /// `list_packages` it walks no package tree for a size, so a caller that
+    /// only needs to know what is installed does not wait on the disk.
+    fn list_package_keys(
+        &self,
+        store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>>;
+
+    /// The pid of another `xearthlayer run` that is serving packages, if any.
+    ///
+    /// Read from the instance lock `run` holds, so it is true for as long as
+    /// that process lives, whatever it has mounted.
+    fn running_instance(&self) -> Option<u32>;
+
+    /// The instance lock `running_instance` reads, named in refusals so a
+    /// user can delete a stale one.
+    fn instance_lock(&self) -> PathBuf;
 }
 
 // ============================================================================

@@ -3,7 +3,6 @@
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use xearthlayer_package::package_mountpoint;
@@ -66,6 +65,8 @@ pub(super) struct State<D> {
     pub(super) capacity_known: bool,
     pub(super) finished: BTreeMap<JobId, JobOutcome>,
     pub(super) swapping: bool,
+    /// The startup sweep is done. Neither thread takes a job before.
+    pub(super) swept: bool,
     pub(super) shutting_down: bool,
     /// Waiters stop waiting once no swap runs, and dropping the queue
     /// no longer joins its threads.
@@ -82,6 +83,7 @@ impl<D> State<D> {
             capacity_known: false,
             finished: BTreeMap::new(),
             swapping: false,
+            swept: false,
             shutting_down: false,
             abandoned: false,
         }
@@ -102,7 +104,6 @@ pub(super) struct Shared<S: Stages> {
     observer: Arc<dyn QueueObserver>,
     state: Mutex<State<S::Downloaded>>,
     pub(super) changed: Condvar,
-    pub(super) next_id: AtomicU64,
     /// Held until the last holder of this state goes: normally after both
     /// threads are joined, and when the queue is abandoned, after the
     /// detached threads finish, so no new queue sweeps under them.
@@ -116,7 +117,6 @@ impl<S: Stages> Shared<S> {
             observer,
             state: Mutex::new(State::new()),
             changed: Condvar::new(),
-            next_id: AtomicU64::new(1),
             _lock: lock,
         }
     }
@@ -179,7 +179,12 @@ impl<S: Stages> Shared<S> {
             self.changed.notify_all();
         }
         drop(state);
-        self.clean_up(taken);
+        if abandon {
+            // Nothing waits for these deletes, so neither does the caller.
+            drop_elsewhere(taken);
+        } else {
+            self.clean_up(taken);
+        }
     }
 
     /// Drop what `cancel_locked` took, outside the lock, then finish the
@@ -270,6 +275,19 @@ impl<S: Stages> Shared<S> {
         let mut state = self.lock();
         self.finish(&mut state, id, outcome);
     }
+}
+
+/// Drop `taken` on a thread of its own, or here if none can be made.
+/// Abandoned jobs are already finished, so nothing is left to do after.
+fn drop_elsewhere<D: Send + 'static>(taken: Vec<Taken<D>>) {
+    if taken.is_empty() {
+        return;
+    }
+    debug_assert!(taken.iter().all(|t| !t.finish_after));
+    // A spawn that fails drops the closure, and with it `taken`, here.
+    let _ = std::thread::Builder::new()
+        .name("xel-queue-discard".into())
+        .spawn(move || drop(taken));
 }
 
 /// A stage's error as a job outcome.

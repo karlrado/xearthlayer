@@ -183,8 +183,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
     - `DiskLedger` budgets two filesystems: a package's parts (`s`) on temp until it installs or fails, and its estimated tree (`TREE_MULTIPLIER` = 3, times `s`) on the packages filesystem, which stays charged once installed. `Capacity::Split` waits on temp and refuses on packages; `Capacity::Shared` (one device) admits only if `installed + sum(3*s before j) + 3*s[j] + sum(s from j)` fits for every admitted j. The installer never waits, so the threads cannot deadlock. `Stages::capacity` is read once per busy period, never mid-install
     - Removes (`packages remove` too) skip the downloader; `submit` refuses a second job for the same package
     - `CancelToken` per job, checked per buffer and per tar entry; the tree is extracted from the verified parts straight into `.xel-staging-*` beside its destination (no joined archive; each part is deleted once read), then the swap (`manager/aside.rs`: rename old aside, rename staged in, delete old after `end_swap`) is the only step that cannot be cancelled. A cancelled job finishes only after its temp tree is deleted (a downloaded one waits in `Phase::Cancelling`), so `wait_for` returning means temp is clean; `abandon` does not wait
-    - `flock` on `{temp_dir}/.queue.lock` allows one package operation at a time; `sweep` at start deletes `install_*`, `.xel-staging-*` and `.xel-removed-*` leftovers, and renames a `.xel-aside-*` back when its package folder is missing (else deletes it). A remove renames straight to `.xel-removed-<name>` before its slow delete, so an interrupted remove is never restored as a half-deleted package; the aside rule applies only between a swap's two renames
+    - `flock` on `{temp_dir}/.queue.lock` allows one package operation at a time; `sweep` runs on the queue's downloader thread (`start` returns at once, no job starts until it is done) and deletes `install_*`, `.xel-staging-*` and `.xel-removed-*` leftovers, and renames a `.xel-aside-*` back when its package folder is missing (else deletes it). A remove renames straight to `.xel-removed-<name>` before its slow delete, so an interrupted remove is never restored as a half-deleted package; the aside rule applies only between a swap's two renames
     - CLI signals (`xearthlayer-cli/src/signals.rs`): first SIGINT cancels, a second one or SIGTERM/SIGHUP abandons (exit 130, 143, 129 by the first signal); a stop request is remembered across the per-package queues of a multi-package remove; with no queue running, the default action. `run` is not on it yet (#314)
+
+14b. **Package Manager TUI** (`xearthlayer-cli/src/ui/packages/`)
+    - `xearthlayer packages` with no subcommand opens it when stdin and stdout are terminals; otherwise the command help prints. `xearthlayer setup` offers it at the end (`offer_manager`). Three tabs: Local, Library, Progress
+    - `AppState::update(Input, Instant) -> Vec<Effect>` (`app.rs`) is pure: no terminal, network or disk, so every rule is tested by calling it. `Effects` (`effects.rs`) carries the effects out and answers with `Msg`s on one channel; slow reads run on a worker thread
+    - The `InstallQueue` starts on the first job and is released (with its `.queue.lock`) when idle, after one overlay rebuild if an overlay changed. `ChannelObserver` runs under the queue's lock, so it only does an unbounded `send`
+    - The `actions` module (`commands/packages/actions.rs`) is shared with the CLI handlers: `library_status`, `plan_install`, `check_removal`/`check_replacement` (`RunActive`), `RESTART_NOTE`, `rebuild_overlays`
+    - While `xearthlayer run` is alive (`system::process::running_instance` on `paths::lock_file()`), updates, deletes and installs over an installed package are refused; new packages install. The banner and keypress refusals use the cached answer; `Effects` checks again when it carries out `Remove` or `Submit` (whose `replacing` names the installed packages). This replaced a mount-point check that never fired after consolidated mounting
+    - `JobId`s come from one process-wide counter, so the job rows the TUI keeps across released queues never share an id
+    - `runner.rs`: 50 ms key poll, 1 s tick, every signal handled so the terminal is restored; first external SIGINT quits as a confirmed `q`, a later one or SIGTERM abandons, SIGHUP abandons and stops drawing (exit 130, 143, 129)
+    - See `docs/package-management.md` (user) and `docs/dev/package-manager-design.md` (design)
 
 15. **Version Update Checker** (`xearthlayer/src/update/`)
     - `VersionManifest` - Serde model for remote `version.json`
@@ -379,6 +389,7 @@ xearthlayer scenery-index update    # Rebuild index from installed packages
 xearthlayer scenery-index clear     # Delete the cache file
 
 # Package management (<reg> may be the start of a code: NA, NA-CANADA; #293)
+xearthlayer packages                # Package manager TUI (no subcommand; command help without a terminal)
 xearthlayer packages list           # List installed/available packages
 xearthlayer packages install <reg>... # Install every package the codes select (or --all)
 xearthlayer packages update [reg]   # Update packages
@@ -463,6 +474,9 @@ xearthlayer-publish delete --region <code> [--type <ortho|overlay>] [--dry-run] 
 | `xearthlayer/src/config/file.rs` | Configuration loading |
 | `xearthlayer/src/config/keys.rs` | ConfigKey enum with validation (Specification Pattern) |
 | `xearthlayer/src/manager/queue/` | InstallQueue, DiskLedger, Stages, lock and sweep |
+| `xearthlayer-cli/src/ui/packages/` | Package manager TUI: `app.rs` (pure `AppState::update`), `effects.rs` (effects, worker, `ChannelObserver`), `runner.rs` (loop, signals), `view.rs` and `widgets/` |
+| `xearthlayer-cli/src/commands/packages/actions.rs` | The `actions` module shared by the package commands and the TUI (install planning, `run` refusals, overlay rebuild) |
+| `xearthlayer/src/system/process.rs` | `running_instance`, `recorded_pid`: the instance lock reading |
 | `xearthlayer-package/src/` | Scenery package format: metadata, library index, naming, spec version gate (shared by runtime and publisher) |
 | `xearthlayer-publisher/src/` | Package publisher library |
 | `xearthlayer-publisher/src/dedupe/` | Zoom level overlap detection and gap analysis |

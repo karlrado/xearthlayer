@@ -4,7 +4,7 @@
 //! adapting them to the trait interfaces used by handlers.
 
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::progress::ConsoleQueueObserver;
@@ -132,22 +132,20 @@ impl PackageManagerService for DefaultPackageManagerService {
         self.client.fetch_metadata(url)
     }
 
-    fn check_updates(
+    fn try_check_updates(
         &self,
         store: &LocalPackageStore,
         library: &PackageLibrary,
-    ) -> Vec<(PackageInfo, PackageStatus)> {
+    ) -> ManagerResult<Vec<(PackageInfo, PackageStatus)>> {
         let checker = UpdateChecker::new(store, &self.client);
-        match checker.list_all(library) {
-            Ok(infos) => infos
-                .into_iter()
-                .map(|info| {
-                    let status = info.status.clone();
-                    (info, status)
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        }
+        Ok(checker
+            .list_all(library)?
+            .into_iter()
+            .map(|info| {
+                let status = info.status.clone();
+                (info, status)
+            })
+            .collect())
     }
 
     fn install_packages(
@@ -239,6 +237,21 @@ impl PackageManagerService for DefaultPackageManagerService {
 
     fn list_packages(&self, store: &LocalPackageStore) -> ManagerResult<Vec<InstalledPackage>> {
         store.list()
+    }
+
+    fn list_package_keys(
+        &self,
+        store: &LocalPackageStore,
+    ) -> ManagerResult<Vec<(String, PackageType)>> {
+        store.list_keys()
+    }
+
+    fn running_instance(&self) -> Option<u32> {
+        xearthlayer::system::process::running_instance(&self.instance_lock())
+    }
+
+    fn instance_lock(&self) -> PathBuf {
+        xearthlayer::paths::lock_file()
     }
 }
 
