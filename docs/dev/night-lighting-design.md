@@ -728,8 +728,9 @@ decision on video memory.
 ## Attribution
 
 The brightness layer comes from NASA's VIIRS annual night lights. XEL's
-user documentation credits it as **NASA Black Marble VNP46A4/VJ146A4 annual
-nighttime lights** (R21). The lit patterns are Laminar Research's, read
+user documentation credits it as **NASA Black Marble VJ146A4 annual
+nighttime lights** (R21), with NASA's full citation in `docs/configuration.md`
+under `[night]`; release notes that ship night lighting carry it too. The lit patterns are Laminar Research's, read
 from the user's own X-Plane installation and never redistributed.
 
 ## Open Questions

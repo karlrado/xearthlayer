@@ -497,7 +497,9 @@ Lit textures are built from the X-Plane installation behind your Custom Scenery 
 
 Lit urban ground glows where your X-Plane art and NASA VIIRS night lights say a city is, with soft edges between neighbourhoods and no visible repeat in the street pattern. Some neighbourhoods are lit with white LED street lighting instead of sodium orange, more often in bright downtown and industrial areas than in suburbs, at a share and colour temperature that depend on the package's region. The lit layer switches off close to the aircraft, where X-Plane's own 3D lights take over. Generated lit textures are kept in the disk cache (see `disk_size` above), so a revisited area does not need to generate them again.
 
-The brightness of the night lights comes from NASA Black Marble VNP46A4/VJ146A4 annual nighttime lights.
+The brightness of the night lights comes from NASA Black Marble VJ146A4 annual nighttime lights, from the VIIRS instrument on NOAA-20 (JPSS1):
+
+> NASA VIIRS Land Science Investigator-led Processing System. (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset]. NASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center. https://doi.org/10.5067/VIIRS/VJ146A4.002 Date Accessed: 2026-10-16
 
 **Example:**
 ```ini
