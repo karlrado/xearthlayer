@@ -84,7 +84,7 @@ pub enum PackagesCommands {
         #[arg(long)]
         install_dir: Option<PathBuf>,
 
-        /// Temporary directory for downloads (default: from config or system temp)
+        /// Temporary directory for downloads (default: packages.temp_dir, else the tmp folder in the cache directory)
         #[arg(long)]
         temp_dir: Option<PathBuf>,
     },
@@ -106,7 +106,7 @@ pub enum PackagesCommands {
         #[arg(long)]
         install_dir: Option<PathBuf>,
 
-        /// Temporary directory for downloads (default: from config or system temp)
+        /// Temporary directory for downloads (default: packages.temp_dir, else the tmp folder in the cache directory)
         #[arg(long)]
         temp_dir: Option<PathBuf>,
 

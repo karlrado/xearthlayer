@@ -1,7 +1,7 @@
 //! Coverage map generator for visualizing package tile coverage.
 //!
 //! This module generates static PNG images showing the geographic coverage
-//! of scenery packages using OpenStreetMap tiles as a base map.
+//! of scenery packages over a land silhouette drawn locally (see `basemap`).
 //!
 //! # Example
 //!
@@ -29,10 +29,10 @@ use super::{PublishError, PublishResult};
 /// Map style/theme for the base layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MapStyle {
-    /// Standard OpenStreetMap tiles (light theme).
+    /// Light sea and land, drawn locally from Natural Earth (light theme).
     #[default]
     Light,
-    /// CartoDB Dark Matter tiles (dark theme).
+    /// Dark sea and land, drawn locally from Natural Earth (dark theme).
     Dark,
 }
 

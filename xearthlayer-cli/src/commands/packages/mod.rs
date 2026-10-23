@@ -85,7 +85,8 @@ pub(crate) fn default_custom_scenery_dir(config: &ConfigFile) -> Option<PathBuf>
 /// Get the default temporary directory.
 ///
 /// Uses the config file's packages.temp_dir if available, otherwise falls back to
-/// `~/.xearthlayer/tmp`. This avoids using the system temp directory which on many
+/// `paths::temp_dir()`, the `tmp` folder in the cache directory
+/// (`~/.cache/xearthlayer/tmp` on Linux). This avoids using the system temp directory which on many
 /// Linux distributions is a tmpfs (RAM-backed), causing OOM when downloading large
 /// scenery packages.
 pub(crate) fn default_temp_dir(config: &ConfigFile) -> PathBuf {

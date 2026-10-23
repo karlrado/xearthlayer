@@ -44,15 +44,18 @@ use xearthlayer::config::ConfigFile;
 struct Cli {
     /// Enable debug-level logging for the xearthlayer crate.
     ///
-    /// Applies to every subcommand. Equivalent to setting
-    /// `RUST_LOG=info,xearthlayer=debug`. Use this when filing bug reports
-    /// or debugging download / cache issues.
+    /// Applies to the commands that write a log: `run` (xearthlayer.log) and
+    /// the `packages` commands (xearthlayer-packages.log), both in the state
+    /// directory. Other commands write no log and ignore it. Equivalent to
+    /// setting `RUST_LOG=info,xearthlayer=debug`. Use this when filing bug
+    /// reports or debugging download / cache issues.
     #[arg(long, global = true)]
     debug: bool,
 
-    /// Enable Chrome Trace profiling output (writes trace to logs/).
+    /// Enable Chrome Trace profiling output, written beside the log.
     ///
-    /// Applies to every subcommand. Requires the `profiling` feature.
+    /// Applies to `run` and the `packages` commands, the ones that write a
+    /// log; other commands ignore it. Requires the `profiling` feature.
     #[arg(long, global = true)]
     profile: bool,
 
@@ -63,7 +66,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Initialize configuration file at ~/.xearthlayer/config.ini
+    /// Create a configuration file with default settings
+    ///
+    /// The file goes in the standard configuration directory for this system:
+    /// ~/.config/xearthlayer/config.ini on Linux (honouring XDG_CONFIG_HOME),
+    /// ~/Library/Application Support/XEarthLayer/config.ini on macOS.
+    /// `xearthlayer config path` prints the path in use.
     Init,
 
     /// Interactive setup wizard for first-time configuration
@@ -115,7 +123,7 @@ enum Commands {
     ///
     ///   NA          every North America package
     ///   NA-CANADA   NA-CANADA-WEST and NA-CANADA-EAST
-    ///   AS-RUSSIA   AS-RUSSIA-WEST and AS-RUSSIA-EAST
+    ///   AS-RUSSIA   AS-RUSSIA-CENTRAL and AS-RUSSIA-EAST
     ///   AF-SOUTH    exactly AF-SOUTH
     ///
     /// A full code still selects every code that starts with it, so EU also
@@ -140,8 +148,10 @@ enum Commands {
     /// Start XEarthLayer and mount all installed ortho packages for X-Plane
     ///
     /// This is the main command for running XEarthLayer. It discovers all installed
-    /// ortho packages and mounts them as FUSE filesystems in your X-Plane Custom Scenery
-    /// directory. DDS textures are generated on-demand when X-Plane requests them.
+    /// ortho packages and patches and mounts them as one FUSE filesystem, zzXEL_ortho,
+    /// in your X-Plane Custom Scenery directory. DDS textures are generated on demand
+    /// when X-Plane requests them. Ctrl+C, SIGTERM or closing the terminal unmounts
+    /// cleanly.
     Run {
         /// Imagery provider (default: from config)
         #[arg(long, value_enum)]
@@ -159,7 +169,7 @@ enum Commands {
         #[arg(long, value_enum)]
         dds_format: Option<DdsCompression>,
 
-        /// Download timeout in seconds (default: from config)
+        /// Per-chunk download timeout in seconds (default: executor.request_timeout_secs)
         #[arg(long)]
         timeout: Option<u64>,
 

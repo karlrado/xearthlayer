@@ -577,10 +577,10 @@ After publishing packages, generate visual coverage maps for your repository REA
 ### Static PNG Map
 
 ```bash
-# Light theme (OpenStreetMap tiles)
+# Light theme
 xearthlayer-publish coverage --output coverage.png
 
-# Dark theme (CartoDB Dark Matter tiles) - recommended for GitHub READMEs
+# Dark theme, recommended for GitHub READMEs
 xearthlayer-publish coverage --dark --output coverage.png
 
 # Custom dimensions
@@ -612,7 +612,7 @@ xearthlayer-publish coverage --geojson --output coverage.geojson
 | `--output, -o` | Output file path (default: coverage.png) |
 | `--width` | Image width in pixels (PNG only, default: 1200) |
 | `--height` | Image height in pixels (PNG only, default: 600) |
-| `--dark` | Use dark theme with CartoDB tiles (PNG only) |
+| `--dark` | Use the dark theme (PNG only) |
 | `--geojson` | Generate GeoJSON instead of PNG |
 | `--metadata` | Path to region_metadata.json (default: `<repo>/region_metadata.json`) |
 

@@ -110,7 +110,7 @@ pub enum PublishCommands {
         #[arg(long)]
         source: PathBuf,
 
-        /// Region code (e.g., "na", "eur", "asia")
+        /// Region code (e.g., "eu-west", "na-canada-east")
         #[arg(long)]
         region: String,
 
@@ -276,7 +276,7 @@ pub enum PublishCommands {
         #[arg(long, default_value = "600")]
         height: u32,
 
-        /// Use dark mode (CartoDB Dark Matter tiles, PNG only)
+        /// Use dark mode (dark sea and land, PNG only)
         #[arg(long)]
         dark: bool,
 
@@ -298,7 +298,7 @@ pub enum PublishCommands {
     /// Detects and removes redundant tiles where multiple zoom levels
     /// cover the same geographic area, eliminating Z-fighting artifacts.
     Dedupe {
-        /// Region code (e.g., "na", "eur", "asia")
+        /// Region code (e.g., "eu-west", "na-canada-east")
         #[arg(long)]
         region: String,
 
@@ -339,7 +339,7 @@ pub enum PublishCommands {
     /// Identifies missing tiles needed to complete ZL18 coverage over ZL16 areas.
     /// Outputs coordinates that can be used to regenerate tiles in Ortho4XP.
     Gaps {
-        /// Region code (e.g., "na", "eur", "asia")
+        /// Region code (e.g., "eu-west", "na-canada-east")
         #[arg(long)]
         region: String,
 
@@ -367,7 +367,7 @@ pub enum PublishCommands {
     /// Delete a regional package: its library index entry, working directory
     /// and archives.
     Delete {
-        /// Region code (e.g. "na-usa-mx-central")
+        /// Region code (e.g., "na-canada-east")
         #[arg(long)]
         region: String,
 
