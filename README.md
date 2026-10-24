@@ -47,7 +47,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
   - **USGS** - Free, US coverage only
 - **Adaptive Prefetch System** - Phase-aware tile prediction
   - Flight phase detection: Ground (ring pattern) vs Cruise (track-based bands)
-  - Configurable mode: Opportunistic (default), Aggressive, or Disabled
+  - On by default; switch off with `prefetch.enabled = false` or `run --no-prefetch`
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
 - **Multiple compression backends**: ISPC SIMD (default), pure-Rust software, or GPU-accelerated via wgpu compute shaders
@@ -114,13 +114,15 @@ See [Getting Started](docs/getting-started.md) for the complete guide.
 
 XEarthLayer provides a real-time terminal dashboard showing cache status, download activity, and prefetch progress:
 
-![XEarthLayer CLI Dashboard](docs/images/xearthlayer-v0.3.0.png)
+![XEarthLayer TUI Dashboard](docs/images/xearthlayer-tui-0.5.0-beta.png)
 
 ## XEarthLayer Regional Scenery Package Project
 
 XEarthLayer requires regional scenery packages to be installed in order for it to work. XEarthLayer is creating a regional package library for general public use. It is possible for anyone to create and publish their own package server.
 
-[XEarthLayer Scenery Packages](https://github.com/samsoir/xearthlayer-regional-scenery) are hosted on Github.
+[XEarthLayer Scenery Packages](https://github.com/samsoir/xearthlayer-regional-scenery) are hosted on Github, and managed in XEarthLayer from the command line or the package manager TUI.
+
+![XEarthLayer TUI Package Manager](docs/images/xearthlayer-package-manger-0.5.0-beta.png)
 
 ## Adaptive Prefetch System
 
@@ -130,15 +132,9 @@ XEarthLayer reduces scenery loading stutters by prefetching tiles ahead of your 
 
 A prefetch box moves with your aircraft and queues the scenery inside it before X-Plane asks for it. On the ground the box is centred on you (GS < 40kt); in cruise it grows with ground speed and shifts ahead in your direction of travel. Prefetch pauses during takeoff and ramps back up once you are climbing, and it yields whenever XEarthLayer or X-Plane is busy.
 
-### Prefetch Modes
+### Switching Prefetch Off
 
-Set with `xearthlayer config set prefetch.mode <mode>`.
-
-| Mode | Behaviour |
-|------|-----------|
-| **Opportunistic** | Prefetch on (default) |
-| **Aggressive** | Currently identical to Opportunistic |
-| **Disabled** | Never prefetch |
+Prefetch is on by default. Switch it off with `xearthlayer config set prefetch.enabled false`, or for a single run with `xearthlayer run --no-prefetch`.
 
 ### Telemetry
 
@@ -173,10 +169,11 @@ xearthlayer config list               # View all settings
 xearthlayer config set <key> <value>  # Change a setting
 
 # Package Management
+xearthlayer packages                  # Package Manager TUI
 xearthlayer packages check            # Check available packages
 xearthlayer packages install <region> # Install a package
 xearthlayer packages list             # List installed packages
-xearthlayer packages update [region]  # Update packages
+xearthlayer packages update <region>  # Update packages
 xearthlayer packages remove <region>  # Remove a package
 
 # Running
@@ -231,6 +228,10 @@ See [Developer Documentation](docs/dev/) for architecture and guidelines.
 Architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho) by [kubilus1](https://github.com/kubilus1). XEarthLayer is an independent Rust implementation focused on performance and memory safety.
 
 XEarthLayer Regional Scenery Packages created using [Shred86 fork of Ortho4XP](https://github.com/shred86/Ortho4XP)
+
+NASA VIIRS Land Science Investigator-led Processing System. (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset]. [ASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center](ttps://doi.org/10.5067/VIIRS/VJ146A4.002). Date Accessed: 2026-10-16
+
+[@dlicudi](https://github.com/dlicudi) for leading development of the macOS native port of XEarthLayer.
 
 Developed with assistance from [Claude](https://claude.ai) by Anthropic.
 
