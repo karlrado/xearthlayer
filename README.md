@@ -1,6 +1,6 @@
 # X-Plane Earth Layer
 
-High-quality satellite imagery for X-Plane, streamed on demand.
+High-quality streaming orthographic satellite imagery and night time lighting for X-Plane, delivered on demand.
 
 ![X-Plane Earth Layer flying California at dusk](docs/images/xearthlayer-github-hero-v0.5.0.webp)
 
@@ -11,7 +11,7 @@ X-Plane Earth Layer (XEarthLayer or XEL) delivers photo scenery to X-Plane witho
 1. **Installs smaller regional packages** (tens of gigabytes) containing terrain detail
 2. **Streams textures on-demand** as you fly, downloading satellite imagery from a variety of providers
 
-The result: complete orthophoto scenery with less overall disk usage implemented in a fast, modern, memory safe language.
+The result: complete orthophoto scenery during the day and cities lit up with lights from dust until dawn. Less overall disk usage than hosting your own ortho tiles, implemented in a fast, modern, memory safe language.
 
 ## How It Works
 
@@ -37,22 +37,21 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 
 ## Features
 
+- Global Coverage including every major populated continent, excluding Antartica.
+- **Night time lighting** available in all regions for the first time using ortho tiles in X-Plane.
 - Small regional packages (gigabytes, not terabytes)
 - On-demand texture streaming from multiple providers:
   - **Bing Maps** - Free, global coverage (recommended)
   - **Google Maps** - Via GO2 (free) or official API (paid)
   - **Apple Maps** - High quality, auto-acquires tokens
-  - **ArcGIS** - Free, global coverage
-  - **MapBox** - Requires access token
-  - **USGS** - Free, US coverage only
 - **Adaptive Prefetch System** - Phase-aware tile prediction
   - Flight phase detection: Ground (ring pattern) vs Cruise (track-based bands)
   - On by default; switch off with `prefetch.enabled = false` or `run --no-prefetch`
 - Two-tier caching for instant repeat visits
 - High-quality BC1/BC3 DDS textures with mipmaps
-- **Multiple compression backends**: ISPC SIMD (default), pure-Rust software, or GPU-accelerated via wgpu compute shaders
-- Real-time dashboard showing cache, download, and prefetch status
-- Works with Ortho4XP-generated scenery
+- **Multiple compression backends**: ISPC SIMD (default) or GPU-accelerated via wgpu compute shaders
+- Real-time TUI dashboard showing cache, download, and prefetch status
+- Works with OXO and Ortho4XP-generated scenery
 - Linux and macOS support
 
 ## Quick Start
@@ -181,9 +180,6 @@ xearthlayer                           # Start streaming (defaults to 'run')
 xearthlayer run                       # Mount all packages with real-time dashboard
 xearthlayer run --airport KJFK        # Pre-warm cache around an airport
 
-# Advanced: Single Package Mode
-xearthlayer start --source <path>     # Start streaming for a single scenery pack
-
 # Cache Management
 xearthlayer cache stats               # View cache usage
 xearthlayer cache clear               # Clear cache
@@ -201,7 +197,7 @@ Run `xearthlayer --help` for all options.
 
 - **X-Plane 12**
 - **Linux** with FUSE support, or **macOS** with [macFUSE](https://macfuse.io) installed (see the [macOS guide](docs/macos.md))
-- **Modern GPU** with 8GB VRAM or higher, 16GB+ recommended (for X-Plane rendering)
+- **Modern GPU** with 8GB VRAM or higher, 16GB+ recommended (for X-Plane rendering), 24GB+ for all sliders right flying
 - **Fast Internet connection** for streaming imagery, recommended 800Mbps downstream or better
 
 > **GPU Encoding:** XEarthLayer includes built-in GPU-accelerated DDS encoding via wgpu compute shaders. This works with any wgpu-compatible GPU and is separate from the X-Plane GPU requirement above. Select it at runtime via `texture.compressor = gpu` in your config.
@@ -223,17 +219,17 @@ make verify
 
 See [Developer Documentation](docs/dev/) for architecture and guidelines.
 
-## Credits
+## Acknowledgments
 
 Architecturally influenced by [AutoOrtho](https://github.com/kubilus1/autoortho) by [kubilus1](https://github.com/kubilus1). XEarthLayer is an independent Rust implementation focused on performance and memory safety.
 
-XEarthLayer Regional Scenery Packages created using [Shred86 fork of Ortho4XP](https://github.com/shred86/Ortho4XP)
+XEarthLayer Global Scenery created using [OXO: Ortho4 XEarthLayer Orchestrator](https://https://github.com/XEarthLayer/ortho4-xearthlayer-orchestrator)
 
-NASA VIIRS Land Science Investigator-led Processing System. (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset]. [ASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center](ttps://doi.org/10.5067/VIIRS/VJ146A4.002). Date Accessed: 2026-10-16
-
-[@dlicudi](https://github.com/dlicudi) for leading development of the macOS native port of XEarthLayer.
+Thanks to [@dlicudi](https://github.com/dlicudi) for leading development of the macOS native port of XEarthLayer.
 
 Developed with assistance from [Claude](https://claude.ai) by Anthropic.
+
+ > **NASA VIIRS Land Science Investigator-led Processing System.** (2025). *VIIRS/JPSS1 Lunar BRDF-Adjusted Nighttime Lights Yearly L3 Global 15 arc second Linear Lat Lon Grid* [Dataset](https://doi.org/10.5067/VIIRS/VJ146A4.002). ASA Level 1 and Atmosphere Archive and Distribution System Distributed Active Archive Center. Date Accessed: 2026-10-16
 
 Made with :heart: in California.
 
