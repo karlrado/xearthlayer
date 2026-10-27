@@ -1,8 +1,11 @@
 # Windows Backend Split — Phase 1 Design
 
 Date: 2026-10-27
-Status: design, ready for implementation (Karl to confirm §10 before coding starts)
-Base commit: `13f27b0` (develop/0.5.0 line; branch `bionic/windows-backend-split`)
+Status: **Phase 1 implemented and complete (2026-10-27)** — commits 1–6 on
+branch `feature/windows-backend-split` (karlrado/xearthlayer), fork CI green
+at every commit. §9 questions resolved as implemented: "clean build" is a
+checkpoint, not a hard gate; `support/` is the core's home; push-per-commit.
+Base commit: `13f27b0` (develop/0.5.0 line)
 Parent doc: `docs/dev/windows-scope.md` (§4.9 phase structure, §4.11 gate list)
 
 ---
@@ -573,11 +576,10 @@ exit.
 
 ---
 
-## 9. Open questions for Karl
+## 9. Open questions for Karl (resolved 2026-10-27, all three approved)
 
 1. **Clean-build checkpoint** (§7, last paragraph): OK with "checkpoint, not a
-   hard gate" for Phase 1? (Pending from the handoff — the one decision
-   still not explicitly approved.)
+   hard gate" for Phase 1? (Resolved: approved — checkpoint, not a gate.)
 2. **Core home:** `fuse/support/` (this doc's proposal) vs. a new
    `fuse/core/` directory. Cosmetic; `support/` is chosen for mergeability.
 3. **CI as the green gate:** commits are pushed to `bionic/windows-backend-split`
