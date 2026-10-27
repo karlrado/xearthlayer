@@ -54,6 +54,10 @@ impl FsNode {
     }
 
     /// Whether this node is a directory.
+    ///
+    /// Part of the neutral API surface; the FUSE adapter keys off `NodeKind`
+    /// today, so this stays unused until the WinFSP backend (Phase 2).
+    #[allow(dead_code)]
     pub fn is_directory(&self) -> bool {
         matches!(self, FsNode::Directory(_))
     }
@@ -62,6 +66,10 @@ impl FsNode {
     ///
     /// Only directories can be the root; a virtual DDS or real file is never
     /// root.
+    ///
+    /// Part of the neutral API surface; unused until the WinFSP backend
+    /// (Phase 2) needs it.
+    #[allow(dead_code)]
     pub fn is_root(&self) -> bool {
         match self {
             FsNode::Directory(p) => p.as_os_str().is_empty(),

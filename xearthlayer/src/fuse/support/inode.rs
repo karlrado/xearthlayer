@@ -122,6 +122,11 @@ impl InodeManager {
     ///
     /// Unlike `get_or_create_inode`, this does not allocate a new inode.
     /// This operation is lock-free.
+    ///
+    /// Read-only counterpart of `get_or_create_inode`; the FUSE adapter
+    /// creates inodes on the paths it resolves, so only the manager's tests
+    /// exercise the lookup-only path today.
+    #[allow(dead_code)]
     pub fn get_inode(&self, path: &Path) -> Option<u64> {
         self.path_to_inode.get(path).map(|r| *r.value())
     }
