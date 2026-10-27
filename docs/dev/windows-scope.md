@@ -4,9 +4,10 @@ Date: 2026-09-28 (updated 2026-10-02, rebaselined 2026-10-26, reframed
 2026-10-27 for solo-fork implementation)
 Status: Karl is implementing this on his fork (karlrado/xearthlayer), solo,
 with no intention of contributing upstream. Phase 0 complete (2026-10-27);
-Phase 1 (backend split) in progress — design done, see
-`windows-backend-split.md` (same directory). See §4.11 for the Phase 0 gate
-list and §4.9 (reframed) for the surviving constraints.
+Phase 1 (backend split) complete (2026-10-27) — design and commit ledger in
+`windows-backend-split.md` (same directory). Phase 2 (`winfsp` backend) is
+next. See §4.11 for the Phase 0 gate list and §4.9 (reframed) for the
+surviving constraints.
 Author: Hermes Agent, pairing with Karl
 **Base commit:** `317637d` (develop/0.5.0, 0.5.0-rc.1, 2026-10-26). All
 file:line anchors in this doc are valid at this commit — re-verify with grep
@@ -442,7 +443,10 @@ state:
 - **Phase 1 — backend trait split.** Extract the backend-neutral core from
   `ortho_union_fs.rs` + `inode.rs`; the `fuse3` backend now calls into it.
   Linux-only, no behaviour change, no new deps. De-risks Phase 2 and keeps
-  the fork mergeable.
+  the fork mergeable. **Done 2026-10-27:** `OrthoUnionCore` + neutral types
+  in `fuse/support/`, `Fuse3OrthoUnionFS` reduced to a thin adapter, and
+  the behavioural op tests ported to the core level; commit ledger in
+  `windows-backend-split.md` §6.
 - **Phase 2 — `winfsp` backend.** Add the Windows backend against the core
   with `winfsp`/`winfsp-sys` under `[target.'cfg(target_os = "windows")']`;
   move `fuse3`/`nix`/`rlimit` under the Linux target. This is the phase that
@@ -549,8 +553,8 @@ question changes.
 (karlrado/xearthlayer), solo, not contributing upstream (see reframed §1
 goal and §4.9). Phase 0 is complete — environment ready and the full
 OS-specific gate list established (§4.11). Phase 1 (backend trait split)
-is next. The ZL17 tradeoff, the effort estimate, and the §4.4 risk list
-stand as before.
+is complete (2026-10-27); Phase 2 (the `winfsp` backend) is next. The ZL17
+tradeoff, the effort estimate, and the §4.4 risk list stand as before.
 
 ### 4.11 Phase 0 findings (2026-10-27)
 

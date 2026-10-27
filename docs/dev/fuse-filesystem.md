@@ -418,12 +418,23 @@ xearthlayer start --source /path/to/scenery
 xearthlayer/src/
 ├── fuse/
 │   ├── mod.rs              # Module exports
-│   ├── fuse3/              # Async multi-threaded FUSE (primary)
+│   ├── support/            # Backend-neutral core (FUSE today, WinFSP later)
+│   │   ├── mod.rs          # Support module exports
+│   │   ├── core.rs         # OrthoUnionCore: state + neutral ops
+│   │   ├── node.rs         # FsNode: Directory / RealFile / VirtualDds
+│   │   ├── attrs.rs        # FileAttributes, DirEntry, StatFsInfo, VirtualDdsConfig
+│   │   ├── error.rs        # FsError: NotFound / NotADirectory / Io
+│   │   ├── requestor.rs    # DdsRequestor: neutral DDS-generation pipeline
+│   │   ├── inode.rs        # InodeManager: FsNode ↔ inode mapping (FUSE)
+│   │   └── types.rs        # DDS request/response types
+│   ├── fuse3/              # Async multi-threaded FUSE (primary backend)
 │   │   ├── mod.rs          # Fuse3 module exports
-│   │   ├── passthrough_fs.rs   # Single-source passthrough
-│   │   ├── union_fs.rs         # Multi-source union (patches)
-│   │   └── ortho_union_fs.rs   # Consolidated ortho mount
+│   │   ├── ortho_union_fs.rs   # Thin FUSE adapter over OrthoUnionCore
+│   │   ├── shared.rs         # TTL, FileAttrBuilder, to_file_attr
+│   │   ├── inode.rs          # Re-exports InodeManager
+│   │   └── types.rs          # Mount/result plumbing (Fuse3Result, ...)
 │   ├── filename.rs         # DDS filename parsing
+│   ├── coalesce.rs         # Request coalescing
 │   └── placeholder.rs      # Magenta placeholder generation
 ├── ortho_union/
 │   ├── mod.rs              # Module exports
@@ -470,11 +481,23 @@ xearthlayer/src/
 └── texture/                # DDS encoding
 ```
 
+The FUSE layer is split into a backend-neutral core and a thin kernel
+adapter (design in `windows-backend-split.md`): `OrthoUnionCore`
+(`fuse/support/core.rs`) owns the union index, the DDS generation pipeline,
+per-open handle memoisation, the pinned-tile budget and its gauges, and
+serves every op in neutral types (`FsNode`, `FileAttributes`, `FsError`,
+`DirEntry`). `Fuse3OrthoUnionFS` owns only kernel identity (inodes) and
+maps the neutral ops onto FUSE. Behavioural tests for the neutral ops live
+at the core level (`core.rs`) so the WinFSP backend (Phase 2) inherits
+them.
+
 ### Key Types
 
 | Type | Module | Purpose |
 |------|--------|---------|
-| `Fuse3OrthoUnionFS` | `fuse/fuse3/ortho_union_fs.rs` | Consolidated FUSE filesystem |
+| `OrthoUnionCore` | `fuse/support/core.rs` | Backend-neutral core: union index, DDS pipeline, handle memoisation, budget, gauges |
+| `Fuse3OrthoUnionFS` | `fuse/fuse3/ortho_union_fs.rs` | Thin FUSE adapter over `OrthoUnionCore` (kernel identity + op mapping) |
+| `FsNode` | `fuse/support/node.rs` | Backend-agnostic node identity (Directory / RealFile / VirtualDds) |
 | `OrthoUnionIndex` | `ortho_union/index.rs` | Maps files to sources with priority |
 | `MountManager` | `manager/mounts.rs` | Orchestrates consolidated mounting |
 | `DdsHandler` | `service/dds_handler.rs` | Async DDS generation pipeline |

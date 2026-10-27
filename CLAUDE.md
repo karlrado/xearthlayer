@@ -24,10 +24,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Implemented Components
 
-1. **FUSE Layer** (`xearthlayer/src/fuse/fuse3/`)
+1. **FUSE Layer** (`xearthlayer/src/fuse/`)
    - `Fuse3OrthoUnionFS` - The single FUSE mount: all ortho sources (patches + packages)
      merged into one union filesystem. The earlier `Fuse3PassthroughFS` and
      `Fuse3UnionFS` implementations were deleted in #233 once they became unreachable.
+   - **Backend split** (Phase 1 of Windows support; see `docs/dev/windows-scope.md`
+     and `docs/dev/windows-backend-split.md`): `OrthoUnionCore`
+     (`xearthlayer/src/fuse/support/core.rs`) owns the backend-neutral state and ops —
+     union index, DDS generation pipeline, per-open handle memoisation, the
+     pinned-tile budget and its gauges, lit source — in neutral types
+     (`FsNode`, `FileAttributes`, `FsError`, `DirEntry` under `fuse/support/`).
+     `Fuse3OrthoUnionFS` is a thin FUSE adapter: it owns kernel identity
+     (inodes) and maps the neutral ops and `FsError` onto FUSE. The WinFSP
+     backend (Phase 2) will drive the same core. Behavioural tests for the
+     neutral ops live at the core level (`core.rs` tests), where a second
+     backend inherits them.
    - All FUSE operations run asynchronously on the Tokio runtime
    - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
    - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
