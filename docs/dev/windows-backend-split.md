@@ -3,7 +3,7 @@
 Date: 2026-10-27
 Status: design, ready for implementation (Karl to confirm §10 before coding starts)
 Base commit: `13f27b0` (develop/0.5.0 line; branch `bionic/windows-backend-split`)
-Parent doc: `docs/dev/windows-support.md` (§4.9 phase structure, §4.11 gate list)
+Parent doc: `docs/dev/windows-scope.md` (§4.9 phase structure, §4.11 gate list)
 
 ---
 
@@ -24,7 +24,7 @@ gate-list plumbing — `flock` (`manager/queue/lock.rs`), `statvfs`
 (`system/filesystem.rs`), symlinks (`manager/symlinks.rs`), `/proc/*`
 (`system/hardware.rs`, `diagnostics/report.rs`), `rlimit`
 (`preflight/system.rs`) — and packaging (Phase 4). See
-`docs/dev/windows-support.md` §4.11 for the full gate list.
+`docs/dev/windows-scope.md` §4.11 for the full gate list.
 
 Governing constraints (from the parent doc §4.9, Karl-approved):
 - **Linux stays green** at every commit (fork CI `verify` job, `make pre-commit`
@@ -509,7 +509,7 @@ fails to compile for `x86_64-pc-windows-msvc` by design).
 | 3 | `refactor(fuse): extract OrthoUnionCore state + builders + accessors` | `support/core.rs` with the 17 fields, all `with_*` builders, all accessors, `DdsHandle`, gauge/budget/`record_read`/`resolve_tile`/`is_geo_filtered`/`resolve_lazy_geo`/`request_dds`; `Fuse3OrthoUnionFS` wraps the core and delegates; **public API unchanged**; `DdsRequestor` impl lands on core | state first: the adapter already delegates, ops untouched |
 | 4 | `refactor(fuse): route the 14 FUSE ops through core neutral ops` | `core.lookup/attrs/read/list_directory/open/release/statfs` implemented (bodies moved from the ops); ops become thin shells; `FileAttrBuilder` default impls route via neutral mappers; `FsError → Errno` mapping | the big move; op-level tests (which call `impl Filesystem` directly) are the regression net |
 | 5 | `test(fuse): port behavioural tests to the core level` | water-mask guard, geo-filtered lookup (patched region), lit read/size, once-per-open memoisation, budget-exhaustion trio, range reads incl. EOF clamp, readdir `.`/`..` math — as core-level tests (no `fuse3::Request` fixtures needed) | TDD close: core covered directly, not only through the FUSE shell |
-| 6 | `docs(fuse): update architecture notes for the backend split` | `CLAUDE.md` (module map, trait notes), `docs/dev/fuse-filesystem.md` (module table), `docs/dev/windows-support.md` (Phase 1 status + pointer to this doc) | keeps docs truthful (project rule) |
+| 6 | `docs(fuse): update architecture notes for the backend split` | `CLAUDE.md` (module map, trait notes), `docs/dev/fuse-filesystem.md` (module table), `docs/dev/windows-scope.md` (Phase 1 status + pointer to this doc) | keeps docs truthful (project rule) |
 
 Commits 3 and 4 may each split into two if a commit grows beyond reviewable
 size (3a state/builders, 3b pipeline; 4a lookup/attrs/list, 4b read/open/
@@ -588,7 +588,7 @@ exit.
 
 ## 10. References
 
-- `docs/dev/windows-support.md` — parent scoping doc: §1 goal, §4.3A the split,
+- `docs/dev/windows-scope.md` — parent scoping doc: §1 goal, §4.3A the split,
   §4.4 unknowns, §4.8 OS rules, §4.9 phases, §4.11 gate list.
 - `docs/dev/fuse-filesystem.md` — current FUSE architecture (pre-split).
 - `docs/dev/night-lighting-design.md` — R4/R7/R8 lit-texture invariants
