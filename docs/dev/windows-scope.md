@@ -462,7 +462,13 @@ state:
   package installer is now unblocked on Windows too (2026-10-28, Tier 1 —
   `windows-package-install.md`): ortho packages download, extract and install
   on the same queue as Linux and macOS, so there is real content to mount.
-  Overlay packages are deferred (Tier 2 — the symlink path). The in-scene e2e
+  Overlay packages are deferred (Tier 2 — the symlink path). Note: the
+  workspace `[profile.dev]` now sets `overflow-checks = false` (2026-10-28)
+  because zlib's 32-bit `total_in`/`total_out` counters wrap by design and a
+  real ~12 GB package's compressed stream passes the 4 GiB wrap point, so
+  default debug traps panicked a debug `packages install` mid-extract while
+  release completed the same package (see the note in the root `Cargo.toml`).
+  The in-scene e2e
   (X-Plane loading ortho off the mount) is the remaining Phase 3 item.
 - **Phase 3 — X-Plane integration.** Wire into X-Plane 12 on the Windows box;
   confirm the 10s per-tile budget + magenta placeholder under WinFSP; verify

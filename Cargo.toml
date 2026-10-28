@@ -44,6 +44,24 @@ flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 tar = "0.4"
 clap = { version = "4.5", features = ["derive"] }
 
+[profile.dev]
+# Debug builds must process streams of any size, so integer-overflow traps
+# are off, matching release.
+#
+# zlib's C ABI defines the `z_stream.total_in` / `total_out` byte counters
+# as 32-bit values that *wrap by design* (zlib.h: "total_in may overflow if
+# there is more than 4GiB of compressed data"), and zlib-rs follows that
+# intent (e.g. `total_out` is advanced with `wrapping_add`). But at least
+# one site advances `total_in` with a plain `+=` (zlib-rs `inflate.rs`),
+# which panics under Rust's debug overflow-checks once the compressed
+# stream passes 4 GiB. Real ortho packages are ~12 GB, so a debug build of
+# `xearthlayer packages install` panicked mid-extract while the release
+# build completed the same package fine. Disabling the traps in the dev
+# profile keeps debug and release behaving identically on real-world data.
+# Trade-off, accepted: a genuine overflow bug in *our* code now wraps
+# silently in debug instead of panicking.
+overflow-checks = false
+
 [patch.crates-io]
 # winfsp-sys 0.12.1 runs bindgen (needs libclang) at build time. We vendor the
 # crate's shipped pre-generated bindings + import libraries instead, so
