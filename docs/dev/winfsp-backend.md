@@ -18,6 +18,17 @@
 4. Same process: push per commit, CI green at every commit, **plus a new
    `windows-latest` (MSVC) `verify` job** in fork CI so every commit also
    compiles/tests on Windows.
+5. **Config format (2026-10-27):** `config.ini` keeps rust-ini's
+   **escape-enabled** format (parser default; `enabled_escape: true`). The
+   writer's historical double-escape was fixed in commit 2 — `path_to_string`
+   is a plain conversion and the `toml_escape` calls at the INI boundary are
+   the sole escapers, so values round-trip exactly (regression tests in
+   `config/writer.rs`). Accepted consequence: a *hand-written* Windows path
+   in `config.ini` must use doubled backslashes (`C:\\Users\\...`) or
+   forward slashes; a raw `C:\Users\...` is mangled on read (`\U` becomes
+   `U`). Flipping to a no-escape format (`ParseOption::enabled_escape =
+   false`, writer stops escaping) remains a small, well-contained option —
+   deferred.
 
 ## 1. Purpose and scope
 
