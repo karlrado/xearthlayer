@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 #### Windows
 
-- **Windows support (on-demand ortho) via WinFSP**: XEarthLayer now builds and runs natively on Windows. The ortho union filesystem — on-demand ortho generation, the memory and disk caches, and the dashboard — is served through [WinFSP](https://docs.winfsp.xyz) instead of FUSE, driven by the same backend-neutral core as the Linux and macOS FUSE paths. The package manager (downloading and installing scenery packages) is not yet supported on Windows.
+- **Windows support (on-demand ortho) via WinFSP**: XEarthLayer now builds and runs natively on Windows. The ortho union filesystem — on-demand ortho generation, the memory and disk caches, and the dashboard — is served through [WinFSP](https://docs.winfsp.xyz) instead of FUSE, driven by the same backend-neutral core as the Linux and macOS FUSE paths. The scenery package installer works on Windows too: it downloads, extracts and installs **ortho** packages on the same queue as Linux and macOS. Installing **overlay** packages is not yet supported there (the consolidated overlay folder they build depends on symlinks).
 
 #### Package management
 

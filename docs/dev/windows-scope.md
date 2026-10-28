@@ -7,7 +7,9 @@ with no intention of contributing upstream. Phase 0 complete (2026-10-27);
 Phase 1 (backend split) complete (2026-10-27) — design and commit ledger in
 `windows-backend-split.md` (same directory); Phase 2 (`winfsp` backend)
 complete (2026-10-28) — design and commit ledger in `winfsp-backend.md`
-(same directory). Phase 3 (X-Plane integration / in-scene e2e) is next. See
+(same directory). The scenery package installer is now unblocked on Windows
+(Tier 1, 2026-10-28 — `windows-package-install.md`; overlays deferred,
+Tier 2). Phase 3 (X-Plane integration / in-scene e2e) is next. See
 §4.11 for the Phase 0 gate list and §4.9 (reframed) for the surviving
 constraints.
 Author: Hermes Agent, pairing with Karl
@@ -456,9 +458,12 @@ state:
   serves ortho + night-lit on demand. **Done 2026-10-28:** the WinFSP backend
   (`fuse/winfsp/`) is built and wired into the production mount flow
   (`manager/mounts.rs`), green on Linux + macOS + Windows, and spike-verified
-  on the Windows box; commit ledger in `winfsp-backend.md` §6. The in-scene
-  e2e (X-Plane loading ortho off the mount) is the remaining Phase 3 item —
-  it is pending content, since the package manager is not yet on Windows.
+  on the Windows box; commit ledger in `winfsp-backend.md` §6. The scenery
+  package installer is now unblocked on Windows too (2026-10-28, Tier 1 —
+  `windows-package-install.md`): ortho packages download, extract and install
+  on the same queue as Linux and macOS, so there is real content to mount.
+  Overlay packages are deferred (Tier 2 — the symlink path). The in-scene e2e
+  (X-Plane loading ortho off the mount) is the remaining Phase 3 item.
 - **Phase 3 — X-Plane integration.** Wire into X-Plane 12 on the Windows box;
   confirm the 10s per-tile budget + magenta placeholder under WinFSP; verify
   ISPC/wgpu under real load, dashboard/TUI, prefetch, providers, package
