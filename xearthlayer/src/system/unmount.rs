@@ -341,6 +341,11 @@ fn is_winfsp_volume(path: &Path) -> bool {
 /// or any other volume mounted onto a folder) rather than a filesystem path
 /// (an NTFS junction or a symlink). Pure function (no I/O) so the
 /// classification is unit-testable on every OS.
+///
+/// Its only production caller ([`is_winfsp_volume`]) is Windows-only, so on
+/// other platforms this is reachable solely from the test above — silence the
+/// `dead_code` lint there (it stays enforced on Windows, where it is used).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn is_winfsp_volume_target(target: &str) -> bool {
     target.trim_start().starts_with(r"\Device\Volume{")
 }
