@@ -809,6 +809,9 @@ fn local_rows(installed: &[InstalledPackage], library: &[LibraryRow]) -> Vec<Loc
 }
 
 #[cfg(test)]
+// The queue-driven tests below are gated `not(windows)` (design doc §5 defers
+// the install queue), so their shared scaffolding is unused on Windows.
+#[cfg_attr(target_os = "windows", allow(dead_code, unused_imports))]
 mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::{self, Receiver};
@@ -1210,6 +1213,7 @@ mod tests {
     // The queue
     // ------------------------------------------------------------------------
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn submit_starts_a_queue_and_reports_queued_first_then_progress_in_order() {
         let dir = TempDir::new().unwrap();
@@ -1242,6 +1246,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn submitted_comes_after_every_queued_of_its_batch_with_the_refusals() {
         let dir = TempDir::new().unwrap();
@@ -1279,6 +1284,7 @@ mod tests {
         drop(gate);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn remove_queues_each_target_and_answers_submitted() {
         let dir = TempDir::new().unwrap();
@@ -1300,6 +1306,7 @@ mod tests {
         assert!(seen.contains(&"submitted []".to_string()), "{seen:#?}");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn release_queue_frees_the_lock_for_the_next_queue() {
         let dir = TempDir::new().unwrap();
@@ -1317,6 +1324,7 @@ mod tests {
         assert!(next.is_ok(), "the lock is still held: {:?}", next.err());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_queue_started_after_a_release_gives_new_ids() {
         let dir = TempDir::new().unwrap();
@@ -1373,6 +1381,7 @@ mod tests {
 
     /// The state keeps its job rows after the queue is released, so a job
     /// in the next queue must not be mistaken for a finished one.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_job_queued_after_the_queue_was_released_finishes_and_releases_it_again() {
         let dir = TempDir::new().unwrap();
@@ -1400,6 +1409,7 @@ mod tests {
     }
 
     /// The state's view of `run` may be stale, so acting checks again.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_remove_while_run_is_active_queues_nothing_and_is_refused() {
         let dir = TempDir::new().unwrap();
@@ -1425,6 +1435,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_submit_while_run_is_active_queues_only_the_new_packages() {
         let dir = TempDir::new().unwrap();
@@ -1485,6 +1496,7 @@ mod tests {
 
     /// The state's rows may be stale: a package installed on disk is a
     /// replacement whatever its library row says.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_submit_while_run_is_active_leaves_out_what_is_installed_on_disk() {
         let dir = TempDir::new().unwrap();
@@ -1522,6 +1534,7 @@ mod tests {
 
     /// The runner thread reads the installed keys, so the size of every
     /// package tree is not walked there.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_submit_while_run_is_active_lists_the_installed_keys_without_sizes() {
         let dir = TempDir::new().unwrap();
@@ -1548,6 +1561,7 @@ mod tests {
         until(&rx, finished);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_queue_that_will_not_start_keeps_the_left_out_note() {
         let dir = TempDir::new().unwrap();
@@ -1574,6 +1588,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_submit_while_run_is_active_still_installs_new_packages() {
         let dir = TempDir::new().unwrap();
@@ -1589,6 +1604,7 @@ mod tests {
         assert!(seen.contains(&"1 Installed".to_string()), "{seen:#?}");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_held_lock_refuses_the_queue_and_names_the_other_operation() {
         let dir = TempDir::new().unwrap();
@@ -1617,6 +1633,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn cancelling_a_job_in_its_swap_is_too_late() {
         let dir = TempDir::new().unwrap();
@@ -1667,6 +1684,7 @@ mod tests {
         assert!(effects.apply(Effect::Exit).is_break());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn cancel_all_cancels_the_queued_jobs() {
         let dir = TempDir::new().unwrap();
@@ -1739,6 +1757,7 @@ mod tests {
         (effects, rx, swap, delete, [ids[0], ids[1]])
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn cancel_all_returns_at_once_while_a_download_is_being_deleted() {
         let dir = TempDir::new().unwrap();
@@ -1779,6 +1798,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn exit_after_abandon_waits_for_the_swap_and_nothing_else() {
         let dir = TempDir::new().unwrap();
@@ -1806,6 +1826,7 @@ mod tests {
 
     /// The queue holds its lock until the overlay rebuild is done, on the
     /// way out too.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn exit_finishes_the_overlay_rebuild_before_releasing_the_queue() {
         let dir = TempDir::new().unwrap();
@@ -1982,6 +2003,8 @@ mod tests {
         assert!(rx.try_recv().is_err(), "answered once");
     }
 
+    /// Unix-only: it sets up a real symlink (Phase 2, design doc §5).
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_removed_overlay_loses_its_custom_scenery_symlink() {
         let dir = TempDir::new().unwrap();

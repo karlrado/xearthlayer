@@ -14,7 +14,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 
 use xearthlayer_package::{self as package, PackageType};
@@ -22,14 +21,31 @@ use xearthlayer_package::{self as package, PackageType};
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
 
+// Unix symlinks are the overlay mechanism; Windows has none of this yet and
+// the overlay machinery ships as an explicit stub (Phase 2, design doc §5).
+#[cfg(not(target_os = "windows"))]
+use std::os::unix::fs::symlink;
+
+/// Windows stand-in for `std::os::unix::fs::symlink`: refused with an
+/// explicit error instead of compiling to nothing.
+#[cfg(target_os = "windows")]
+fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(_original: P, _link: Q) -> std::io::Result<PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "symlinks are not yet supported on Windows",
+    ))
+}
+
 /// Marker file name used to identify XEarthLayer symlinks.
 const SYMLINK_MARKER: &str = ".xearthlayer_symlink";
 
 /// Create a per-region symlink for an overlay package in the Custom Scenery directory.
 ///
 /// This approach is superseded by the consolidated overlay (`yzXEL_overlay/`).
-/// Kept for test setup only.
+/// Kept for test setup only. Test-only and Unix-only: the overlay tests that
+/// call it are gated `not(windows)` (Phase 2, design doc §5).
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 fn create_overlay_symlink(
     package_path: &Path,
     custom_scenery_path: &Path,
@@ -157,6 +173,7 @@ pub fn remove_overlay_symlink(region: &str, custom_scenery_path: &Path) -> Manag
 /// This checks if the symlink points to a directory containing our marker file.
 /// Only used by `create_overlay_symlink` which is test-only.
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 fn is_xearthlayer_symlink(path: &Path) -> ManagerResult<bool> {
     if !path.is_symlink() {
         return Ok(false);
@@ -175,6 +192,7 @@ fn is_xearthlayer_symlink(path: &Path) -> ManagerResult<bool> {
 
 /// Get the symlink path for a per-region overlay package.
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 fn overlay_symlink_path(region: &str, custom_scenery_path: &Path) -> PathBuf {
     let folder_name = package::package_mountpoint(region, PackageType::Overlay);
     custom_scenery_path.join(folder_name)
@@ -182,6 +200,7 @@ fn overlay_symlink_path(region: &str, custom_scenery_path: &Path) -> PathBuf {
 
 /// Check if a per-region overlay symlink exists.
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 fn overlay_symlink_exists(region: &str, custom_scenery_path: &Path) -> bool {
     let symlink_path = overlay_symlink_path(region, custom_scenery_path);
     symlink_path.is_symlink()
@@ -578,7 +597,7 @@ pub fn consolidated_overlay_exists(custom_scenery_path: &Path) -> bool {
     consolidated_path.exists()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -1016,5 +1035,19 @@ mod tests {
         let result = ConsolidatedOverlayResult::no_packages();
         assert!(result.success);
         assert_eq!(result.package_count, 0);
+    }
+}
+
+/// Windows stub seam (design doc §5): the overlay machinery must refuse
+/// explicitly, not merely compile.
+#[cfg(all(test, target_os = "windows"))]
+mod windows_stub_tests {
+    use super::*;
+
+    #[test]
+    fn symlink_is_refused_on_windows() {
+        let result = symlink(Path::new("/a"), Path::new("/b"));
+        let err = result.expect_err("symlink must be refused on Windows");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
     }
 }

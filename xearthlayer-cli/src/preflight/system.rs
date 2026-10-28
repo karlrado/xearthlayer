@@ -49,6 +49,49 @@ impl Preflight<BootstrapContext> for LogStartup {
     }
 }
 
+/// The soft and hard NOFILE limit of this process.
+#[cfg(not(target_os = "windows"))]
+fn nofile_limits() -> std::io::Result<(u64, u64)> {
+    rlimit::Resource::NOFILE.get()
+}
+
+/// Windows has no per-process NOFILE limit (Phase 2, design doc §5): report
+/// soft and hard as equal, so the preflight reads "already at maximum" and is
+/// satisfied without remediation.
+#[cfg(target_os = "windows")]
+fn nofile_limits() -> std::io::Result<(u64, u64)> {
+    Ok((0, 0))
+}
+
+/// Raise the soft NOFILE limit to the hard maximum, best effort.
+#[cfg(not(target_os = "windows"))]
+fn raise_nofile_limit() {
+    match rlimit::Resource::NOFILE.get() {
+        Ok((soft, hard)) if soft < hard => {
+            if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
+                tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
+            } else {
+                tracing::info!(
+                    old_soft = soft,
+                    new_soft = hard,
+                    "Raised file descriptor limit"
+                );
+            }
+        }
+        Ok((soft, _)) => {
+            tracing::debug!(soft, "FD limit already at maximum");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query FD limit");
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn raise_nofile_limit() {
+    tracing::debug!("no per-process FD limit to raise on Windows");
+}
+
 /// Raise the file descriptor soft limit to the hard maximum.
 ///
 /// Processes inherit a soft FD limit (often 1024) that can be lower than the
@@ -74,7 +117,7 @@ impl Default for FdLimit {
     fn default() -> Self {
         Self {
             attempted: AtomicBool::new(false),
-            limits: Box::new(|| rlimit::Resource::NOFILE.get()),
+            limits: Box::new(nofile_limits),
         }
     }
 }
@@ -125,25 +168,7 @@ impl Preflight<BootstrapContext> for FdLimit {
         _ctx: &mut BootstrapContext,
     ) -> Result<Remedy<BootstrapContext>, PreflightError> {
         self.attempted.store(true, Ordering::SeqCst);
-        match rlimit::Resource::NOFILE.get() {
-            Ok((soft, hard)) if soft < hard => {
-                if let Err(e) = rlimit::Resource::NOFILE.set(hard, hard) {
-                    tracing::warn!(soft, hard, error = %e, "Failed to raise FD limit");
-                } else {
-                    tracing::info!(
-                        old_soft = soft,
-                        new_soft = hard,
-                        "Raised file descriptor limit"
-                    );
-                }
-            }
-            Ok((soft, _)) => {
-                tracing::debug!(soft, "FD limit already at maximum");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "Failed to query FD limit");
-            }
-        }
+        raise_nofile_limit();
         Ok(Remedy::default())
     }
 }

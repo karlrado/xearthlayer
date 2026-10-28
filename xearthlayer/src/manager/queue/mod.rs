@@ -25,7 +25,10 @@ pub use job::{CancelResult, Job, JobEvent, JobId, JobKind, JobOutcome, JobSummar
 pub use ledger::Capacity;
 pub use stages::{InstallContext, Stages};
 
+// Only the non-Windows tests read it: on Windows the queue and its tests
+// are deferred (design doc §5), so nothing there names the lock file.
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 pub(crate) use lock::LOCK_FILE_NAME;
 
 /// What a signal handler or a UI needs to stop a queue it does not own.
@@ -281,5 +284,8 @@ impl<S: Stages> Drop for InstallQueue<S> {
     }
 }
 
+// The queue is deferred on Windows (Phase 2, design doc §5): its lock is
+// refused there, and every test drives work through InstallQueue::start.
 #[cfg(test)]
+#[cfg(not(target_os = "windows"))]
 mod tests;

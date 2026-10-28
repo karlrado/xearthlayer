@@ -286,6 +286,7 @@ mod tests {
         names
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn removing_an_installed_package_deletes_it_and_leaves_no_aside_folder() {
         let packages = tempfile::tempdir().unwrap();
@@ -302,6 +303,7 @@ mod tests {
         assert_eq!(entries(packages.path()), Vec::<String>::new());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_finished_remove_leaves_no_queue_active_and_the_lock_free_for_the_next() {
         let packages = tempfile::tempdir().unwrap();
@@ -374,6 +376,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn removing_a_package_that_is_not_installed_reports_it_as_not_found() {
         let packages = tempfile::tempdir().unwrap();
@@ -391,6 +394,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_remove_refused_by_the_queue_lock_leaves_the_package_installed() {
         let packages = tempfile::tempdir().unwrap();

@@ -23,13 +23,6 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "local-time"] }
 time = { version = "0.3", features = ["formatting", "local-offset"] }
 tracing-appender = "0.2"
-# FUSE library - fuse3 is the active implementation (async multi-threaded)
-# Temporary fork: samsoir/fuse3 `master` = upstream + configurable-background
-# (max_background/congestion_threshold) plus macOS reply-resilience and mount-option
-# fixes. Required for 0.5.x (macOS support) until these patches ship on crates.io;
-# revert to the published fuse3 release then. See #155.
-fuse3 = { git = "https://github.com/samsoir/fuse3", branch = "master", features = ["tokio-runtime", "unprivileged"] }
-libc = "0.2"
 regex.workspace = true
 thiserror = "1.0"
 dirs = "5.0"
@@ -61,10 +54,32 @@ futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["connect"] }
-nix = { version = "0.31", default-features = false, features = ["fs"] }
 memory-stats = "1.2"
 tracing-chrome = { version = "0.7", optional = true }
 axum = { version = "0.7", optional = true }
+
+# Unix-only dependencies. Windows serves the ortho union through WinFSP
+# (Phase 2, docs/dev/winfsp-backend.md) and never through FUSE, so the FUSE
+# stack and the nix fcntl/statvfs helpers are excluded there. Gated on
+# `not(windows)` — not `unix` — because macOS uses the same FUSE stack.
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+# FUSE library - fuse3 is the active implementation (async multi-threaded)
+# Temporary fork: samsoir/fuse3 `master` = upstream + configurable-background
+# (max_background/congestion_threshold) plus macOS reply-resilience and mount-option
+# fixes. Required for 0.5.x (macOS support) until these patches ship on crates.io;
+# revert to the published fuse3 release then. See #155.
+fuse3 = { git = "https://github.com/samsoir/fuse3", branch = "master", features = ["tokio-runtime", "unprivileged"] }
+libc = "0.2"
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
+# Windows-only dependencies (Phase 2: WinFSP backend).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [features]
 profiling = ["tracing-chrome"]

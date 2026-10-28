@@ -13,12 +13,18 @@ pub(crate) mod support;
 
 mod coalesce;
 mod filename;
+
+// The FUSE adapter is Unix-only: Windows serves the same neutral core
+// through WinFSP (Phase 2, docs/dev/winfsp-backend.md §4.1), so the fuse3
+// crate and everything bound to it stay out of the Windows build graph.
+#[cfg(not(target_os = "windows"))]
 pub mod fuse3;
 mod placeholder;
 
 // Re-export types for public API
 pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};
+#[cfg(not(target_os = "windows"))]
 pub use fuse3::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
 pub use placeholder::{
     generate_default_placeholder, generate_magenta_placeholder, get_default_placeholder,

@@ -687,6 +687,7 @@ mod tests {
     /// A stale aside that cannot be deleted must stop the remove. Removing
     /// the package anyway would leave the aside as the only folder of that
     /// name, and the startup sweep restores such an aside as the package.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_stale_aside_that_cannot_be_deleted_stops_the_remove() {
         use std::os::unix::fs::PermissionsExt;

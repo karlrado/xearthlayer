@@ -55,11 +55,16 @@ tokio-util = "0.7"
 dialoguer = "0.11"
 console = "0.15"
 indicatif = "0.17"
-rlimit = "0.10"
 signal-hook = "0.3"
-libc = "0.2"
 sha2.workspace = true
 chrono.workspace = true
+
+# Unix-only dependencies. `rlimit` raises the per-process FD limit, and
+# `libc` provides the `dup2`/descriptor plumbing behind SIGHUP handling;
+# Windows has neither (docs/dev/winfsp-backend.md §5).
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+rlimit = "0.10"
+libc = "0.2"
 
 [features]
 profiling = ["xearthlayer/profiling"]

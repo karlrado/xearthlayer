@@ -12,20 +12,29 @@ use std::time::Duration;
 use crate::config::defaults::{
     DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
 };
+// The FUSE adapter and its session handle are Unix-only; Windows serves the
+// same neutral core through WinFSP (Phase 2, docs/dev/winfsp-backend.md).
+#[cfg(not(target_os = "windows"))]
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
+#[cfg(not(target_os = "windows"))]
 use crate::fuse::SpawnedMountHandle;
-use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
+use crate::geo_index::GeoIndex;
+#[cfg(not(target_os = "windows"))]
+use crate::geo_index::{DsfRegion, PatchCoverage};
 use crate::metrics::TelemetrySnapshot;
-use crate::ortho_union::{
-    default_cache_path, IndexBuildProgressCallback, OrthoUnionIndex, OrthoUnionIndexBuilder,
-};
+#[cfg(not(target_os = "windows"))]
+use crate::ortho_union::{default_cache_path, OrthoUnionIndexBuilder};
+use crate::ortho_union::{IndexBuildProgressCallback, OrthoUnionIndex};
 use crate::panic as panic_handler;
+#[cfg(not(target_os = "windows"))]
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
-use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
+#[cfg(not(target_os = "windows"))]
+use crate::prefetch::PrefetchStateObserver;
+use crate::prefetch::TileRequestCallback;
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
-use xearthlayer_package::{
-    InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
-};
+use xearthlayer_package::PackageType;
+#[cfg(not(target_os = "windows"))]
+use xearthlayer_package::{InstalledPackage as PackageInstalledPackage, Package as PackageCore};
 
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
@@ -118,6 +127,8 @@ impl ConsolidatedOrthoMountResult {
 pub struct MountManager {
     /// Active mount sessions, keyed by region.
     /// Uses SpawnedMountHandle which can be safely dropped from any context.
+    /// Unix-only: Windows holds its WinFSP sessions separately (Phase 2).
+    #[cfg(not(target_os = "windows"))]
     sessions: HashMap<String, SpawnedMountHandle>,
     /// Services that own the Tokio runtimes - MUST be kept alive while sessions are active.
     /// The service contains the runtime that processes DDS generation requests.
@@ -127,13 +138,15 @@ pub struct MountManager {
     /// Target scenery directory for mounts (e.g., X-Plane Custom Scenery).
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
-    /// Active patches union filesystem mount (if any).
+    /// Active patches union filesystem mount (if any). Unix-only (Phase 2).
+    #[cfg(not(target_os = "windows"))]
     patches_session: Option<SpawnedMountHandle>,
     /// Patches mount info for display.
     patches_mount: Option<ActiveMount>,
     /// Service for patches (owns the runtime for DDS generation).
     patches_service: Option<XEarthLayerService>,
-    /// Consolidated ortho union filesystem mount (if any).
+    /// Consolidated ortho union filesystem mount (if any). Unix-only (Phase 2).
+    #[cfg(not(target_os = "windows"))]
     consolidated_session: Option<SpawnedMountHandle>,
     /// Consolidated ortho mount info for display.
     consolidated_mount: Option<ActiveMount>,
@@ -163,13 +176,16 @@ impl MountManager {
     /// Create a new mount manager that mounts packages in-place.
     pub fn new() -> Self {
         Self {
+            #[cfg(not(target_os = "windows"))]
             sessions: HashMap::new(),
             services: HashMap::new(),
             mounts: HashMap::new(),
             scenery_path: None,
+            #[cfg(not(target_os = "windows"))]
             patches_session: None,
             patches_mount: None,
             patches_service: None,
+            #[cfg(not(target_os = "windows"))]
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
@@ -221,6 +237,10 @@ impl MountManager {
 
     /// Resolve the lit source for the ortho mount and record the outcome for
     /// [`night_lighting`](Self::night_lighting).
+    ///
+    /// Platform-neutral; the Windows mount flow is a stub until the WinFSP
+    /// backend (Phase 2, commit 6), so it is uncalled there for now.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn resolve_night_lit_source(
         &mut self,
         index: &OrthoUnionIndex,
@@ -243,6 +263,9 @@ impl MountManager {
     /// The lit source for this installation, or `None` (black) when the
     /// X-Plane installation behind the scenery path cannot be found. `disk`
     /// is the lit disk tier, `None` when caching is off.
+    ///
+    /// Platform-neutral; see [`resolve_night_lit_source`].
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn night_lit_source(
         &self,
         index: &OrthoUnionIndex,
@@ -287,12 +310,28 @@ impl MountManager {
 
     /// Get the number of active mounts.
     pub fn mount_count(&self) -> usize {
-        self.sessions.len()
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.sessions.len()
+        }
+        // Windows has no FUSE sessions yet; the WinFSP backend (Phase 2,
+        // commit 6) reports its own.
+        #[cfg(target_os = "windows")]
+        {
+            0
+        }
     }
 
     /// Check if any mounts are active.
     pub fn has_mounts(&self) -> bool {
-        !self.sessions.is_empty()
+        #[cfg(not(target_os = "windows"))]
+        {
+            !self.sessions.is_empty()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            false
+        }
     }
 
     /// List active mounts.
@@ -302,12 +341,27 @@ impl MountManager {
 
     /// Check if a specific region is mounted.
     pub fn is_mounted(&self, region: &str) -> bool {
-        self.sessions.contains_key(&region.to_lowercase())
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.sessions.contains_key(&region.to_lowercase())
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let _ = region;
+            false
+        }
     }
 
     /// Check if patches are mounted.
     pub fn has_patches(&self) -> bool {
-        self.patches_session.is_some()
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.patches_session.is_some()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            false
+        }
     }
 
     /// Get patches mount info (if mounted).
@@ -356,6 +410,7 @@ impl MountManager {
     /// * `store` - Local package store
     /// * `service_builder` - Service builder for FUSE mount
     /// * `progress` - Optional callback for progress updates
+    #[cfg(not(target_os = "windows"))]
     pub fn mount_consolidated_ortho_with_progress(
         &mut self,
         patches_dir: &std::path::Path,
@@ -637,9 +692,34 @@ impl MountManager {
         }
     }
 
+    /// Windows stub until the WinFSP backend lands (Phase 2, commit 6,
+    /// docs/dev/winfsp-backend.md §6): mounting is refused explicitly rather
+    /// than silently doing nothing.
+    #[cfg(target_os = "windows")]
+    pub fn mount_consolidated_ortho_with_progress(
+        &mut self,
+        patches_dir: &std::path::Path,
+        store: &LocalPackageStore,
+        service_builder: &ServiceBuilder,
+        progress: Option<IndexBuildProgressCallback>,
+    ) -> ConsolidatedOrthoMountResult {
+        let _ = (patches_dir, store, service_builder, progress);
+        ConsolidatedOrthoMountResult::failure(
+            PathBuf::new(),
+            "consolidated ortho mounting is not yet available on Windows".to_string(),
+        )
+    }
+
     /// Check if consolidated ortho is mounted.
     pub fn has_consolidated_ortho(&self) -> bool {
-        self.consolidated_session.is_some()
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.consolidated_session.is_some()
+        }
+        #[cfg(target_os = "windows")]
+        {
+            false
+        }
     }
 
     /// Get consolidated ortho mount info (if mounted).
@@ -675,7 +755,17 @@ impl MountManager {
     pub fn unmount(&mut self, region: &str) -> ManagerResult<()> {
         let key = region.to_lowercase();
 
+        // No session exists on Windows yet (Phase 2, commit 6), so the
+        // neutral mount bookkeeping is the guard there.
+        #[cfg(not(target_os = "windows"))]
         if !self.sessions.contains_key(&key) {
+            return Err(ManagerError::PackageNotFound {
+                region: region.to_string(),
+                package_type: "ortho".to_string(),
+            });
+        }
+        #[cfg(target_os = "windows")]
+        if !self.mounts.contains_key(&key) {
             return Err(ManagerError::PackageNotFound {
                 region: region.to_string(),
                 package_type: "ortho".to_string(),
@@ -688,7 +778,10 @@ impl MountManager {
         }
 
         // Remove session first - Drop will trigger unmount via fusermount
-        self.sessions.remove(&key);
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.sessions.remove(&key);
+        }
         // Then remove service - this shuts down the runtime
         self.services.remove(&key);
         self.mounts.remove(&key);
@@ -701,27 +794,45 @@ impl MountManager {
     /// Sessions are unmounted in reverse order of mounting.
     /// Patches are unmounted last (they were mounted first).
     pub fn unmount_all(&mut self) {
-        // Collect keys to unmount (reverse order for clean shutdown)
-        let keys: Vec<String> = self.sessions.keys().cloned().collect();
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Collect keys to unmount (reverse order for clean shutdown)
+            let keys: Vec<String> = self.sessions.keys().cloned().collect();
 
-        for key in keys.into_iter().rev() {
-            // Unregister from panic handler before unmounting
-            if let Some(mount) = self.mounts.get(&key) {
-                panic_handler::unregister_mount(&mount.mountpoint);
+            for key in keys.into_iter().rev() {
+                // Unregister from panic handler before unmounting
+                if let Some(mount) = self.mounts.get(&key) {
+                    panic_handler::unregister_mount(&mount.mountpoint);
+                }
+
+                // Remove session first - Drop will trigger unmount via fusermount
+                self.sessions.remove(&key);
+                // Then remove service - this shuts down the runtime
+                self.services.remove(&key);
+                self.mounts.remove(&key);
             }
-
-            // Remove session first - Drop will trigger unmount via fusermount
-            self.sessions.remove(&key);
-            // Then remove service - this shuts down the runtime
-            self.services.remove(&key);
-            self.mounts.remove(&key);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // No sessions exist on Windows yet (Phase 2, commit 6); clear the
+            // neutral bookkeeping the same way so the manager empties out.
+            for key in self.mounts.keys().cloned().collect::<Vec<_>>() {
+                if let Some(mount) = self.mounts.get(&key) {
+                    panic_handler::unregister_mount(&mount.mountpoint);
+                }
+                self.services.remove(&key);
+                self.mounts.remove(&key);
+            }
         }
 
         // Unmount patches (if mounted separately)
         if let Some(ref mount) = self.patches_mount {
             panic_handler::unregister_mount(&mount.mountpoint);
         }
-        self.patches_session = None;
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.patches_session = None;
+        }
         self.patches_mount = None;
         self.patches_service = None;
 
@@ -729,7 +840,10 @@ impl MountManager {
         if let Some(ref mount) = self.consolidated_mount {
             panic_handler::unregister_mount(&mount.mountpoint);
         }
-        self.consolidated_session = None;
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.consolidated_session = None;
+        }
         self.consolidated_mount = None;
         self.consolidated_service = None;
 

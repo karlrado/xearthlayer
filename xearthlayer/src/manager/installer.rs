@@ -22,7 +22,9 @@ use xearthlayer_package::{PackageMetadata, PackageType};
 
 use super::aside;
 use super::cancel::CancelToken;
-use super::disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider};
+#[cfg(not(target_os = "windows"))]
+use super::disk_check::available_bytes;
+use super::disk_check::{FsInfoProvider, RealFsInfoProvider};
 use super::download::{DownloadProgressCallback, DownloadState, MultiPartDownloader};
 use super::error::{ManagerError, ManagerResult};
 use super::extractor::TarGzExtractor;
@@ -140,6 +142,10 @@ pub struct PackageInstaller {
     /// Filesystem info provider for the pre-flight disk-space check.
     /// Defaults to `RealFsInfoProvider`; tests can substitute a stub
     /// via `with_fs_info_provider`.
+    ///
+    /// The Windows installer path is deferred (Phase 2, design doc §5), so
+    /// nothing reads this there yet; it stays so the deferred path can use it.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fs_info_provider: Box<dyn FsInfoProvider>,
 }
 
@@ -172,7 +178,11 @@ impl PackageInstaller {
     }
 
     /// Serve archive parts from somewhere other than the network.
+    ///
+    /// Only the non-Windows tests use it: on Windows the queue-driven
+    /// installer tests are deferred (Phase 2, design doc §5).
     #[cfg(test)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     fn with_transfer(mut self, transfer: Box<dyn PartTransfer>) -> Self {
         self.transfer = transfer;
         self
@@ -189,6 +199,16 @@ impl PackageInstaller {
 
     /// The device and free bytes of the filesystem holding `folder`,
     /// creating the folder first so a fresh install can be measured.
+    ///
+    /// Windows stub (Phase 2, design doc §5): the installer path is deferred
+    /// there, and the cross-filesystem device identity has no Unix
+    /// equivalent yet, so capacity is refused explicitly.
+    #[cfg(target_os = "windows")]
+    fn filesystem_of(&self, _folder: &Path) -> ManagerResult<(u64, u64)> {
+        Err(ManagerError::UnsupportedOnWindows)
+    }
+
+    #[cfg(not(target_os = "windows"))]
     fn filesystem_of(&self, folder: &Path) -> ManagerResult<(u64, u64)> {
         use std::os::unix::fs::MetadataExt;
 
@@ -505,20 +525,31 @@ fn swap_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The queue-driven tests and their helpers below are deferred with the
+    // queue on Windows (Phase 2, design doc §5); the imports they need go
+    // with them, so nothing there is dead code.
+    #[cfg(not(target_os = "windows"))]
     use std::cell::RefCell;
+    #[cfg(not(target_os = "windows"))]
     use std::collections::HashMap;
+    #[cfg(not(target_os = "windows"))]
     use std::io;
+    #[cfg(not(target_os = "windows"))]
     use std::sync::{Arc, Mutex};
 
     use tempfile::TempDir;
+    #[cfg(not(target_os = "windows"))]
     use xearthlayer_package::ArchivePart;
 
+    #[cfg(not(target_os = "windows"))]
     use crate::manager::queue::{
         InstallContext, InstallQueue, JobEvent, JobId, QueueObserver, Stages, LOCK_FILE_NAME,
     };
+    #[cfg(not(target_os = "windows"))]
     use crate::system::FilesystemInfo;
 
     /// Serves archive parts from memory instead of the network.
+    #[cfg(not(target_os = "windows"))]
     #[derive(Clone, Default)]
     struct LocalTransfer {
         /// Bytes served for each part URL.
@@ -531,6 +562,7 @@ mod tests {
         downloaded: Arc<Mutex<Vec<String>>>,
     }
 
+    #[cfg(not(target_os = "windows"))]
     impl PartTransfer for LocalTransfer {
         fn query_sizes(&self, state: &mut DownloadState) {
             state.total_size = state
@@ -566,15 +598,18 @@ mod tests {
     }
 
     /// Records the events each job passes through as "<event> <region>".
+    #[cfg(not(target_os = "windows"))]
     #[derive(Default)]
     struct Recorder(Mutex<(HashMap<JobId, String>, Vec<String>)>);
 
+    #[cfg(not(target_os = "windows"))]
     impl Recorder {
         fn events(&self) -> Vec<String> {
             self.0.lock().unwrap().1.clone()
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     impl QueueObserver for Recorder {
         fn on_event(&self, id: JobId, event: &JobEvent<'_>) {
             let mut recorded = self.0.lock().unwrap();
@@ -595,6 +630,7 @@ mod tests {
     }
 
     /// Install `batch` through a queue, one result per package.
+    #[cfg(not(target_os = "windows"))]
     fn install_all(
         installer: PackageInstaller,
         batch: &[PackageMetadata],
@@ -606,11 +642,13 @@ mod tests {
     }
 
     /// An install context driven by the test rather than a queue.
+    #[cfg(not(target_os = "windows"))]
     struct TestContext {
         token: CancelToken,
         allow_swap: bool,
     }
 
+    #[cfg(not(target_os = "windows"))]
     impl InstallContext for TestContext {
         fn stage(&self, _stage: InstallStage) {}
 
@@ -626,8 +664,10 @@ mod tests {
     }
 
     /// Reports a fixed amount of free space.
+    #[cfg(not(target_os = "windows"))]
     struct FreeSpace(u64);
 
+    #[cfg(not(target_os = "windows"))]
     impl FsInfoProvider for FreeSpace {
         fn fs_info(&self, _path: &Path) -> io::Result<FilesystemInfo> {
             Ok(FilesystemInfo {
@@ -637,6 +677,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// Add a one-part ortho package for `title` to `transfer`. Like a
     /// published package, its archive holds the package's metadata file
     /// alongside its content, `<mountpoint>/terrain/tile.ter`.
@@ -644,6 +685,7 @@ mod tests {
         package_at(title, semver::Version::new(1, 0, 0), transfer)
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// `package` at `version`, which its archive's metadata file records.
     fn package_at(
         title: &str,
@@ -653,6 +695,7 @@ mod tests {
         package_archive(title, version, transfer, true)
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// `package_at`, with the archive's entries inside the package folder
     /// when `in_folder` is set, or at the archive's root when not.
     fn package_archive(
@@ -708,6 +751,7 @@ mod tests {
         metadata
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn installer(temp: &TempDir, transfer: LocalTransfer, free: u64) -> PackageInstaller {
         PackageInstaller::new(
             LocalPackageStore::new(temp.path().join("Custom Scenery")),
@@ -717,6 +761,7 @@ mod tests {
         .with_fs_info_provider(Box::new(FreeSpace(free)))
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_batch_installs_every_package() {
         let temp = TempDir::new().unwrap();
@@ -740,6 +785,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_install_records_the_size_a_walk_of_the_installed_tree_measures() {
         // #324: the bytes extracted are recorded, so listing never walks.
@@ -760,6 +806,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn the_observer_hears_each_download_and_every_install_stage() {
         let temp = TempDir::new().unwrap();
@@ -791,6 +838,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_failed_download_does_not_stop_the_batch() {
         let temp = TempDir::new().unwrap();
@@ -816,6 +864,7 @@ mod tests {
     /// path, because that function prefixes only the first path component.
     /// The metadata parser now refuses such a title, but `PackageMetadata` is
     /// publicly constructible, so the install path itself is checked too.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_title_that_escapes_the_scenery_directory_is_refused_and_the_batch_continues() {
         let temp = TempDir::new().unwrap();
@@ -844,6 +893,7 @@ mod tests {
         assert_eq!(*downloaded.lock().unwrap(), ["test://AF-SOUTH"]);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_installed_version_is_refused_without_downloading_it_again() {
         let temp = TempDir::new().unwrap();
@@ -871,6 +921,7 @@ mod tests {
         assert_eq!(downloaded.lock().unwrap().len(), 1);
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// The installed package's files, to compare before and after.
     fn snapshot(install_path: &Path) -> Vec<Vec<u8>> {
         ["terrain/tile.ter", "xearthlayer_scenery_package.txt"]
@@ -879,6 +930,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// Install v1 of AF-NORTH through a queue, then download v2 of it
     /// without installing it. Returns the v2 download and v1's install path.
     fn v1_installed_and_v2_downloaded(
@@ -903,6 +955,7 @@ mod tests {
     }
 
     /// Spec section 3: cancelling before the swap leaves the old version untouched.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_cancelled_install_leaves_the_installed_version_byte_for_byte() {
         let temp = TempDir::new().unwrap();
@@ -933,6 +986,7 @@ mod tests {
     }
 
     /// The installer calls `begin_swap` and honours a refusal.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_install_refused_its_swap_changes_nothing() {
         let temp = TempDir::new().unwrap();
@@ -951,6 +1005,7 @@ mod tests {
         assert!(!aside::aside_path(&install_path).exists());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_batch_that_cannot_install_even_one_package_at_a_time_downloads_nothing() {
         let temp = TempDir::new().unwrap();
@@ -988,6 +1043,7 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_batch_whose_second_tree_the_disk_cannot_hold_installs_only_the_first() {
         let temp = TempDir::new().unwrap();
@@ -1020,6 +1076,7 @@ mod tests {
         assert_eq!(*downloaded.lock().unwrap(), ["test://AF-NORTH"]);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn capacity_is_shared_for_folders_on_one_filesystem() {
         let temp = TempDir::new().unwrap();
@@ -1033,6 +1090,7 @@ mod tests {
         assert!(installer.packages_root().is_dir());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn nothing_is_left_in_the_temp_directory() {
         let temp = TempDir::new().unwrap();
@@ -1079,6 +1137,7 @@ mod tests {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_part_file_name_that_escapes_the_temp_directory_is_refused_before_downloading() {
         let temp = TempDir::new().unwrap();
@@ -1102,6 +1161,7 @@ mod tests {
         assert!(!temp.path().join("escaped.aa").exists());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_archive_file_name_that_escapes_the_temp_directory_is_refused_before_downloading() {
         let temp = TempDir::new().unwrap();
@@ -1199,6 +1259,7 @@ mod tests {
     /// A stale staging folder that cannot be deleted must stop the install,
     /// the same rule `LocalPackageStore::remove` applies to a stale aside:
     /// extracting into it would mix its leftovers into the new version.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_stale_staging_folder_that_cannot_be_deleted_stops_the_stage() {
         use std::os::unix::fs::PermissionsExt;
@@ -1260,6 +1321,7 @@ mod tests {
 
     /// Extraction is where an install now fails, after staging and before
     /// the swap: the old version stays and the staging folder goes.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_extraction_that_fails_leaves_the_old_version_and_no_staging_folder() {
         let temp = TempDir::new().unwrap();
@@ -1282,6 +1344,7 @@ mod tests {
         assert!(!aside::aside_path(&install_path).exists());
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// Replace the downloaded part with a valid archive holding only `names`.
     fn replace_archive_with(downloaded: &DownloadedPackage, names: &[&str]) {
         let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -1301,6 +1364,7 @@ mod tests {
 
     /// An archive that holds no package must not replace a working install
     /// with an empty folder: the old version stays, the staging folder goes.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_archive_without_package_metadata_leaves_the_old_version_untouched() {
         let temp = TempDir::new().unwrap();
@@ -1329,6 +1393,7 @@ mod tests {
     /// A top-level symlink named like the package is not a package folder,
     /// whatever it points at: nothing outside staging may be renamed into
     /// the install path.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_symlink_named_like_the_package_is_not_the_package_source() {
         let temp = TempDir::new().unwrap();
@@ -1346,6 +1411,7 @@ mod tests {
     }
 
     /// A lone symlink is no more a package folder than a named one.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_lone_symlink_to_a_folder_is_not_the_package_source() {
         let temp = TempDir::new().unwrap();
@@ -1431,10 +1497,12 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// What `PeekingContext::begin_swap` saw: whether staging held the new
     /// version's tree, and whether the package's temp directory was empty.
     type Peek = (bool, bool);
 
+    #[cfg(not(target_os = "windows"))]
     /// An install context that looks at the disk at the moment the swap is
     /// claimed, then allows it.
     struct PeekingContext {
@@ -1445,6 +1513,7 @@ mod tests {
         seen: RefCell<Option<Peek>>,
     }
 
+    #[cfg(not(target_os = "windows"))]
     impl InstallContext for PeekingContext {
         fn stage(&self, _stage: InstallStage) {}
 
@@ -1474,6 +1543,7 @@ mod tests {
         fn end_swap(&self) {}
     }
 
+    #[cfg(not(target_os = "windows"))]
     /// The names in the packages root that only exist mid-replacement.
     fn transient_folders(packages_root: &Path) -> Vec<std::ffi::OsString> {
         fs::read_dir(packages_root)
@@ -1486,6 +1556,7 @@ mod tests {
     /// The tree is written once, beside its destination: at the moment the
     /// swap is claimed it is complete inside the staging folder and temp holds
     /// no extracted tree.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_install_extracts_into_staging_beside_the_install_path() {
         let temp = TempDir::new().unwrap();
@@ -1518,6 +1589,7 @@ mod tests {
         assert!(left.is_empty(), "{left:?}");
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_archive_with_its_files_at_the_top_level_installs() {
         let temp = TempDir::new().unwrap();

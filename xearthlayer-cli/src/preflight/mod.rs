@@ -337,8 +337,12 @@ mod tests {
             &config_path,
             format!(
                 "[packages]\ninstall_location = {}\ncustom_scenery_path = {}\n",
-                packages.display(),
-                scenery.display()
+                // config.ini uses the app's escape-enabled format (rust-ini treats
+                // `\` as an escape), so a raw Windows backslash path would be
+                // mangled on read. Forward slashes are escape-free and round-trip
+                // on every platform.
+                packages.display().to_string().replace('\\', "/"),
+                scenery.display().to_string().replace('\\', "/")
             ),
         )
         .unwrap();

@@ -80,7 +80,7 @@ pub fn attrs_from_metadata(metadata: &std::fs::Metadata) -> FileAttributes {
         NodeKind::RegularFile
     };
 
-    let mut attrs = FileAttributes {
+    let base = FileAttributes {
         size: metadata.len(),
         blocks: 0,
         atime: metadata.accessed().unwrap_or(UNIX_EPOCH),
@@ -97,15 +97,20 @@ pub fn attrs_from_metadata(metadata: &std::fs::Metadata) -> FileAttributes {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        attrs.blocks = metadata.blocks();
-        attrs.perm = (metadata.mode() & 0o7777) as u16;
-        attrs.nlink = metadata.nlink() as u32;
-        attrs.uid = metadata.uid();
-        attrs.gid = metadata.gid();
-        attrs.rdev = metadata.rdev() as u32;
+        FileAttributes {
+            blocks: metadata.blocks(),
+            perm: (metadata.mode() & 0o7777) as u16,
+            nlink: metadata.nlink() as u32,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            rdev: metadata.rdev() as u32,
+            ..base
+        }
     }
-
-    attrs
+    #[cfg(not(unix))]
+    {
+        base
+    }
 }
 
 /// Attributes for a generated (virtual) DDS file: read-only, single link.

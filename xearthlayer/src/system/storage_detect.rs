@@ -25,6 +25,7 @@
 
 use super::hardware::StorageType;
 use std::path::Path;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use tracing::debug;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

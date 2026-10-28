@@ -822,6 +822,8 @@ mod tests {
 
     /// Remove the overlay "NA" with its per-region symlink in place; returns
     /// the run and whether the symlink is still there afterwards.
+    /// Unix-only: it sets up a real symlink (Phase 2, design doc §5).
+    #[cfg(not(target_os = "windows"))]
     fn remove_overlay_with_symlink(manager: &FakeManager) -> (Run, bool) {
         let scenery = tempfile::tempdir().unwrap();
         let target = tempfile::tempdir().unwrap();
@@ -849,6 +851,7 @@ mod tests {
         (run, link.symlink_metadata().is_ok())
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_refused_remove_leaves_the_overlay_symlink_in_place() {
         let manager = FakeManager::default()
@@ -865,6 +868,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_completed_overlay_remove_clears_its_symlink() {
         let manager = FakeManager::default().with_installed(PackageType::Overlay, &["NA"]);
@@ -1636,6 +1640,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn package_commands_build_everything_with_x_world_pro_off() {
         let (text, eu_linked) = rebuild(false, false);

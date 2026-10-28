@@ -18,6 +18,9 @@
 //! by ostree. This is the same signal `rpm-ostree` and `bootc` themselves
 //! use, so it stays correct as the ecosystem evolves.
 
+// `statvfs` is Unix-only; Windows asks `GetDiskFreeSpaceExW` instead
+// (Phase 2, docs/dev/winfsp-backend.md §5).
+#[cfg(not(target_os = "windows"))]
 use nix::sys::statvfs::statvfs;
 use std::io;
 use std::path::Path;
@@ -44,6 +47,7 @@ pub struct FilesystemInfo {
 /// Query capacity information for the filesystem containing `path`.
 ///
 /// Returns an `io::Error` if `path` doesn't exist or `statvfs(2)` fails.
+#[cfg(not(target_os = "windows"))]
 pub fn fs_info(path: &Path) -> io::Result<FilesystemInfo> {
     let stat = statvfs(path).map_err(|errno| io::Error::from_raw_os_error(errno as i32))?;
     // f_frsize is the fragment (allocation) size; on Linux it equals
@@ -65,6 +69,44 @@ pub fn fs_info(path: &Path) -> io::Result<FilesystemInfo> {
     })
 }
 
+/// Query capacity information for the filesystem containing `path`.
+///
+/// Windows: `GetDiskFreeSpaceExW` reports the volume total and the bytes
+/// available to the calling user, which matches the `statvfs` fields
+/// (`f_blocks`, `f_bavail * f_frsize`) for our purposes (Phase 2,
+/// docs/dev/winfsp-backend.md §5).
+#[cfg(target_os = "windows")]
+pub fn fs_info(path: &Path) -> io::Result<FilesystemInfo> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    // NUL-terminated UTF-16 for the Win32 API; `wide` outlives the call.
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut available_bytes = 0u64;
+    let mut total_bytes = 0u64;
+    let mut _free_bytes = 0u64;
+    // SAFETY: `wide` is a valid NUL-terminated UTF-16 string and all three
+    // outputs are initialized u64s the API fully writes on success.
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR::from_raw(wide.as_ptr()),
+            Some(&mut available_bytes),
+            Some(&mut total_bytes),
+            Some(&mut _free_bytes),
+        )
+    }
+    .map_err(io::Error::other)?;
+    Ok(FilesystemInfo {
+        total_bytes,
+        available_bytes,
+    })
+}
+
 /// Returns `true` if the host appears to be an ostree-based atomic
 /// distribution (Bazzite, Silverblue, Kinoite, SteamOS, Fedora Atomic,
 /// etc.) where the rootfs is intentionally sized to its content.
@@ -77,15 +119,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fs_info_returns_nonzero_capacity_for_tmp() {
-        // /tmp is guaranteed to exist on any test host.
-        let info = fs_info(Path::new("/tmp")).expect("statvfs /tmp must succeed");
+    fn fs_info_returns_nonzero_capacity_for_temp_dir() {
+        // The process temp directory exists on every test host, Unix or
+        // Windows.
+        let info = fs_info(&std::env::temp_dir()).expect("fs_info of the temp dir must succeed");
         assert!(
             info.total_bytes > 0,
-            "/tmp filesystem should report nonzero total bytes"
+            "the temp dir filesystem should report nonzero total bytes"
         );
         // Don't assert on available_bytes > 0; CI runners can theoretically
-        // run with /tmp full. Just verify the field is populated and sane.
+        // run with the volume full. Just verify the field is populated and
+        // sane.
         assert!(
             info.available_bytes <= info.total_bytes,
             "available bytes ({}) must not exceed total ({})",
