@@ -18,7 +18,7 @@ env:
 
 jobs:
   verify:
-    name: Verify
+    name: Verify (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
