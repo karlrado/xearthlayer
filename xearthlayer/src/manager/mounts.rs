@@ -16,24 +16,21 @@ use crate::config::defaults::{
 // same neutral core through WinFSP (Phase 2, docs/dev/winfsp-backend.md).
 #[cfg(not(target_os = "windows"))]
 use crate::fuse::fuse3::Fuse3OrthoUnionFS;
+#[cfg(target_os = "windows")]
+use crate::fuse::winfsp::{WinFspOrthoUnionFS, WinFspSession};
 #[cfg(not(target_os = "windows"))]
 use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::GeoIndex;
-#[cfg(not(target_os = "windows"))]
 use crate::geo_index::{DsfRegion, PatchCoverage};
 use crate::metrics::TelemetrySnapshot;
-#[cfg(not(target_os = "windows"))]
 use crate::ortho_union::{default_cache_path, OrthoUnionIndexBuilder};
 use crate::ortho_union::{IndexBuildProgressCallback, OrthoUnionIndex};
 use crate::panic as panic_handler;
-#[cfg(not(target_os = "windows"))]
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
-#[cfg(not(target_os = "windows"))]
 use crate::prefetch::PrefetchStateObserver;
 use crate::prefetch::TileRequestCallback;
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
 use xearthlayer_package::PackageType;
-#[cfg(not(target_os = "windows"))]
 use xearthlayer_package::{InstalledPackage as PackageInstalledPackage, Package as PackageCore};
 
 use super::local::LocalPackageStore;
@@ -145,9 +142,14 @@ pub struct MountManager {
     patches_mount: Option<ActiveMount>,
     /// Service for patches (owns the runtime for DDS generation).
     patches_service: Option<XEarthLayerService>,
-    /// Consolidated ortho union filesystem mount (if any). Unix-only (Phase 2).
+    /// Consolidated ortho union filesystem mount (if any). Unix: the FUSE
+    /// session handle; Windows: the WinFSP session (Phase 2). Same field name
+    /// on both platforms, different handle type — cfg-gated, not a cross-OS
+    /// trait (design §4.5).
     #[cfg(not(target_os = "windows"))]
     consolidated_session: Option<SpawnedMountHandle>,
+    #[cfg(target_os = "windows")]
+    consolidated_session: Option<WinFspSession>,
     /// Consolidated ortho mount info for display.
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
@@ -185,7 +187,6 @@ impl MountManager {
             patches_session: None,
             patches_mount: None,
             patches_service: None,
-            #[cfg(not(target_os = "windows"))]
             consolidated_session: None,
             consolidated_mount: None,
             consolidated_service: None,
@@ -410,7 +411,6 @@ impl MountManager {
     /// * `store` - Local package store
     /// * `service_builder` - Service builder for FUSE mount
     /// * `progress` - Optional callback for progress updates
-    #[cfg(not(target_os = "windows"))]
     pub fn mount_consolidated_ortho_with_progress(
         &mut self,
         patches_dir: &std::path::Path,
@@ -542,13 +542,18 @@ impl MountManager {
         // check below.
         crate::system::recover_stale_fuse_mount(&mountpoint);
 
-        // Create mountpoint directory
-        if !mountpoint.exists() {
-            if let Err(e) = std::fs::create_dir_all(&mountpoint) {
-                return ConsolidatedOrthoMountResult::failure(
-                    mountpoint,
-                    format!("Failed to create mountpoint directory: {}", e),
-                );
+        // Create the mountpoint directory — FUSE needs it to exist. WinFSP is
+        // the opposite: it requires the mountpoint ABSENT and creates it itself
+        // (spike F1), so skip this on Windows.
+        #[cfg(not(target_os = "windows"))]
+        {
+            if !mountpoint.exists() {
+                if let Err(e) = std::fs::create_dir_all(&mountpoint) {
+                    return ConsolidatedOrthoMountResult::failure(
+                        mountpoint,
+                        format!("Failed to create mountpoint directory: {}", e),
+                    );
+                }
             }
         }
 
@@ -624,102 +629,188 @@ impl MountManager {
         // so the filesystem accounts against the same one prefetch reads (#246).
         let pinned_budget = dds_client.pinned_budget();
 
-        let mut ortho_union_fs =
-            Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
-                .with_geo_index(Arc::clone(&geo_index))
-                .with_state_observer(state_observer)
-                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
-                .with_timeout(Duration::from_secs(self.generation_timeout_secs));
+        // The mount itself is platform-specific. Unix mounts through FUSE
+        // (async `mount_spawned` on the service runtime); Windows mounts
+        // through WinFSP (synchronous `mount`, and the mountpoint must NOT
+        // pre-exist — WinFSP creates it, spike F1). The shared setup above
+        // (index, geo_index, service, dds_client, state_observer,
+        // pinned_budget) is identical on both.
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut ortho_union_fs = Fuse3OrthoUnionFS::new(
+                (*index_for_prefetch).clone(),
+                dds_client,
+                expected_dds_size,
+            )
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_state_observer(state_observer)
+            .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
+            .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
-        if let Some(budget) = pinned_budget {
-            ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
-        }
-
-        if self.night_enabled {
-            if let Some(source) =
-                self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
-            {
-                ortho_union_fs = ortho_union_fs.with_lit_source(source);
+            if let Some(budget) = pinned_budget {
+                ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
             }
-        }
 
-        // Wire metrics client for coalesced request tracking
-        if let Some(metrics) = metrics_client {
-            ortho_union_fs = ortho_union_fs.with_metrics(metrics);
-        }
-        let mountpoint_str = mountpoint.to_string_lossy();
+            if self.night_enabled {
+                if let Some(source) =
+                    self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
+                {
+                    ortho_union_fs = ortho_union_fs.with_lit_source(source);
+                }
+            }
 
-        let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));
+            // Wire metrics client for coalesced request tracking
+            if let Some(metrics) = metrics_client {
+                ortho_union_fs = ortho_union_fs.with_metrics(metrics);
+            }
+            let mountpoint_str = mountpoint.to_string_lossy();
 
-        match mount_result {
-            Ok(session) => {
-                let mount_info = ActiveMount {
-                    region: "consolidated".to_string(),
-                    package_type: PackageType::Ortho,
-                    mountpoint: mountpoint.clone(),
-                };
+            let mount_result =
+                runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));
 
-                // Register mount point with panic handler for cleanup on crash
-                panic_handler::register_mount(mountpoint.clone());
+            match mount_result {
+                Ok(session) => {
+                    let mount_info = ActiveMount {
+                        region: "consolidated".to_string(),
+                        package_type: PackageType::Ortho,
+                        mountpoint: mountpoint.clone(),
+                    };
 
-                // Store service to keep runtime alive, then store session and mount info
-                self.consolidated_service = Some(service);
-                self.consolidated_session = Some(session);
-                self.consolidated_mount = Some(mount_info);
+                    // Register mount point with panic handler for cleanup on crash
+                    panic_handler::register_mount(mountpoint.clone());
 
-                // Store indexes for tile-based prefetcher
-                self.ortho_union_index = Some(index_for_prefetch);
-                self.geo_index = Some(geo_index);
+                    // Store service to keep runtime alive, then store session and mount info
+                    self.consolidated_service = Some(service);
+                    self.consolidated_session = Some(session);
+                    self.consolidated_mount = Some(mount_info);
 
-                tracing::info!(
-                    mountpoint = %mountpoint.display(),
-                    sources = source_count,
-                    files = file_count,
-                    "Consolidated ortho union filesystem mounted"
-                );
+                    // Store indexes for tile-based prefetcher
+                    self.ortho_union_index = Some(index_for_prefetch);
+                    self.geo_index = Some(geo_index);
 
-                ConsolidatedOrthoMountResult::success(
+                    tracing::info!(
+                        mountpoint = %mountpoint.display(),
+                        sources = source_count,
+                        files = file_count,
+                        "Consolidated ortho union filesystem mounted"
+                    );
+
+                    ConsolidatedOrthoMountResult::success(
+                        mountpoint,
+                        source_count,
+                        file_count,
+                        patch_names,
+                        package_regions,
+                    )
+                }
+                Err(e) => ConsolidatedOrthoMountResult::failure(
                     mountpoint,
-                    source_count,
-                    file_count,
-                    patch_names,
-                    package_regions,
-                )
-            }
-            Err(e) => {
-                ConsolidatedOrthoMountResult::failure(mountpoint, format!("Failed to mount: {}", e))
+                    format!("Failed to mount: {}", e),
+                ),
             }
         }
-    }
 
-    /// Windows stub until the WinFSP backend lands (Phase 2, commit 6,
-    /// docs/dev/winfsp-backend.md §6): mounting is refused explicitly rather
-    /// than silently doing nothing.
-    #[cfg(target_os = "windows")]
-    pub fn mount_consolidated_ortho_with_progress(
-        &mut self,
-        patches_dir: &std::path::Path,
-        store: &LocalPackageStore,
-        service_builder: &ServiceBuilder,
-        progress: Option<IndexBuildProgressCallback>,
-    ) -> ConsolidatedOrthoMountResult {
-        let _ = (patches_dir, store, service_builder, progress);
-        ConsolidatedOrthoMountResult::failure(
-            PathBuf::new(),
-            "consolidated ortho mounting is not yet available on Windows".to_string(),
-        )
+        #[cfg(target_os = "windows")]
+        {
+            // WinFSP requires the mountpoint to be ABSENT — it creates the
+            // directory on mount and removes it on unmount (spike F1). A
+            // leftover from a killed process cannot be cleared from here (F5),
+            // so fail loudly and point at a reboot rather than deleting it.
+            if mountpoint.exists() {
+                return ConsolidatedOrthoMountResult::failure(
+                    mountpoint.clone(),
+                    format!(
+                        "mountpoint already exists ({}); WinFSP requires it absent. \n\
+                         If a prior run was killed, a reboot may be needed to clear it",
+                        mountpoint.display()
+                    ),
+                );
+            }
+
+            let mut ortho_union_fs = WinFspOrthoUnionFS::new(
+                (*index_for_prefetch).clone(),
+                dds_client,
+                expected_dds_size,
+            )
+            .with_geo_index(Arc::clone(&geo_index))
+            .with_state_observer(state_observer)
+            .with_timeout(Duration::from_secs(self.generation_timeout_secs));
+
+            if let Some(budget) = pinned_budget {
+                ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
+            }
+
+            if self.night_enabled {
+                if let Some(source) =
+                    self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
+                {
+                    ortho_union_fs = ortho_union_fs.with_lit_source(source);
+                }
+            }
+
+            // Wire metrics client for coalesced request tracking
+            if let Some(metrics) = metrics_client {
+                ortho_union_fs = ortho_union_fs.with_metrics(metrics);
+            }
+
+            // Required before mount: async tile reads dispatch onto the service
+            // runtime, keeping the WinFSP dispatcher threads free.
+            let ortho_union_fs = ortho_union_fs.with_runtime_handle(runtime_handle.clone());
+
+            let mount_result = ortho_union_fs.mount(&mountpoint);
+
+            match mount_result {
+                Ok(session) => {
+                    let mount_info = ActiveMount {
+                        region: "consolidated".to_string(),
+                        package_type: PackageType::Ortho,
+                        mountpoint: mountpoint.clone(),
+                    };
+
+                    // Register with the panic handler (path) and the WinFSP
+                    // session registry (path -> session) so unmount/panic both
+                    // find and stop the service.
+                    panic_handler::register_mount(mountpoint.clone());
+                    crate::system::unmount::register_winfsp_mount(
+                        mountpoint.clone(),
+                        session.clone(),
+                    );
+
+                    // Store service to keep runtime alive, then store session and mount info
+                    self.consolidated_service = Some(service);
+                    self.consolidated_session = Some(session);
+                    self.consolidated_mount = Some(mount_info);
+
+                    // Store indexes for tile-based prefetcher
+                    self.ortho_union_index = Some(index_for_prefetch);
+                    self.geo_index = Some(geo_index);
+
+                    tracing::info!(
+                        mountpoint = %mountpoint.display(),
+                        sources = source_count,
+                        files = file_count,
+                        "Consolidated ortho union filesystem mounted (WinFSP)"
+                    );
+
+                    ConsolidatedOrthoMountResult::success(
+                        mountpoint,
+                        source_count,
+                        file_count,
+                        patch_names,
+                        package_regions,
+                    )
+                }
+                Err(e) => ConsolidatedOrthoMountResult::failure(
+                    mountpoint,
+                    format!("Failed to mount: {}", e),
+                ),
+            }
+        }
     }
 
     /// Check if consolidated ortho is mounted.
     pub fn has_consolidated_ortho(&self) -> bool {
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.consolidated_session.is_some()
-        }
-        #[cfg(target_os = "windows")]
-        {
-            false
-        }
+        self.consolidated_session.is_some()
     }
 
     /// Get consolidated ortho mount info (if mounted).
@@ -839,11 +930,13 @@ impl MountManager {
         // Unmount consolidated ortho (if mounted)
         if let Some(ref mount) = self.consolidated_mount {
             panic_handler::unregister_mount(&mount.mountpoint);
+            // Windows: stop the WinFSP session now (idempotent) and clear the
+            // in-process registry, so dropping the handle below is a no-op.
+            // Unix: dropping the handle below triggers the unmount.
+            #[cfg(target_os = "windows")]
+            crate::system::unmount_fuse(&mount.mountpoint, false);
         }
-        #[cfg(not(target_os = "windows"))]
-        {
-            self.consolidated_session = None;
-        }
+        self.consolidated_session = None;
         self.consolidated_mount = None;
         self.consolidated_service = None;
 
