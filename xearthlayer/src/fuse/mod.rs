@@ -19,6 +19,12 @@ mod filename;
 // crate and everything bound to it stay out of the Windows build graph.
 #[cfg(not(target_os = "windows"))]
 pub mod fuse3;
+
+// The WinFSP backend (Phase 2, docs/dev/winfsp-backend.md §4.1). Its pure
+// helpers are cross-platform (CI-tested on every OS); the trait impl is
+// Windows-only.
+pub(crate) mod winfsp;
+
 mod placeholder;
 
 // Re-export types for public API
