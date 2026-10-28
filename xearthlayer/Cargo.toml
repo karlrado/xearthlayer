@@ -74,6 +74,9 @@ nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # Windows-only dependencies (Phase 2: WinFSP backend).
 [target.'cfg(windows)'.dependencies]
+# Official WinFSP bindings; winfsp-sys bundles the import libraries, so
+# building needs no WinFSP install (runtime-only dependency).
+winfsp = { version = "0.13", default-features = false, features = ["async-io", "handle-util"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

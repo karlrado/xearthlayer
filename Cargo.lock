@@ -4430,6 +4430,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4817,6 +4823,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
+name = "winfsp"
+version = "0.13.2+winfsp-2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e16efc519e33f1455ad9b2f3f73ba4d153f6f28f52eafc4c02e88ab928c5d9ba"
+dependencies = [
+ "bytemuck",
+ "parking_lot",
+ "paste",
+ "static_assertions",
+ "thiserror 2.0.18",
+ "widestring",
+ "windows 0.61.3",
+ "winfsp-sys",
+]
+
+[[package]]
+name = "winfsp-sys"
+version = "0.12.1"
+
+[[package]]
 name = "wit-bindgen"
 version = "0.51.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4972,6 +4998,7 @@ dependencies = [
  "tracing-subscriber",
  "wgpu",
  "windows 0.61.3",
+ "winfsp",
  "xearthlayer-package",
 ]
 

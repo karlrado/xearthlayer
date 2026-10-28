@@ -43,3 +43,11 @@ tempfile = "3.8"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 tar = "0.4"
 clap = { version = "4.5", features = ["derive"] }
+
+[patch.crates-io]
+# winfsp-sys 0.12.1 runs bindgen (needs libclang) at build time. We vendor the
+# crate's shipped pre-generated bindings + import libraries instead, so
+# Windows builds are hermetic: no libclang, no WinFSP install (the driver
+# stays a runtime-only, delay-loaded dependency). See
+# third-party/winfsp-sys/README.md and docs/dev/winfsp-backend.md §0.
+winfsp-sys = { path = "third-party/winfsp-sys" }

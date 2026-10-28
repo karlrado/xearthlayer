@@ -29,6 +29,16 @@
    `U`). Flipping to a no-escape format (`ParseOption::enabled_escape =
    false`, writer stops escaping) remains a small, well-contained option —
    deferred.
+6. **Build tooling (2026-10-28): vendor `winfsp-sys` ("option C").** The
+   published `winfsp-sys 0.12.1+winfsp-2.1` `build.rs` runs bindgen and
+   therefore needs libclang, which Karl's box does not have; Karl chose to
+   minimize extra installs, so the crate is vendored at
+   `third-party/winfsp-sys/` — the same crate with the bindgen step
+   replaced by its own shipped pre-generated `bindings.rs` and the bundled
+   import libraries — applied via `[patch.crates-io]` in the root
+   `Cargo.toml`. The build stays hermetic (no libclang, no WinFSP install).
+   Revert: delete the folder and the patch entry (see
+   `third-party/winfsp-sys/README.md` for provenance).
 
 ## 1. Purpose and scope
 
@@ -62,13 +72,35 @@ from the 0.13.2 registry crate during this design):
 
 - Built against **WinFSP 2.1** (this machine has WinFSP 2.1.25156 — match).
 - Safe, sealed trait API over `winfsp-sys` (raw bindings).
-- **`winfsp-sys` bundles its own `winfsp/lib` import libraries and `winfsp/inc`
-  headers** (default "local" mode; the `system` feature that reads the
-  installed WinFSP directory is opt-in). Consequences:
+- **`winfsp-sys` bundles its own `winfsp/lib` import libraries** (default
+  "local" mode; the `system` feature that reads the installed WinFSP
+  directory is opt-in). Consequences:
   - **Building does not require WinFSP installed** → the `windows-latest` CI
-    job needs no install step.
-  - **WinFSP is a runtime dependency** (delay-loaded DLL), present on Karl's
-    box, absent on CI runners — CI must never *mount*, only build/test.
+    job needs no install step. (Build-time catch 2026-10-28, decision 6:
+    the published crate's `build.rs` runs bindgen and needs libclang — we
+    vendor a bindgen-free copy instead.)
+  - **WinFSP is a runtime dependency** (DLL imported by the exe — see the
+    DLL-resolution note below), present on Karl's box, absent on CI
+    runners — CI must never *mount*, only build/test.
+- **DLL resolution (2026-10-28, verified on Karl's box):** the final exe
+  carries an **immediate** import of `winfsp-x64.dll`. The vendored build
+  script's `/DELAYLOAD` directive does *not* reach the final link (verified
+  via the `-v` link command: `delayimp.lib` is passed, no `/DELAYLOAD`;
+  `dumpbin /imports` shows the DLL in the import table, no delay-load
+  entry), so the upstream delay-load is inert here. And a standard WinFSP
+  2.x install puts the DLL in `C:\Program Files (x86)\WinFsp\bin`, which is
+  **not** a default DLL search path and is **not** on this machine's
+  machine/user `PATH` (checked in the registry 2026-10-28). Consequence:
+  **the exe will not even start unless `winfsp-x64.dll` is resolvable**
+  (next to the exe, on `PATH`, or loaded into the process earlier). The
+  spike runs with WinFSP's `bin` dir prepended to `PATH`. For the
+  production backend this must be solved deliberately (open item,
+  mount-lifecycle commit): copy the installed DLL next to
+  `xearthlayer.exe` at install time, and/or enable the `delayload` feature
+  plus an explicit `LoadLibrary` of the installed DLL (locate via the
+  WinFSP registry `InstallDir`) before the first WinFSP call, so the exe
+  can start for non-mounting work and fail with a useful message when
+  WinFSP is absent.
 - Feature surface: `default = ["full", "handle-util"]`; `full` = `notify` +
   `delayload` + `async-io`. We will use
   `default-features = false, features = ["async-io", "handle-util"]`:
@@ -76,9 +108,10 @@ from the 0.13.2 registry crate during this design):
     executor (`spawn_task`), §3.3.
   - `notify` — not needed (we push no change notifications; the driver does
     not modify its own tree).
-  - `delayload` — not needed for the first cut; the bundled import library
-    links directly. Can be enabled later if we want the exe to start without
-    WinFSP present.
+  - `delayload` — see the DLL-resolution note above: the exe's import is
+    immediate in practice (the `/DELAYLOAD` directive is inert in the final
+    link), so `delayload` + explicit `LoadLibrary` is the lever if we want
+    the exe to start without the DLL resolvable.
 - **License: GPL-3.0** (same as the WinFSP runtime). The repository is MIT.
   For this solo fork used privately that is acceptable; if upstream ever
   distributes a Windows build they must address GPL themselves (relinkable
@@ -141,7 +174,9 @@ Notes from the source:
   entry already returned, or `.`/`..`), not an `off_t` offset, and entries
   are written into a driver-managed `DirBuffer` via `DirBufferLock`.
 - `VolumeParams` exposes the **`IrpTimeout`** knob (see §4.4): pending-IRP
-  timeout, valid range 60 000–600 000 ms — WinFSP's read-transaction ceiling.
+  timeout, valid range 60 000–600 000 ms. Spike finding F2 (2026-10-28):
+  it bounds how long an IRP may *wait for dispatcher pickup*, **not** how
+  long a picked-up callback may run.
 
 ### 3.2 Host and service
 
@@ -306,6 +341,81 @@ Research findings (winfsp 0.13.2 source, this design):
   observe `ReadFile` success vs error at 5 s / 10 s / 70 s / 310 s. Record
   findings as an addendum to this doc. This is cheap, decisive, and removes
   the one unknown that could force an architecture change.
+  **(Run 2026-10-28 — findings below.)**
+
+### 4.4a Spike findings (run 2026-10-28 on Karl's box, WinFSP 2.1.25156)
+
+Method: `examples/winfsp_spike.rs` — one 1 KiB file; sync `read` callback
+sleeps `sleep_ms` on data IRPs (answers EOF probes immediately); a sync
+`ReadFile` client; a metadata probe after the read; a unique-per-run mount
+directory under `%TEMP%` (WinFSP creates and removes it — F1). CI compiles
+the example but never runs it.
+
+**F1 — Mount mechanics (bug found and fixed).** WinFSP's directory mount
+creates the mount-point directory itself (`NtCreateFile` with
+`FILE_CREATE` + `FILE_DELETE_ON_CLOSE`, then `FSCTL_SET_REPARSE_POINT`
+pointing at `\Device\Volume{guid}\`; unmount closes the handle, which
+deletes the directory). **The application must NOT pre-create the mount
+directory**: a pre-existing name makes `FspFileSystemSetMountPoint` fail
+with `STATUS_OBJECT_NAME_COLLISION` (0xC0000035 → HRESULT 0xD0000035,
+"Object Name already exists"). This was the spike's original mount
+failure; removing the pre-creation fixed it.
+
+**F2 — `IrpTimeout` does not bound an in-flight read (top risk
+resolved).** A 70 s blocking read with `IrpTimeout = 60 s` completed
+successfully (`READ=OK`); the 300 s ceiling behaves the same. Source
+(WinFSP 2.x, `winfsp/winfsp` master as of 2026-10-28): the driver arms a
+per-IRP deadline when posting (`src/sys/ioq.c`, `FspIoqPostIrpEx`: deadline
+= now + `IrpTimeout`), and the device expiration routine
+(`FspIoqRemoveExpired`, called from the 1 s device timer) reclaims **only
+IRPs still in the pending queue** — `FSP_IOQ_PROCESS_NO_CANCEL` is defined
+(`src/sys/driver.h`), so IRPs the dispatcher has picked up (processing
+queue) are never expired; expired ones complete as `STATUS_CANCELLED`
+(`FspIopCompleteCanceledIrp`). So `IrpTimeout` is a "the dispatcher must
+pick up work within X" liveness guard, **not** a "callbacks must finish
+within X" ceiling. The spike verified the sync path directly; the async
+path (dispatcher picks the work up immediately and defers the response)
+sits in the same processing-queue exemption.
+
+**F3 — Read-IRP shape.** One user read of a 1 KiB file issues exactly three
+read IRPs, in order: (offset 0, len 4096) → 1024 B; (offset 0, len 1024) →
+1024 B (the cache manager re-issues the exact range); (offset 1024, len
+32) → EOF. A slow data callback therefore blocks **twice** per file read;
+EOF probes must be answered immediately (no generation work) or they
+multiply the apparent latency.
+
+**F4 — Stalls are not driver-killed.** Because of F2, a generation that
+hangs forever inside `read` is never aborted by WinFSP; the client's
+`ReadFile` blocks indefinitely. The only bound is our own: the core
+`generation_timeout_secs` (10 s, placeholder fallback) remains the strict,
+sole bound on read latency. This resolves the original top risk:
+slow-but-completing generation costs *waiting*, not magenta; an unbounded
+stall is already capped by the core timeout.
+
+**F5 — Kill/leak behaviour (operational).** Killing the backend process
+mid-IO leaves: a zombie process (its object lingers), a broken
+mount-point reparse (I/O to that path hangs until the pending-IRP
+deadline), and a locked exe image (the linker cannot overwrite the exe —
+`LNK1104`). Avoid killing mid-IO; the shutdown path must unmount first; a
+reboot clears leaked WinFSP state. (This happened twice on Karl's box on
+2026-10-28 during spike runs — a reboot is recommended before the next
+build; the leaked dirs are `xel_winfsp_spike_*` under `%TEMP%`.)
+
+**F6 — DLL resolution.** See §2: the exe imports `winfsp-x64.dll`
+immediately and the WinFSP install location is not on the default DLL
+search path, so the exe must find the DLL to start at all.
+
+| sleep in read | `IrpTimeout` | result (2026-10-28) |
+|---|---|---|
+| 5 s | 60 s | `READ=OK` in 10.0 s (2×5 s data IRPs + EOF probe), `FOLLOWUP-META=OK`, `UNMOUNT=OK` |
+| 10 s | 60 s | `READ=OK` in 20.0 s (2×10 s + EOF), `FOLLOWUP-META=OK`, `UNMOUNT=OK` |
+| 70 s | 60 s | `READ=OK` in 140.0 s (2×70 s + EOF) — **not aborted by the 60 s ceiling** (F2) |
+| 70 s | 300 s | killed by the wall-clock limit mid-read; process zombified with a leaked mount dir (F5) — mechanism already proven by the 70 s/60 s case |
+| 310 s | 300 s | not run — deliberately skipped to avoid further machine-state leaks (F5); expected identical to the 70 s/60 s case |
+
+**Updated policy:** set `IrpTimeout` explicitly to 300 000 ms at mount
+(it bounds dispatcher pickup, not generation — F2); keep
+`generation_timeout_secs` (10 s) as the strict read-latency bound (F4).
 
 ### 4.5 Mount model and lifecycle
 
@@ -459,7 +569,7 @@ X-Plane still running (busy-handle behaviour observed and recorded).
 
 | Risk | Mitigation |
 |---|---|
-| IRP timeout ceiling vs generation stall (top risk) | §4.4: core timeout (10 s) ≪ explicit `IrpTimeout` (5 min); spike proves behaviour before backend work |
+| IRP timeout ceiling vs generation stall (top risk) | **Resolved 2026-10-28** (§4.4a F2/F4): `IrpTimeout` does not abort in-flight reads; the core 10 s timeout is the sole bound and already falls back to a placeholder |
 | `get_security_by_name`/ACL expectations of X-Plane | read-only volume, `sz_security_descriptor = 0` (driver default ACL); same-user access; e2e in §7.4 |
 | Directory-enumeration marker semantics differ from FUSE `off_t` | isolated pure `entries_after` helper, property-tested; one-shot core listing simplifies state |
 | `open` sync/async seam blocking a dispatcher thread | bounded by `core.lookup` (metadata reads only, no generation); pollster pattern already in use; generation never happens in `open` |

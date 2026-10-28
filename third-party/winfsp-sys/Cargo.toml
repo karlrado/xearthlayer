@@ -1,0 +1,20 @@
+[package]
+name = "winfsp-sys"
+version = "0.12.1"
+edition = "2021"
+description = "Raw bindings to WinFSP. Vendored copy of the published 0.12.1 crate; see README.md for provenance and the one build difference."
+license = "GPL-3.0"
+repository = "https://github.com/SnowflakePowered/winfsp-rs"
+
+[lib]
+name = "winfsp_sys"
+path = "src/lib.rs"
+build = "build.rs"
+
+[features]
+# No-ops, kept so winfsp 0.13.x's feature map (which references
+# winfsp-sys/docsrs and winfsp-sys/system) still resolves. This vendored
+# build never needs either: bindings are pre-generated and the import
+# libraries are bundled in winfsp/lib/.
+docsrs = []
+system = []
