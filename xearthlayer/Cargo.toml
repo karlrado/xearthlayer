@@ -73,10 +73,21 @@ libc = "0.2"
 nix = { version = "0.31", default-features = false, features = ["fs"] }
 
 # Windows-only dependencies (Phase 2: WinFSP backend).
+[target.'cfg(windows)'.build-dependencies]
+# `winfsp::build::winfsp_link_delayload()` (called from build.rs): emits the
+# DELAYLOAD link args for the final exe. `delayload` enables the `build`
+# module; nothing else of the crate is needed at build time.
+winfsp = { version = "0.13", default-features = false, features = ["delayload"] }
+
 [target.'cfg(windows)'.dependencies]
 # Official WinFSP bindings; winfsp-sys bundles the import libraries, so
 # building needs no WinFSP install (runtime-only dependency).
-winfsp = { version = "0.13", default-features = false, features = ["async-io", "handle-util"] }
+# - `delayload` + `system`: the exe delay-loads winfsp-x64.dll (build.rs
+#   emits the link directive via `winfsp::build`, design doc §2) and
+#   `winfsp_init()` resolves the DLL from the standard search path first,
+#   then the installed `HKLM\SOFTWARE\WinFsp\InstallDir` — no hardcoded
+#   location, and the exe starts even where WinFSP is absent (commit 5).
+winfsp = { version = "0.13", default-features = false, features = ["async-io", "handle-util", "delayload", "system"] }
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",

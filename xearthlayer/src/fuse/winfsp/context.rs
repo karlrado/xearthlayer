@@ -3,15 +3,22 @@
 //!
 //! Windows-only: this is the only module in the backend that names WinFSP
 //! types. The mapping/resolution logic it delegates to lives in the pure,
-//! cross-platform `error`/`resolve` siblings (CI-tested on every OS), and
-//! the sync→async seam is `pollster::block_on` (§3.4) — safe because the
-//! WinFSP dispatcher threads are never tokio workers.
+//! cross-platform `error`/`resolve` siblings (CI-tested on every OS).
 //!
-//! The driver invokes these from multiple dispatcher threads under the
-//! default `FineGuard` strategy (exclusive-shared lock per op class, no
-//! lock on reads), so every core call goes through the core's internally
-//! synchronized API (`Arc` + `DashMap` + atomics) and no adapter lock is
-//! needed (§3.1).
+//! Two call shapes coexist, both safe:
+//!
+//! - **Metadata ops** (`lookup` walk, `attrs`, `open`) block the dispatcher
+//!   thread via the mount runtime's `Handle::block_on` — they are
+//!   metadata-only (bounded by `core.lookup`/`core.attrs`, no generation)
+//!   and WinFSP's dispatcher threads are never tokio workers, so a
+//!   `block_on` there cannot deadlock the runtime (§3.4). The runtime's
+//!   `block_on` (not a bare `pollster::block_on`) installs the tokio
+//!   runtime context the core's `tokio::fs` I/O needs to find its blocking
+//!   thread pool — see the `block_on` helper below.
+//! - **Read ops** run as async tasks on the mount's tokio runtime
+//!   (`AsyncFileSystemContext`, design §3.3): the dispatcher stays free
+//!   while a slow tile generation is in flight, and no dispatcher thread
+//!   ever blocks on tokio.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -20,8 +27,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_READONLY};
 use winfsp::filesystem::{
-    DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
-    VolumeInfo, WideNameInfo,
+    AsyncFileSystemContext, DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity,
+    FileSystemContext, OpenFileInfo, VolumeInfo, WideNameInfo,
 };
 use winfsp::{FspError, Result, U16CStr};
 
@@ -93,24 +100,48 @@ pub struct FileEntry {
 /// The WinFSP backend context: a thin adapter over the neutral
 /// [`OrthoUnionCore`].
 ///
-/// The core is constructed by the caller (commit 5's builder mirrors the
-/// FUSE adapter's construction), which is what keeps this struct free of
-/// lifecycle concerns.
+/// The core is constructed by the caller (the builder in `mod.rs` mirrors
+/// the FUSE adapter's construction), which is what keeps this struct free
+/// of lifecycle concerns.
 #[derive(Clone)]
-pub struct WinFspOrthoUnionFS {
+pub struct OrthoUnionContext {
     core: Arc<OrthoUnionCore>,
+    /// The tokio runtime that async read tasks are spawned onto (the
+    /// builder carries it, design §4.2).
+    runtime: tokio::runtime::Handle,
 }
 
-impl WinFspOrthoUnionFS {
-    /// Wrap an existing core.
-    pub fn new(core: Arc<OrthoUnionCore>) -> Self {
-        Self { core }
+impl OrthoUnionContext {
+    /// Wrap an existing core. `runtime` must be the mount's runtime: async
+    /// reads are dispatched there via [`AsyncFileSystemContext::spawn_task`].
+    pub fn new(core: Arc<OrthoUnionCore>, runtime: tokio::runtime::Handle) -> Self {
+        Self { core, runtime }
     }
 
-    /// The core this context serves (the commit-5 mount flow builds the
-    /// host around the same core).
+    /// The core this context serves (the mount flow builds the host around
+    /// the same core).
     pub fn core(&self) -> &Arc<OrthoUnionCore> {
         &self.core
+    }
+
+    /// Run a core future on this (WinFSP dispatcher) thread — the sync→async
+    /// seam (§3.4).
+    ///
+    /// `Handle::block_on`, deliberately not a bare `pollster::block_on`: the
+    /// core does its blocking I/O through `tokio::fs` (the shared, I/O
+    /// limited path the FUSE backend uses), and `tokio::fs` resolves the
+    /// blocking thread pool from the ambient tokio runtime context. A bare
+    /// `block_on` provides no context, so the first `tokio::fs` call inside
+    /// the future panics with "there is no reactor running" — on a WinFSP
+    /// dispatcher thread that cannot unwind, where `catch_panic!` turns the
+    /// panic into an opaque NTSTATUS for the caller (hit live in the
+    /// commit-5 smoke test: `open` of a real passthrough file). Installing
+    /// the mount runtime's context routes those calls to the mount
+    /// runtime's blocking pool instead. Dispatcher threads are never tokio
+    /// workers (§3.4), so this cannot nest inside a runtime context or
+    /// block one of the runtime's own workers.
+    fn block_on<F: std::future::Future>(&self, future: F) -> F::Output {
+        self.runtime.block_on(future)
     }
 
     /// Walk a driver path through the core — the sync→async seam (§3.4).
@@ -119,10 +150,8 @@ impl WinFspOrthoUnionFS {
         // FUSE; a name that cannot round-trip simply does not match the
         // index and is reported missing.
         let components = split_components(&file_name.to_string_lossy());
-        let core = Arc::clone(&self.core);
-        walk(&components, move |parent, name| {
-            let core = Arc::clone(&core);
-            pollster::block_on(async move { core.lookup(parent, name).await })
+        walk(&components, |parent, name| {
+            self.block_on(self.core.lookup(parent, name))
         })
         .map_err(to_fsp)
     }
@@ -141,14 +170,27 @@ impl WinFspOrthoUnionFS {
         if entry.is_dir {
             return entry.attrs.clone();
         }
-        match pollster::block_on(self.core.attrs(&entry.node)) {
+        match self.block_on(self.core.attrs(&entry.node)) {
+            Ok(real) => real,
+            Err(_) => entry.attrs.clone(),
+        }
+    }
+
+    /// The attributes for one listed entry, awaited (the async `read` path
+    /// upgrades entries before filling the driver buffer — no awaits under
+    /// the `DirBuffer` lock).
+    async fn entry_attrs_async(&self, entry: &DirEntry) -> FileAttributes {
+        if entry.is_dir {
+            return entry.attrs.clone();
+        }
+        match self.core.attrs(&entry.node).await {
             Ok(real) => real,
             Err(_) => entry.attrs.clone(),
         }
     }
 }
 
-impl FileSystemContext for WinFspOrthoUnionFS {
+impl FileSystemContext for OrthoUnionContext {
     type FileContext = Arc<FileEntry>;
 
     fn get_security_by_name(
@@ -183,7 +225,7 @@ impl FileSystemContext for WinFspOrthoUnionFS {
 
         // Report the node's attributes so the driver can cache them; sizes
         // matter for passthrough DSF/TER files.
-        let attrs = pollster::block_on(self.core.attrs(&node)).map_err(to_fsp)?;
+        let attrs = self.block_on(self.core.attrs(&node)).map_err(to_fsp)?;
         let info = file_info_from_attrs(&attrs);
         let fi = file_info.as_mut();
         fi.file_attributes = info.file_attributes;
@@ -217,26 +259,22 @@ impl FileSystemContext for WinFspOrthoUnionFS {
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
-        let attrs = pollster::block_on(self.core.attrs(&context.node)).map_err(to_fsp)?;
+        let attrs = self
+            .block_on(self.core.attrs(&context.node))
+            .map_err(to_fsp)?;
         *file_info = file_info_from_attrs(&attrs);
         Ok(())
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
         let fh = context.fh.load(Ordering::Acquire);
-        let data =
-            pollster::block_on(
+        let data = self
+            .block_on(
                 self.core
                     .read(&context.node, fh, offset, buffer.len() as u32),
             )
             .map_err(to_fsp)?;
-
-        // The core serves whatever the source has: a short read at the end,
-        // empty past it. `0` is the driver's EOF signal, so an EOF probe
-        // costs the core's (already bounded) answer and nothing more.
-        let len = data.len().min(buffer.len());
-        buffer[..len].copy_from_slice(&data[..len]);
-        Ok(len as u32)
+        Ok(copy_read_into(data, buffer))
     }
 
     fn read_directory(
@@ -255,8 +293,9 @@ impl FileSystemContext for WinFspOrthoUnionFS {
         //
         // The pattern is left to the driver's own matching, as the vtable
         // contract allows.
-        let listing =
-            pollster::block_on(self.core.list_directory(&context.node)).map_err(to_fsp)?;
+        let listing = self
+            .block_on(self.core.list_directory(&context.node))
+            .map_err(to_fsp)?;
 
         let dir_buffer = DirBuffer::new();
         {
@@ -294,6 +333,95 @@ impl FileSystemContext for WinFspOrthoUnionFS {
 
     fn dispatcher_stopped(&self, normally: bool) {
         tracing::debug!(normally, "WinFSP dispatcher stopped");
+    }
+}
+
+/// Copy the core's answer into the driver's buffer and report the length.
+///
+/// The core serves whatever the source has: a short read at the end, empty
+/// past it. `0` is the driver's EOF signal, so an EOF probe costs the core's
+/// (already bounded) answer and nothing more. Shared by the sync and async
+/// read paths so the two cannot drift.
+fn copy_read_into(data: bytes::Bytes, buffer: &mut [u8]) -> u32 {
+    let len = data.len().min(buffer.len());
+    buffer[..len].copy_from_slice(&data[..len]);
+    len as u32
+}
+
+impl AsyncFileSystemContext for OrthoUnionContext {
+    /// The read runs on the mount's tokio runtime, keeping the WinFSP
+    /// dispatcher thread free while a tile generation (up to the core's 10 s
+    /// budget) is in flight — the async read path of design §3.3.
+    fn read_async(
+        &self,
+        context: &Self::FileContext,
+        buffer: &mut [u8],
+        offset: u64,
+    ) -> impl std::future::Future<Output = Result<u32>> + Send {
+        let core = Arc::clone(&self.core);
+        let node = context.node.clone();
+        let fh = context.fh.load(Ordering::Acquire);
+        async move {
+            let data = core
+                .read(&node, fh, offset, buffer.len() as u32)
+                .await
+                .map_err(to_fsp)?;
+            Ok(copy_read_into(data, buffer))
+        }
+    }
+
+    /// The listing and the per-entry metadata upgrade are awaited first;
+    /// the driver's staging buffer is filled and read back only after the
+    /// last await, so the `DirBuffer` lock is never held across one.
+    fn read_directory_async(
+        &self,
+        context: &Self::FileContext,
+        _pattern: Option<&U16CStr>,
+        marker: DirMarker,
+        buffer: &mut [u8],
+    ) -> impl std::future::Future<Output = Result<u32>> + Send {
+        let node = context.node.clone();
+        async move {
+            // The core's listing is one-shot; pagination is the driver's job
+            // (it sorts the staging buffer by name and resumes strictly
+            // after `marker`) — same contract as the sync path.
+            let listing = self.core.list_directory(&node).await.map_err(to_fsp)?;
+
+            // Upgrade file entries to real metadata before touching the
+            // driver buffer: the attrs read is async and must not happen
+            // while the `DirBuffer` lock is held (no awaits under the lock).
+            // The placeholder stands in if the source vanished, exactly as
+            // `readdirplus` does on FUSE.
+            let mut attrs = Vec::with_capacity(listing.len());
+            for entry in &listing {
+                attrs.push(self.entry_attrs_async(entry).await);
+            }
+
+            let dir_buffer = DirBuffer::new();
+            {
+                // A capacity hint only (the staging buffer grows as needed);
+                // sized to the full listing so a busy directory fills without
+                // regrowth.
+                let hint = listing
+                    .len()
+                    .saturating_mul(std::mem::size_of::<DirInfo<255>>() + 512)
+                    .min(u32::MAX as usize) as u32;
+                let lock = dir_buffer.acquire(true, Some(hint))?;
+                for (entry, real_attrs) in listing.iter().zip(attrs.iter()) {
+                    let mut dir_info = DirInfo::<255>::default();
+                    *dir_info.file_info_mut() = file_info_from_attrs(real_attrs);
+                    dir_info.set_name(&entry.name)?;
+                    lock.write(&mut dir_info)?;
+                }
+            }
+            Ok(dir_buffer.read(marker, buffer))
+        }
+    }
+
+    /// Dispatch the read future onto the mount's tokio runtime — never the
+    /// dispatcher thread that called the driver (design §3.3).
+    fn spawn_task(&self, future: impl std::future::Future<Output = ()> + Send + 'static) {
+        self.runtime.spawn(future);
     }
 }
 

@@ -216,11 +216,20 @@ a dispatcher thread for up to the generation budget per read.
 
 `open` has no async variant. It must resolve the full path through the core
 (`lookup` is `async` because it may stat real source files). **Decision:
-`pollster::block_on` inside `open`** (pollster is already a workspace
-dependency and is the codebase's established pattern for blocking on a
-tokio future from a non-runtime thread). This is safe — we are on a WinFSP
-dispatcher thread, not a tokio worker — and it mirrors what the FUSE adapter
-does implicitly (fuse3 runs the async ops on its own executor).
+the mount runtime's `Handle::block_on` inside `open`** — deliberately not a
+bare `pollster::block_on`. The core does its blocking I/O through
+`tokio::fs` (the shared, I/O-limited path the FUSE backend uses), and
+`tokio::fs` resolves the blocking thread pool from the ambient tokio
+runtime context: a bare `block_on` provides no such context, so the first
+`tokio::fs` call inside the future panics ("there is no reactor running") —
+and on a WinFSP dispatcher thread, which cannot unwind, `catch_panic!`
+turns that into an opaque NTSTATUS for the caller (hit live in the
+commit-5 smoke test: `open` of a real passthrough file). `Handle::block_on`
+installs the mount runtime's context, so those calls run on the mount
+runtime's blocking pool instead. This is safe — we are on a WinFSP
+dispatcher thread, never a tokio worker, so the runtime cannot be nested or
+deadlocked — and it mirrors what the FUSE adapter does implicitly (fuse3
+runs the async ops on its own executor).
 
 ## 4. Architecture
 
@@ -290,10 +299,10 @@ struct FileEntry {
 | WinFSP op (crate) | Implementation |
 |---|---|
 | `get_security_by_name` | `Ok(FileSecurity { reparse: false, sz_security_descriptor: 0, attributes: READONLY })` — no ACL policy |
-| `open(path)` | walk components: `pollster::block_on(core.lookup(parent, name))` per component → `FsNode`; then `core.open(&node)` → `fh`; `Arc::new(FileEntry)` |
+| `open(path)` | walk components: `runtime.block_on(core.lookup(parent, name))` per component → `FsNode`; then `core.open(&node)` → `fh`; `Arc::new(FileEntry)` |
 | `cleanup(ctx)` | if `fh != 0` → `core.release(fh)` (interior mutability via `AtomicU64` or `Mutex`), idempotent |
 | `close(ctx)` | drop `Arc` (no core work; release already happened in `cleanup`) |
-| `get_file_info(ctx)` | `pollster::block_on(core.attrs(&node))` → `FileInfo` (size, times, attrs) |
+| `get_file_info(ctx)` | `runtime.block_on(core.attrs(&node))` → `FileInfo` (size, times, attrs) |
 | `read_async(ctx, buf, off)` | `core.read(&node, fh, off, len).await` → `Bytes` → copy into `buf`; return len |
 | `read_directory_async(ctx, pattern, marker, buf)` | `core.list_directory(&node)` → `Vec<DirEntry>`; resume after `marker` (pure helper `entries_after(marker)`); fill via `DirBuffer::acquire` + `DirInfo` writes; handle `.`/`..` |
 | `get_volume_info` | `core.statfs()` + `VolumeParams` (name "XEarthLayer", 512-byte sectors, serial, read-only flag) |
@@ -443,10 +452,17 @@ search path, so the exe must find the DLL to start at all.
     `unmount()` (the panic handler already registers the mountpoint; on
     Windows it also carries the session handle).
   - `is_path_mounted` → in-process mount registry first (authoritative for
-    our own mounts), with a best-effort `GetVolumeInformation` volume-name
-    check for "is something mounted here at all" (package status display).
-  - `is_stale_fuse_mount` → a mount whose service worker is dead (probe via
-    the session's `join`-state / `GetVolumeInformation` failing).
+    our own mounts), then a reparse-point check on the path: a WinFSP folder
+    mount is a directory carrying a MUP mount-point reparse point whose
+    target is the volume device name (`\Device\Volume{GUID}\`), read via
+    `read_link` (on-disk reparse data — answers for a corpse too, no I/O to
+    the dead service). `GetVolumeInformationW` is **not** usable here: it
+    only accepts a volume-root path (`X:\`) and returns
+    `ERROR_INVALID_NAME` on any subdirectory/file — verified on plain NTFS,
+    not WinFSP-specific.
+  - `is_stale_fuse_mount` → a mount whose service worker is dead: the
+    reparse point survives a dead service (spike F5), so
+    `is_winfsp_volume` is `true` while no in-process session is registered.
 - **Preflight/CLI:** `FdLimit` (rlimit raise) becomes a satisfied no-op on
   Windows (documented: Windows handles are per-process and there is no
   soft-limit raise to do).
@@ -491,7 +507,7 @@ installer path.
 
 | Site | Unix mechanism | Windows plan |
 |---|---|---|
-| `system/unmount.rs` | `fusermount`/`umount`, `/proc/mounts` | §4.5: session unmount + volume-info probe |
+| `system/unmount.rs` | `fusermount`/`umount`, `/proc/mounts` | §4.5: session unmount + reparse-point mount check |
 | `system/hardware.rs` (`try_detect_total_memory`) | `/proc/meminfo` / `sysctl` | `GlobalMemoryStatusEx` (falls back to 8 GB like today if it fails) |
 | `diagnostics/report.rs:~228` | `/proc/meminfo` | reuse `hardware.rs` detection (DRY) |
 | `system/filesystem.rs` (`available_bytes`) | `nix::statvfs` | `GetDiskFreeSpaceExW` |
@@ -572,7 +588,7 @@ X-Plane still running (busy-handle behaviour observed and recorded).
 | IRP timeout ceiling vs generation stall (top risk) | **Resolved 2026-10-28** (§4.4a F2/F4): `IrpTimeout` does not abort in-flight reads; the core 10 s timeout is the sole bound and already falls back to a placeholder |
 | `get_security_by_name`/ACL expectations of X-Plane | read-only volume, `sz_security_descriptor = 0` (driver default ACL); same-user access; e2e in §7.4 |
 | Directory-enumeration marker semantics differ from FUSE `off_t` | isolated pure `entries_after` helper, property-tested; one-shot core listing simplifies state |
-| `open` sync/async seam blocking a dispatcher thread | bounded by `core.lookup` (metadata reads only, no generation); pollster pattern already in use; generation never happens in `open` |
+| `open` sync/async seam blocking a dispatcher thread | bounded by `core.lookup` (metadata reads only, no generation); the mount runtime's `Handle::block_on` supplies the `tokio::fs` context the core needs (a bare `pollster::block_on` panics inside `tokio::fs` — found in the commit-5 smoke); generation never happens in `open` |
 | GPL-3.0 (`winfsp`/WinFSP) in an MIT repo | private fork, no distribution; recorded for upstream's future decision |
 | `intel_tex_2` ISPC kernels on Windows (scope doc §4.5) | prebuilt x86_64 kernels ship in the crate; verified during first Windows build + spike (pure-Rust `SoftwareCompressor` fallback exists) |
 | Case-insensitive Windows paths vs case-sensitive index keys | X-Plane reads back the exact names we enumerate; `case_preserved_names` on; lookup mismatch surfaces in e2e, fallback = case-insensitive compare in `resolve.rs` |

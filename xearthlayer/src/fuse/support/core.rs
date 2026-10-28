@@ -477,10 +477,22 @@ impl OrthoUnionCore {
         };
         let child_path = parent_path.join(name);
 
-        // 1. Real file from a source.
+        // 1. Real file from a source. The scanner registers directories in
+        //    the files map too (`scan_directory_recursive` adds each
+        //    directory for resolution), so a hit whose on-disk metadata is a
+        //    directory must be reported as that directory: backends that
+        //    walk parent nodes by kind (the WinFSP adapter) rely on the
+        //    variant, and a `RealFile` parent would abort the walk with
+        //    NotADirectory. FUSE is unaffected: it keys off `attrs.kind`
+        //    either way.
         if let Some(source) = self.index.resolve(&child_path) {
             if let Ok(metadata) = fs::metadata(&source.real_path).await {
-                return Ok((FsNode::RealFile(child_path), attrs_from_metadata(&metadata)));
+                let node = if metadata.is_dir() {
+                    FsNode::Directory(child_path)
+                } else {
+                    FsNode::RealFile(child_path)
+                };
+                return Ok((node, attrs_from_metadata(&metadata)));
             }
         }
 
@@ -1466,6 +1478,28 @@ mod tests {
     // ========================================================================
     // Lookup semantics: water mask guard (#68), lit passthrough, size upgrades
     // ========================================================================
+
+    /// The scanner registers directories in the files map too
+    /// (`scan_directory_recursive` adds each directory for resolution), so
+    /// looking one up must come back as a *directory* node: the WinFSP
+    /// adapter walks parent nodes by kind and a `RealFile` parent aborts
+    /// the walk with NotADirectory (caught in the commit-5 smoke: opening
+    /// `Earth nav data/...` through the mount).
+    #[tokio::test]
+    async fn lookup_of_a_scanned_directory_reports_a_directory_node() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+
+        let (node, attrs) = core
+            .lookup(&FsNode::root(), "Earth nav data")
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(node, FsNode::Directory(_)),
+            "a name the scanner registered as a directory must resolve to a Directory node, got {node:?}"
+        );
+        assert_eq!(attrs.kind, crate::fuse::support::attrs::NodeKind::Directory);
+    }
 
     /// X-Plane requests BORDER_TEX water masks as `.dds` first. If a `.png`
     /// with the same stem exists on disk, the core must report the DDS
