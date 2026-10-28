@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+#### Windows
+
+- **Windows support (on-demand ortho) via WinFSP**: XEarthLayer now builds and runs natively on Windows. The ortho union filesystem — on-demand ortho generation, the memory and disk caches, and the dashboard — is served through [WinFSP](https://docs.winfsp.xyz) instead of FUSE, driven by the same backend-neutral core as the Linux and macOS FUSE paths. The package manager (downloading and installing scenery packages) is not yet supported on Windows.
+
 #### Package management
 
 - **A package manager in the terminal**: `xearthlayer packages` with no subcommand now opens a full-screen package manager in place of the command help. Three tabs cover what the commands did one at a time: Local lists the installed packages with their size and whether the library has a newer version, Library lists everything on offer with its status and a type filter, and Progress shows each queued job as it downloads, extracts and installs. A spinner shows while the lists are read, marked rows are cyan, and the detail pane names the package's continent. Mark rows with Space (or `a` for all), then press `i` to install, `u` to update or `d` to delete; the marked rows are used, or the selected row when none are marked. Installs and deletes ask for confirmation first, and with `auto_install_overlays` on an ortho install brings its overlay. Jobs run on the same install queue as the commands, so downloads still run ahead of installs, and queuing a job never leaves the tab you are on. `c` cancels the selected job, `C` all of them, and `?` shows every key. Quitting with jobs running cancels them first, and a signal from outside is handled as the commands handle it (exit status 130 for SIGINT, 143 for SIGTERM, 129 for SIGHUP), with the terminal restored. Without a terminal, `xearthlayer packages` still prints the command help. `xearthlayer setup` now offers to open the package manager when it finishes, and its next steps lead with it.

@@ -28,6 +28,14 @@ Technical documentation for XEarthLayer developers and contributors.
 | [Index Building Optimization](index-building-optimization.md) | OrthoUnionIndex caching and parallel scanning |
 | [Network Stats](network-stats.md) | Download metrics, bandwidth tracking |
 
+## Windows (WinFSP port)
+
+| Document | Description |
+|----------|-------------|
+| [Windows Support Scope](windows-scope.md) | Path A (WinFSP) scoping, phase plan, and the Phase 0 gate list |
+| [Windows Backend Split (Phase 1)](windows-backend-split.md) | Extracting the backend-neutral core so the FUSE and WinFSP backends share it |
+| [WinFSP Backend (Phase 2)](winfsp-backend.md) | The WinFSP backend: builder, session, async reads, spike findings, commit plan |
+
 ## Package System
 
 | Document | Description |

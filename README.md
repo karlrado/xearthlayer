@@ -52,7 +52,7 @@ See [How It Works](docs/how-it-works.md) for detailed architecture.
 - **Multiple compression backends**: ISPC SIMD (default) or GPU-accelerated via wgpu compute shaders
 - Real-time TUI dashboard showing cache, download, and prefetch status
 - Works with OXO and Ortho4XP-generated scenery
-- Linux and macOS support
+- Linux, macOS, and Windows support
 
 ## Quick Start
 
@@ -197,7 +197,7 @@ Run `xearthlayer --help` for all options.
 ## Requirements
 
 - **X-Plane 12**
-- **Linux** with FUSE support, or **macOS** with [macFUSE](https://macfuse.io) installed (see the [macOS guide](docs/macos.md))
+- **Linux** with FUSE support, **macOS** with [macFUSE](https://macfuse.io) installed (see the [macOS guide](docs/macos.md)), or **Windows** with [WinFSP](https://docs.winfsp.xyz) installed (on-demand ortho; the package manager is not yet supported on Windows)
 - **Modern GPU** with 8GB VRAM or higher, 16GB+ recommended (for X-Plane rendering), 24GB+ for all sliders right flying
 - **Fast Internet connection** for streaming imagery, recommended 800Mbps downstream or better
 
