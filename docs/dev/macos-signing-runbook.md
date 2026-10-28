@@ -263,9 +263,9 @@ Account Holder only. Repeat steps 1 to 3 with the Installer certificate type:
 | `APPLE_NOTARY_ISSUER_ID` | the issuer ID |
 
 ```bash
-gh secret set APPLE_DEVELOPER_ID_P12 -R samsoir/xearthlayer < <(base64 -i xearthlayer-developer-id.p12)
+test -s xearthlayer-developer-id.p12 && gh secret set APPLE_DEVELOPER_ID_P12 -R samsoir/xearthlayer < <(base64 -i xearthlayer-developer-id.p12)
 gh secret set APPLE_DEVELOPER_ID_P12_PASSWORD -R samsoir/xearthlayer     # prompts
-gh secret set APPLE_DEVELOPER_INSTALLER_P12 -R samsoir/xearthlayer < <(base64 -i xearthlayer-developer-id-installer.p12)
+test -s xearthlayer-developer-id-installer.p12 && gh secret set APPLE_DEVELOPER_INSTALLER_P12 -R samsoir/xearthlayer < <(base64 -i xearthlayer-developer-id-installer.p12)
 gh secret set APPLE_DEVELOPER_INSTALLER_P12_PASSWORD -R samsoir/xearthlayer     # prompts
 gh secret set APPLE_NOTARY_KEY_P8 -R samsoir/xearthlayer < AuthKey_<KEYID>.p8
 gh secret set APPLE_NOTARY_KEY_ID -R samsoir/xearthlayer                  # prompts
@@ -280,7 +280,10 @@ un-notarized binary that Gatekeeper would still refuse.
 
 Without `APPLE_DEVELOPER_INSTALLER_P12` the workflow still signs and notarizes the
 tarballs, emits a `::notice::` and builds no packages. A set `.p12` with a missing
-password fails at import. `version.json` already
+password fails at import. A set password with an empty `.p12` fails the job at its
+first step: `gh secret set` stores an empty value when the `base64` feeding it fails
+(run it where the `.p12` is), and GitHub reads an empty secret as unset, which is how
+v0.5.0-rc.1 shipped without packages. `version.json` already
 lists `macos_pkg` and `publish_macos_pkg`, so until `APPLE_DEVELOPER_INSTALLER_P12` is set
 a release names packages it does not carry. The website ignores those keys today.
 

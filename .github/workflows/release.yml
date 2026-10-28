@@ -206,6 +206,21 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
+      # An Installer password without its certificate is a broken secret, not an
+      # absent one: `gh secret set` stores an empty value when the command feeding
+      # it fails, and GitHub reads an empty secret as unset. Without this check the
+      # job ships tarballs only and passes, with nothing but a notice (v0.5.0-rc.1).
+      - name: Check installer secrets
+        if: env.MACOS_SIGNING == 'true'
+        env:
+          INSTALLER_P12_SET: ${{ secrets.APPLE_DEVELOPER_INSTALLER_P12 != '' }}
+          INSTALLER_PASSWORD_SET: ${{ secrets.APPLE_DEVELOPER_INSTALLER_P12_PASSWORD != '' }}
+        run: |
+          if [ "$INSTALLER_PASSWORD_SET" = "true" ] && [ "$INSTALLER_P12_SET" != "true" ]; then
+            echo "::error::APPLE_DEVELOPER_INSTALLER_P12_PASSWORD is set but APPLE_DEVELOPER_INSTALLER_P12 is empty. Set it again from the directory holding the .p12 (docs/dev/macos-signing-runbook.md)."
+            exit 1
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
