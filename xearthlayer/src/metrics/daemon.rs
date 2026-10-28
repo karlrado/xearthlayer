@@ -1090,7 +1090,27 @@ mod tests {
         );
 
         daemon.process_event(MetricEvent::ChunkIndexEntriesUpdate { entries: 99 });
-        daemon.log_memory_sample();
+
+        // Emit under the capturing subscriber, and assert the sample was
+        // actually emitted (the bare call this replaces proved nothing about
+        // the event).
+        //
+        // Do not "simplify" this back to a bare `daemon.log_memory_sample()`
+        // call: tracing-core caches each callsite's `Interest` process-wide on
+        // first registration, computed against the *registering thread's*
+        // default dispatcher. A bare emission on a subscriber-less thread
+        // registers the "Memory sample" callsite against `NoSubscriber`,
+        // caching `Interest::NEVER`; from then on the `tracing` event macro
+        // drops the event on every thread -- including inside
+        // `capture_events`' `with_default` -- and the capture tests fail with
+        // "0 event(s) captured". That is exactly the flake this test used to
+        // cause in
+        // `memory_sample_line_carries_every_field_from_its_correct_source`.
+        let events = capture_events(|| daemon.log_memory_sample());
+        assert!(
+            find_memory_sample(&events).is_some(),
+            "a working probe must emit the Memory sample event"
+        );
 
         assert!(
             !daemon.memory_probe_failed,
