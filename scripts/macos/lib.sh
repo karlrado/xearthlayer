@@ -79,14 +79,20 @@ notarize() {
 
 # Prints the productbuild distribution for one product's package: arm64
 # only, macOS 12 or later (the casks' `depends_on macos: :monterey`), one
-# hidden choice, no customisation, no scripts. The runtime gets a welcome
-# page (pkg/macos/welcome.html) about macFUSE.
+# hidden choice, no customisation, no scripts. Both packages show the MIT
+# license (LICENSE.txt) for the user to accept. The runtime also gets the
+# welcome, readme and conclusion pages from pkg/macos/, which cover macFUSE:
+# the publisher does not mount anything, so it needs none of them.
 render_distribution() {
-    local product=$1 version=$2 title welcome="" id="net.defreyssi.$1"
+    local product=$1 version=$2 title id="net.defreyssi.$1"
+    local pages='    <license file="LICENSE.txt" mime-type="text/plain"/>
+'
     case "$product" in
         xearthlayer)
             title="XEarthLayer"
-            welcome='    <welcome file="welcome.html" mime-type="text/html"/>
+            pages='    <welcome file="welcome.html" mime-type="text/html"/>
+    <readme file="readme.html" mime-type="text/html"/>
+'"$pages"'    <conclusion file="conclusion.html" mime-type="text/html"/>
 '
             ;;
         xearthlayer-publish) title="XEarthLayer Publishing Tools" ;;
@@ -99,7 +105,7 @@ render_distribution() {
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
     <title>$title</title>
-${welcome}    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
+${pages}    <options customize="never" require-scripts="false" hostArchitectures="arm64"/>
     <domains enable_localSystem="true" enable_anywhere="false" enable_currentUserHome="false"/>
     <volume-check>
         <allowed-os-versions>

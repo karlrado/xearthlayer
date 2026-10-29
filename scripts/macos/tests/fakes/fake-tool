@@ -43,7 +43,7 @@ case "$tool" in
         prev=""
         for arg in "$@"; do
             [ "$prev" = "--distribution" ] && cp "$arg" "$FAKE_DIR/distribution.xml"
-            [ "$prev" = "--resources" ] && ls "$arg" >"$FAKE_DIR/resources.txt"
+            [ "$prev" = "--resources" ] && ls "$arg" >"$FAKE_DIR/resources.txt" && cp -R "$arg" "$FAKE_DIR/resources"
             prev=$arg
         done
         : >"$last"

@@ -124,9 +124,12 @@ writes.
 `scripts/macos/build-pkg.sh <product> <binary> <version> <out.pkg>` builds one
 package from an already signed and notarized binary. The package installs
 `/usr/local/bin/<product>` under the receipt `net.defreyssi.<product>`, has no
-install scripts, and targets arm64 and macOS 12.0 or later. The runtime
-package shows `pkg/macos/welcome.html` in the Installer; the publisher package
-has no welcome page. The script signs it with the
+install scripts, and targets arm64 and macOS 12.0 or later. Both packages show
+the repository's `LICENSE` (MIT) as the license the user accepts. The runtime
+package also shows three pages from `pkg/macos/`: `welcome.html`, `readme.html`
+(installing and approving macFUSE, without which `run` cannot start) and
+`conclusion.html` (next steps: `xearthlayer setup`, or macFUSE first). The
+publisher mounts nothing, so it has only the license. The script signs it with the
 Developer ID Installer identity, submits it for notarization, staples the ticket
 and checks the result. `xcrun stapler validate` gates in every case. The
 `spctl --assess --type install` check is skipped, with a note, on a host whose

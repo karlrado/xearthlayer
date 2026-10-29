@@ -78,8 +78,10 @@ mkdir -p "$work/root/usr/local/bin" "$work/resources" "$work/components"
 chmod 755 "$work/root" "$work/root/usr" "$work/root/usr/local" "$work/root/usr/local/bin"
 cp "$binary" "$work/root/usr/local/bin/$product"
 chmod 755 "$work/root/usr/local/bin/$product"
+cp "$repo_root/LICENSE" "$work/resources/LICENSE.txt"
 if [ "$product" = "xearthlayer" ]; then
-    cp "$repo_root/pkg/macos/welcome.html" "$work/resources/"
+    cp "$repo_root/pkg/macos/welcome.html" "$repo_root/pkg/macos/readme.html" \
+        "$repo_root/pkg/macos/conclusion.html" "$work/resources/"
 fi
 render_distribution "$product" "$version" >"$work/distribution.xml"
 

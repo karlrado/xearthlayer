@@ -44,10 +44,12 @@ test_builds_signs_notarizes_and_staples_the_runtime() {
     assert_contains "$log" "xcrun stapler validate $out"
     assert_contains "$log" "spctl --assess --type install -vv $out"
     assert_contains "$(cat "$FAKE_DIR/distribution.xml")" '<welcome file="welcome.html"'
-    assert_contains "$(cat "$FAKE_DIR/resources.txt")" "welcome.html"
+    assert_eq "$(LC_ALL=C sort "$FAKE_DIR/resources.txt")" \
+        "$(printf '%s\n' LICENSE.txt conclusion.html readme.html welcome.html | LC_ALL=C sort)"
+    cmp -s "$FAKE_DIR/resources/LICENSE.txt" "$SCRIPTS_DIR/../../LICENSE" || fail "LICENSE.txt is not the repository LICENSE"
 }
 
-test_publisher_package_has_no_welcome_page() {
+test_publisher_package_has_license_page_only() {
     setup_fakes
     make_exe "$FAKE_DIR/bin/xearthlayer-publish"
     FAKE_IDENTITIES="$(ids)" MACOS_SKIP_NOTARIZE=1 \
@@ -55,7 +57,8 @@ test_publisher_package_has_no_welcome_page() {
         || fail "build failed"
     assert_contains "$(cat "$FAKE_LOG")" "staged: xearthlayer-publish"
     assert_not_contains "$(cat "$FAKE_DIR/distribution.xml")" "<welcome"
-    assert_eq "$(cat "$FAKE_DIR/resources.txt")" ""
+    assert_eq "$(cat "$FAKE_DIR/resources.txt")" "LICENSE.txt"
+    cmp -s "$FAKE_DIR/resources/LICENSE.txt" "$SCRIPTS_DIR/../../LICENSE" || fail "LICENSE.txt is not the repository LICENSE"
 }
 
 test_explicit_identity_skips_lookup() {
@@ -161,4 +164,21 @@ test_fails_when_stapling_never_succeeds() {
     assert_contains "$err" "attempt 1: stapler staple failed"
     n=$(grep -c "xcrun stapler staple" "$FAKE_LOG")
     assert_eq "$n" 3
+}
+
+# The Installer's pages send users to the website's docs, never to the source
+# repository: the docs are written for users and follow the release.
+test_installer_pages_link_to_the_website_docs() {
+    local page links
+    for page in "$SCRIPTS_DIR"/../../pkg/macos/*.html; do
+        assert_not_contains "$(cat "$page")" "github.com"
+    done
+    links=$(grep -ho 'href="[^"]*"' "$SCRIPTS_DIR"/../../pkg/macos/*.html | grep -v 'href="https://macfuse.io"' | sort -u)
+    [ -n "$links" ] || fail "no documentation links found"
+    while IFS= read -r link; do
+        case "$link" in
+            'href="https://xearthlayer.app/docs/'*) ;;
+            *) fail "link outside xearthlayer.app/docs: $link" ;;
+        esac
+    done <<<"$links"
 }
