@@ -139,6 +139,19 @@ test_distribution_for_publisher_has_license_only() {
     fi
 }
 
+test_unwrap_paragraphs_joins_lines_within_a_paragraph() {
+    assert_eq "$(printf 'Title\n\nfirst line\nsecond line\n\nthird\nfourth\n' | unwrap_paragraphs)" \
+        "$(printf 'Title\n\nfirst line second line\n\nthird fourth')"
+}
+
+test_unwrap_paragraphs_collapses_repeated_blank_lines() {
+    assert_eq "$(printf 'a\n\n\n\nb\n' | unwrap_paragraphs)" "$(printf 'a\n\nb')"
+}
+
+test_unwrap_paragraphs_trims_line_edges() {
+    assert_eq "$(printf '  a  \n  b\n' | unwrap_paragraphs)" "a b"
+}
+
 test_distribution_rejects_unknown_product() {
     local rc=0
     render_distribution nope 1.0 >/dev/null 2>&1 || rc=$?

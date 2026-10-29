@@ -77,6 +77,22 @@ notarize() {
     echo "Notarized: submission $id accepted"
 }
 
+# Joins the lines of each paragraph of stdin into one line, keeping one blank
+# line between paragraphs. The Installer wraps plain text to its own width and
+# also breaks at every newline, so hard-wrapped text breaks early.
+unwrap_paragraphs() {
+    awk '
+        NF {
+            gsub(/^[ \t]+|[ \t]+$/, "")
+            if (open) printf " %s", $0
+            else { if (seen) printf "\n"; printf "%s", $0; open = 1; seen = 1 }
+            next
+        }
+        open { printf "\n"; open = 0 }
+        END { if (open) printf "\n" }
+    '
+}
+
 # Prints the productbuild distribution for one product's package: arm64
 # only, macOS 12 or later (the casks' `depends_on macos: :monterey`), one
 # hidden choice, no customisation, no scripts. Both packages show the MIT

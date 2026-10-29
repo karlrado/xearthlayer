@@ -125,7 +125,9 @@ writes.
 package from an already signed and notarized binary. The package installs
 `/usr/local/bin/<product>` under the receipt `net.defreyssi.<product>`, has no
 install scripts, and targets arm64 and macOS 12.0 or later. Both packages show
-the repository's `LICENSE` (MIT) as the license the user accepts. The runtime
+the repository's `LICENSE` (MIT) as the license the user accepts, with each
+paragraph joined onto one line, because the Installer wraps the text itself and
+also breaks at every newline. The runtime
 package also shows three pages from `pkg/macos/`: `welcome.html`, `readme.html`
 (installing and approving macFUSE, without which `run` cannot start) and
 `conclusion.html` (next steps: `xearthlayer setup`, or macFUSE first). The

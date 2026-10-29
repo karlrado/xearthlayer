@@ -1,6 +1,16 @@
 # shellcheck shell=bash
 SCRIPT="$SCRIPTS_DIR/build-pkg.sh"
 
+# The Installer wraps the license text itself and keeps every newline it is
+# given, so each paragraph must be one line. The words must be exactly those
+# of the repository's LICENSE.
+assert_license_is_unwrapped() {
+    local license="$SCRIPTS_DIR/../../LICENSE"
+    [ -f "$1" ] || fail "no LICENSE.txt in the resources"
+    assert_eq "$(tr -s '[:space:]' ' ' <"$1")" "$(tr -s '[:space:]' ' ' <"$license")"
+    assert_eq "$(grep -c . "$1")" "$(awk 'NF && !p {n++} {p = NF} END {print n}' "$license")"
+}
+
 ids() { printf '%s\n%s' "$APP_ID" "$INSTALLER_ID"; }
 
 test_refuses_non_darwin() {
@@ -46,7 +56,7 @@ test_builds_signs_notarizes_and_staples_the_runtime() {
     assert_contains "$(cat "$FAKE_DIR/distribution.xml")" '<welcome file="welcome.html"'
     assert_eq "$(LC_ALL=C sort "$FAKE_DIR/resources.txt")" \
         "$(printf '%s\n' LICENSE.txt conclusion.html readme.html welcome.html | LC_ALL=C sort)"
-    cmp -s "$FAKE_DIR/resources/LICENSE.txt" "$SCRIPTS_DIR/../../LICENSE" || fail "LICENSE.txt is not the repository LICENSE"
+    assert_license_is_unwrapped "$FAKE_DIR/resources/LICENSE.txt"
 }
 
 test_publisher_package_has_license_page_only() {
@@ -58,7 +68,7 @@ test_publisher_package_has_license_page_only() {
     assert_contains "$(cat "$FAKE_LOG")" "staged: xearthlayer-publish"
     assert_not_contains "$(cat "$FAKE_DIR/distribution.xml")" "<welcome"
     assert_eq "$(cat "$FAKE_DIR/resources.txt")" "LICENSE.txt"
-    cmp -s "$FAKE_DIR/resources/LICENSE.txt" "$SCRIPTS_DIR/../../LICENSE" || fail "LICENSE.txt is not the repository LICENSE"
+    assert_license_is_unwrapped "$FAKE_DIR/resources/LICENSE.txt"
 }
 
 test_explicit_identity_skips_lookup() {
