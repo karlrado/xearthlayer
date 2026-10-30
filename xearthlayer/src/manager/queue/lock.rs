@@ -1,43 +1,35 @@
 //! One package operation at a time per temp directory, and cleanup of what
 //! a killed process left behind.
 //!
-//! The lock is a `flock` on a file in the temp directory, held for the
-//! queue's life. The kernel drops it when the process exits however it
-//! exits, so a stale lock cannot outlive its owner. Holding it is also what
-//! makes the sweep safe: no other process can be using the folders it
-//! deletes.
+//! The lock is an advisory exclusive lock on a file in the temp directory
+//! (`flock` on Unix, `LockFileEx` on Windows, via `fs2`), held for the
+//! queue's life. The OS drops it when the process exits however it exits, so
+//! a stale lock cannot outlive its owner. Holding it is also what makes the
+//! sweep safe: no other process can be using the folders it deletes.
 
 use std::fs;
-#[cfg(not(target_os = "windows"))]
 use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
-// `flock` is Unix-only; Windows has no equivalent for this purpose, and the
-// queue ships as an explicit stub there (Phase 2, design doc §5).
-#[cfg(not(target_os = "windows"))]
-use nix::errno::Errno;
-#[cfg(not(target_os = "windows"))]
-use nix::fcntl::{Flock, FlockArg};
+use fs2::FileExt;
 use tracing::{info, warn};
 
 use crate::manager::aside;
 use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::installer::INSTALL_TEMP_PREFIX;
 
-// The lock file name is platform-neutral: the non-Windows tests compare
-// against it when checking that an install left no leftovers behind. On
-// Windows the queue and those tests are deferred (Phase 2, design doc §5),
-// so it is unread there and allowed to sit dead.
-#[cfg_attr(target_os = "windows", allow(dead_code))]
+/// The lock file name. Platform-neutral: a test on every platform compares
+/// against it when checking that an install left no leftovers behind.
 pub(crate) const LOCK_FILE_NAME: &str = ".queue.lock";
 
-/// Held while a queue runs. Dropping it releases the lock.
-#[cfg(not(target_os = "windows"))]
+/// Held while a queue runs. The lock is an advisory exclusive lock on
+/// `.queue.lock`, tied to the open handle: dropping this closes the handle
+/// and releases it, and the OS releases it however the process exits, so a
+/// stale lock cannot outlive its owner.
 pub(crate) struct QueueLock {
-    _lock: Flock<File>,
+    _file: File,
 }
 
-#[cfg(not(target_os = "windows"))]
 impl QueueLock {
     pub(crate) fn acquire(temp_dir: &Path) -> ManagerResult<Self> {
         fs::create_dir_all(temp_dir).map_err(|e| ManagerError::CreateDirFailed {
@@ -54,26 +46,15 @@ impl QueueLock {
                 path: path.clone(),
                 source: e,
             })?;
-        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
-            Ok(lock) => Ok(Self { _lock: lock }),
-            Err((_, Errno::EWOULDBLOCK)) => Err(ManagerError::QueueBusy { path }),
-            Err((_, errno)) => Err(ManagerError::WriteFailed {
-                path,
-                source: std::io::Error::from(errno),
-            }),
+        // `fs2` ties the lock to the open handle and reports contention with a
+        // platform-specific error (`EWOULDBLOCK` on Unix, `ERROR_LOCK_VIOLATION`
+        // on Windows). Compare the raw code so this stays platform-neutral.
+        let contended = fs2::lock_contended_error().raw_os_error();
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(e) if e.raw_os_error() == contended => Err(ManagerError::QueueBusy { path }),
+            Err(e) => Err(ManagerError::WriteFailed { path, source: e }),
         }
-    }
-}
-
-/// Windows: the queue lock is deferred with the installer (design doc §5).
-/// `acquire` is refused explicitly so no queue can silently start.
-#[cfg(target_os = "windows")]
-pub(crate) struct QueueLock;
-
-#[cfg(target_os = "windows")]
-impl QueueLock {
-    pub(crate) fn acquire(_temp_dir: &Path) -> ManagerResult<Self> {
-        Err(ManagerError::UnsupportedOnWindows)
     }
 }
 
@@ -149,7 +130,6 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
-    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_second_lock_on_the_same_directory_is_refused_until_the_first_is_dropped() {
         let temp = TempDir::new().unwrap();
@@ -252,17 +232,5 @@ mod tests {
             ),
             0
         );
-    }
-
-    /// The Windows stub must refuse explicitly (design doc §5), not merely
-    /// compile.
-    #[cfg(target_os = "windows")]
-    #[test]
-    fn acquire_is_refused_on_windows() {
-        let temp = TempDir::new().unwrap();
-        assert!(matches!(
-            QueueLock::acquire(temp.path()),
-            Err(ManagerError::UnsupportedOnWindows)
-        ));
     }
 }
