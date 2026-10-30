@@ -2,20 +2,34 @@
 //!
 //! Linux unmounts FUSE filesystems with `fusermount3`/`fusermount` and exposes
 //! the mount table as `/proc/mounts`, while macOS (macFUSE) uses the BSD
-//! `umount(8)` and `mount(8)`. Everything that needs to unmount a mount or ask
-//! "is this path mounted?" shares the same platform logic, so it lives here
-//! once: the panic handler, the spawned-mount Drop fallback, and the package
-//! manager's status display.
+//! `umount(8)` and `mount(8)`. Windows (WinFSP) has no kernel mount table at
+//! all — a mount lives in its owning process — so it unmounts through the
+//! owning session, and the in-process session registry below is the
+//! authoritative record of our mounts (design doc §4.5). Everything that
+//! needs to unmount a mount or ask "is this path mounted?" shares the same
+//! platform logic, so it lives here once: the panic handler, the
+//! spawned-mount Drop fallback, and the package manager's status display.
 
 use std::path::Path;
 
 // The unmount binaries and their stderr parsing exist only off-Windows;
-// on Windows the function body is a stub (Phase 2, design doc §5).
+// on Windows the unmount goes through the owning WinFSP session, and the
+// "is something mounted here" probe is a reparse-point check on the mountpoint.
 #[cfg(not(target_os = "windows"))]
 use std::process::Command;
 #[cfg(not(target_os = "windows"))]
 use tracing::debug;
 use tracing::warn;
+
+#[cfg(target_os = "windows")]
+use std::collections::HashMap;
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+#[cfg(target_os = "windows")]
+use std::sync::{Mutex, OnceLock};
+
+#[cfg(target_os = "windows")]
+use crate::fuse::winfsp::WinFspSession;
 
 /// Unmount the FUSE filesystem at `mountpoint`.
 ///
@@ -29,11 +43,20 @@ use tracing::warn;
 pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
     #[cfg(target_os = "windows")]
     {
-        // No FUSE exists on Windows; the desired end state (nothing FUSE
-        // mounted) already holds. WinFSP unmount goes through the session
-        // (Phase 2, commit 5, docs/dev/winfsp-backend.md §4.5).
-        let _ = (mountpoint, force);
-        true
+        // WinFSP unmounts through the owning session — there is no kernel
+        // unmount command (design doc §4.5). Take the session registered for
+        // this mountpoint (which also clears the registration) and stop it.
+        // `force` is advisory: WinFSP's stop is the same operation at both
+        // levels. A path with no registered session is already in the end
+        // state we want (nothing of ours mounted there).
+        let _ = force;
+        match take_winfsp_mount(mountpoint) {
+            Some(session) => {
+                session.unmount();
+                true
+            }
+            None => true,
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -67,33 +90,53 @@ pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
 ///
 /// Platform-specific because the mount table lives in different places: Linux
 /// exposes it as `/proc/mounts`; macOS has no such file and must be queried via
-/// `mount(8)`. A wrong answer here is not cosmetic — callers gate real `umount`
-/// escalation (`SpawnedMountHandle`) and the user-facing package mount status on
-/// it, so a Linux-only implementation silently mis-reports every macOS mount.
+/// `mount(8)`; Windows has no mount table at all and is answered from the
+/// in-process WinFSP session registry, falling back to a reparse-point check
+/// on the path (the mountpoint carries a WinFSP volume mount point). A wrong
+/// answer here is not cosmetic — callers gate real
+/// unmount escalation (`SpawnedMountHandle`) and the user-facing package mount
+/// status on it, so a Linux-only implementation silently mis-reports every
+/// macOS mount.
 ///
 /// This answers "is the kernel mount-table entry present", which is also `true`
 /// for a wedged macFUSE mount (daemon dead, entry lingering) — exactly the
 /// zombie the unmount fallback must still act on. Use [`is_stale_fuse_mount`] to
 /// distinguish a healthy mount from a wedged one.
 pub fn is_path_mounted(path: &Path) -> bool {
-    let path_str = path.to_string_lossy();
-
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "windows")]
     {
-        match Command::new("/sbin/mount").output() {
-            Ok(output) => {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                mount_output_contains(&stdout, &path_str)
-            }
-            Err(_) => false,
+        // A session registered for this path in this process is
+        // authoritative (the panic handler and the manager register under
+        // the same path string).
+        if is_winfsp_mount_registered(path) {
+            return true;
         }
+        // Otherwise ask the OS: a path on a WinFSP volume is a mount, whether
+        // ours in another process or a corpse of a dead one.
+        is_winfsp_volume(path)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(target_os = "windows"))]
     {
-        match std::fs::read_to_string("/proc/mounts") {
-            Ok(mounts) => proc_mounts_contains(&mounts, &path_str),
-            Err(_) => false,
+        let path_str = path.to_string_lossy();
+
+        #[cfg(target_os = "macos")]
+        {
+            match Command::new("/sbin/mount").output() {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    mount_output_contains(&stdout, &path_str)
+                }
+                Err(_) => false,
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            match std::fs::read_to_string("/proc/mounts") {
+                Ok(mounts) => proc_mounts_contains(&mounts, &path_str),
+                Err(_) => false,
+            }
         }
     }
 }
@@ -101,8 +144,10 @@ pub fn is_path_mounted(path: &Path) -> bool {
 /// Whether `/proc/mounts` content lists `path` as a mountpoint.
 ///
 /// Pure function (no I/O) so the parsing is unit-testable. Each line is
-/// `device mountpoint fstype opts ...`; we match field 2.
-#[cfg(not(target_os = "macos"))]
+/// `device mountpoint fstype opts ...`; we match field 2. Linux-only: the
+/// mount table it parses exists only on Linux (Windows has no mount table
+/// at all; the test below runs where the function exists).
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn proc_mounts_contains(mounts: &str, path: &str) -> bool {
     mounts.lines().any(|line| {
         let mut fields = line.split_whitespace();
@@ -144,9 +189,24 @@ fn mount_output_contains(output: &str, path: &str) -> bool {
 /// directory — fails with `ENXIO` (verified empirically against a killed
 /// mount).
 pub fn is_stale_fuse_mount(mountpoint: &Path) -> bool {
-    match std::fs::read_dir(mountpoint) {
-        Ok(_) => false,
-        Err(e) => is_stale_mount_error(&e),
+    #[cfg(target_os = "windows")]
+    {
+        // A WinFSP volume at the path whose owning process is gone: the
+        // kernel's mount-point reparse survives a dead service (spike F5),
+        // but no session in this process serves it. `is_winfsp_volume`
+        // reads the on-disk reparse data (`read_link`), not the mount's I/O
+        // — on a corpse a file operation would hang until the pending-IRP
+        // deadline (F5), while the reparse target is answered by the
+        // kernel's on-disk metadata.
+        is_winfsp_volume(mountpoint) && !is_winfsp_mount_registered(mountpoint)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        match std::fs::read_dir(mountpoint) {
+            Ok(_) => false,
+            Err(e) => is_stale_mount_error(&e),
+        }
     }
 }
 
@@ -160,13 +220,6 @@ fn is_stale_mount_error(error: &std::io::Error) -> bool {
     )
 }
 
-/// Windows: no FUSE corpses exist yet; stale WinFSP detection lands with the
-/// WinFSP backend (Phase 2, commit 5).
-#[cfg(target_os = "windows")]
-fn is_stale_mount_error(_error: &std::io::Error) -> bool {
-    false
-}
-
 /// Detect and clear a stale FUSE mount at `mountpoint`.
 ///
 /// Returns `true` if a stale mount was found and successfully unmounted,
@@ -176,19 +229,125 @@ pub fn recover_stale_fuse_mount(mountpoint: &Path) -> bool {
     if !is_stale_fuse_mount(mountpoint) {
         return false;
     }
-    warn!(
-        mountpoint = %mountpoint.display(),
-        "Stale FUSE mount detected from a previous run; force-unmounting"
-    );
-    let cleared = unmount_fuse(mountpoint, true);
-    if !cleared {
+    #[cfg(target_os = "windows")]
+    {
+        // A corpse's session is dead, so there is nothing in this process to
+        // unmount it with (spike F5: killing the process leaks the mount
+        // until reboot). Report it and leave the directory alone — it may
+        // still be referenced by zombie driver state.
         warn!(
             mountpoint = %mountpoint.display(),
-            "Could not clear stale FUSE mount; mounting will likely fail. \
-             Unmount manually with: umount <mountpoint>"
+            "Stale WinFSP mount from a previous (killed) run; it cannot be \
+             unmounted from here. Manual cleanup: remove the directory, or \
+             reboot if it is locked, then retry the mount"
         );
+        false
     }
-    cleared
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        warn!(
+            mountpoint = %mountpoint.display(),
+            "Stale FUSE mount detected from a previous run; force-unmounting"
+        );
+        let cleared = unmount_fuse(mountpoint, true);
+        if !cleared {
+            warn!(
+                mountpoint = %mountpoint.display(),
+                "Could not clear stale FUSE mount; mounting will likely fail. \
+                 Unmount manually with: umount <mountpoint>"
+            );
+        }
+        cleared
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows (WinFSP) mount model (design doc §4.5)
+//
+// WinFSP has no kernel mount table to query: a mount lives in the owning
+// process's user-mode service. So the in-process session registry below is
+// the authoritative record of *our* mounts — the panic handler, the unmount
+// fallback, and the package status display all ask it first — and a
+// reparse-point check on the path is the best-effort "is *something* WinFSP
+// mounted at this path" test (another process's mount, or a corpse of a dead
+// one). A WinFSP folder mount is a directory carrying a MUP mount-point
+// reparse point whose target is the volume device name
+// `\Device\Volume{GUID}\`; `read_link` reads exactly that (the on-disk
+// reparse data, with no I/O to the — possibly dead — owning service).
+// ---------------------------------------------------------------------------
+
+/// The live WinFSP sessions this process owns, keyed by the mountpoint path
+/// they were registered under (exact `PathBuf` equality — the same path
+/// string the panic handler's registry uses).
+#[cfg(target_os = "windows")]
+static WINFSP_SESSIONS: OnceLock<Mutex<HashMap<PathBuf, WinFspSession>>> = OnceLock::new();
+
+#[cfg(target_os = "windows")]
+fn winfsp_sessions() -> &'static Mutex<HashMap<PathBuf, WinFspSession>> {
+    WINFSP_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register the session that serves `mountpoint` (call right after a
+/// successful mount, with the same path string the rest of the app uses for
+/// that mount). Re-registering the same path replaces the old session, whose
+/// remaining handles still unmount on drop.
+#[cfg(target_os = "windows")]
+pub fn register_winfsp_mount(mountpoint: impl Into<PathBuf>, session: WinFspSession) {
+    winfsp_sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(mountpoint.into(), session);
+}
+
+/// Take the session registered for `mountpoint`, if any. A successful
+/// unmount removes the entry with its session; the panic handler's
+/// `unmount_fuse` takes it the same way.
+#[cfg(target_os = "windows")]
+fn take_winfsp_mount(mountpoint: &Path) -> Option<WinFspSession> {
+    winfsp_sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(mountpoint)
+}
+
+/// Whether a session is registered for `mountpoint` in this process.
+#[cfg(target_os = "windows")]
+fn is_winfsp_mount_registered(mountpoint: &Path) -> bool {
+    winfsp_sessions()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(mountpoint)
+}
+
+/// Whether `path` is a WinFSP (folder) mountpoint — this process's mount,
+/// another process's, or a corpse of a dead one.
+///
+/// A WinFSP folder mount is a directory carrying a MUP mount-point reparse
+/// point whose target is the volume device name (`\Device\Volume{GUID}\`).
+/// `read_link` reads that on-disk reparse data — it needs no I/O to the
+/// owning (possibly dead) service, which is exactly why it still answers for
+/// a corpse. Non-reparse paths error, and NTFS junctions/symlinks name a
+/// filesystem path (`\??\...`) rather than a volume device, so only a real
+/// volume mount matches.
+#[cfg(target_os = "windows")]
+fn is_winfsp_volume(path: &Path) -> bool {
+    std::fs::read_link(path)
+        .map(|target| is_winfsp_volume_target(&target.to_string_lossy()))
+        .unwrap_or(false)
+}
+
+/// Whether a reparse-point target names a mounted volume (a WinFSP volume,
+/// or any other volume mounted onto a folder) rather than a filesystem path
+/// (an NTFS junction or a symlink). Pure function (no I/O) so the
+/// classification is unit-testable on every OS.
+///
+/// Its only production caller ([`is_winfsp_volume`]) is Windows-only, so on
+/// other platforms this is reachable solely from the test below — silence the
+/// `dead_code` lint there (it stays enforced on Windows, where it is used).
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn is_winfsp_volume_target(target: &str) -> bool {
+    target.trim_start().starts_with(r"\Device\Volume{")
 }
 
 /// Run one unmount command, treating "already unmounted" as success.
@@ -290,7 +449,43 @@ mod tests {
         assert!(!is_path_mounted(dir.path()));
     }
 
-    #[cfg(not(target_os = "macos"))]
+    /// The reparse-target classification: a target that names a mounted
+    /// volume (`\Device\Volume{GUID}\`) is a WinFSP/volume mountpoint; a
+    /// target that names a filesystem path (an NTFS junction or a symlink)
+    /// is not, and neither is an empty string.
+    #[test]
+    fn winfsp_volume_target_classification() {
+        assert!(
+            is_winfsp_volume_target(r"\Device\Volume{aa1f6090-d2f0-11f1-9be2-d8b32f2db1cc}\"),
+            "a volume device name is a mount"
+        );
+        assert!(
+            is_winfsp_volume_target(r"\Device\Volume{00000000-0000-0000-0000-000000000000}\"),
+            "any volume GUID shape is a mount"
+        );
+        assert!(
+            is_winfsp_volume_target(r"  \Device\Volume{aa1f6090-d2f0-11f1-9be2-d8b32f2db1cc}\"),
+            "tolerates leading whitespace"
+        );
+        assert!(
+            !is_winfsp_volume_target(r"\??\C:\X-Plane 12\Custom Scenery\zzXEL"),
+            "an NTFS junction path is not a volume mount"
+        );
+        assert!(
+            !is_winfsp_volume_target(r"\\?\C:\some\dir"),
+            "a symlink path is not a volume mount"
+        );
+        assert!(
+            !is_winfsp_volume_target(r"relative\path"),
+            "a relative path is not a volume mount"
+        );
+        assert!(
+            !is_winfsp_volume_target(""),
+            "an empty target is not a volume mount"
+        );
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     #[test]
     fn proc_mounts_contains_detects_mountpoint() {
         let mounts = "proc /proc proc rw,nosuid 0 0\n\
