@@ -66,6 +66,11 @@ chrono.workspace = true
 rlimit = "0.10"
 libc = "0.2"
 
+# Windows-only dependency. The `WinfspAvailable` preflight reads the WinFSP
+# installation directory out of the registry (design doc §4.4, Phase 4).
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Registry"] }
+
 [features]
 profiling = ["xearthlayer/profiling"]
 debug-map = ["xearthlayer/debug-map"]

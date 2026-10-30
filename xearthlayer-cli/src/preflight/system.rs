@@ -274,6 +274,116 @@ impl Preflight<BootstrapContext> for MacFuseAvailable {
     }
 }
 
+/// Require WinFSP to be installed before attempting to mount.
+///
+/// The Windows backend is WinFSP, and a missing install would otherwise
+/// surface as an opaque mount failure, exactly the situation the macFUSE
+/// check exists to prevent. Design doc §4.4: WinFSP is a user-installed
+/// prerequisite — this check detects its absence and points the user at the
+/// installer; it never installs anything itself.
+///
+/// # What is probed, and what is not
+///
+/// The `InstallDir` value under `HKLM\SOFTWARE\WinFsp` (and its
+/// `WOW6432Node` twin), which WinFSP's installer writes and which the
+/// `winfsp` crate itself reads to locate `winfsp-x64.dll`. Deliberately
+/// **not** a DLL load: preflight should stay a cheap question, and the real
+/// load happens at mount time, where a failure has its own diagnostics.
+///
+/// # Why there is no `#[cfg]` on the check itself
+///
+/// As with [`MacFuseAvailable`], the check compiles on every platform and is
+/// excluded at runtime by [`Preflight::applies`], so a test can exercise it
+/// anywhere by injecting a probe. Only the probe's production body is
+/// platform-gated: it calls a Windows API that does not exist elsewhere.
+pub struct WinfspAvailable {
+    probe: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
+}
+
+impl Default for WinfspAvailable {
+    fn default() -> Self {
+        Self {
+            probe: Box::new(winfsp_install_dir),
+        }
+    }
+}
+
+impl WinfspAvailable {
+    /// Construct with an explicit probe.
+    ///
+    /// Injected like every other environment source, so a test does not
+    /// depend on whether the machine running it has WinFSP.
+    pub fn with_probe(probe: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>) -> Self {
+        Self { probe }
+    }
+}
+
+impl Preflight<BootstrapContext> for WinfspAvailable {
+    fn name(&self) -> Cow<'static, str> {
+        Cow::Borrowed(names::WINFSP_AVAILABLE)
+    }
+
+    /// `cfg!` rather than `#[cfg]`: a runtime constant that excludes the check
+    /// off Windows without excluding the code from compilation.
+    fn applies(&self, ctx: &BootstrapContext) -> bool {
+        cfg!(target_os = "windows") && ctx.command() == "run"
+    }
+
+    fn inspect(&self, _ctx: &BootstrapContext) -> Status {
+        match (self.probe)() {
+            Some(_) => Status::Satisfied,
+            None => Status::unsatisfied(
+                "WinFSP is not installed: no HKLM\\SOFTWARE\\WinFsp\\InstallDir value",
+            )
+            .with_hint(
+                "Install WinFSP from https://www.winfsp.dev; it is a \
+                     prerequisite for XEarthLayer on Windows.",
+            ),
+        }
+    }
+}
+
+/// The WinFSP installation directory, or `None` if WinFSP is not installed.
+#[cfg(windows)]
+pub fn winfsp_install_dir() -> Option<PathBuf> {
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+
+    const MAX_PATH: usize = 260;
+    // 32-bit installers land in WOW6432Node; native 64-bit ones write directly
+    // under SOFTWARE. Same order the winfsp crate uses.
+    for subkey in [w!("SOFTWARE\\WOW6432Node\\WinFsp"), w!("SOFTWARE\\WinFsp")] {
+        let mut buffer = [0u16; MAX_PATH];
+        let mut size = (buffer.len() * std::mem::size_of::<u16>()) as u32;
+        // RegGetValueW on HKLM is read-only; the call is safe.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                subkey,
+                w!("InstallDir"),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut size),
+            )
+        };
+        if status.is_ok() {
+            let chars = (size as usize) / std::mem::size_of::<u16>();
+            return Some(PathBuf::from(OsString::from_wide(&buffer[..chars])));
+        }
+    }
+    None
+}
+
+/// Off Windows there is nothing to find: the check is excluded there by
+/// [`WinfspAvailable::applies`] anyway, so the value never matters.
+#[cfg(not(windows))]
+pub fn winfsp_install_dir() -> Option<PathBuf> {
+    None
+}
+
 /// Refuse to start while another instance is already running.
 ///
 /// Nothing guarded this before: XEarthLayer mounts a filesystem and owns a
@@ -527,6 +637,72 @@ mod tests {
     fn macfuse_check_does_not_apply_outside_run() {
         let check = MacFuseAvailable::default();
         assert!(!check.applies(&BootstrapContext::new("packages", None)));
+    }
+
+    // ---- WinfspAvailable ----
+
+    #[test]
+    fn winfsp_is_satisfied_when_the_install_dir_is_registered() {
+        let check = WinfspAvailable::with_probe(Box::new(|| {
+            Some(PathBuf::from(r"C:\Program Files\WinFSP"))
+        }));
+        assert_eq!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
+    fn winfsp_is_unsatisfied_and_points_at_the_installer() {
+        let check = WinfspAvailable::with_probe(Box::new(|| None));
+        match check.inspect(&BootstrapContext::new("run", None)) {
+            Status::Unsatisfied {
+                reason,
+                remediable,
+                hint,
+            } => {
+                assert!(!remediable, "we cannot install WinFSP for the user");
+                assert!(reason.contains("WinFSP is not installed"), "{reason}");
+                assert!(
+                    hint.as_deref()
+                        .unwrap_or_default()
+                        .contains("https://www.winfsp.dev"),
+                    "the hint must point at the WinFSP installer"
+                );
+            }
+            other => panic!("expected Unsatisfied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn winfsp_check_only_applies_on_windows() {
+        // Compiles and runs on every platform; excluded at runtime off Windows.
+        // The assertion follows the target so this test is meaningful on both.
+        let check = WinfspAvailable::default();
+        let ctx = BootstrapContext::new("run", None);
+        assert_eq!(check.applies(&ctx), cfg!(target_os = "windows"));
+    }
+
+    #[test]
+    fn winfsp_check_does_not_apply_outside_run() {
+        let check = WinfspAvailable::default();
+        assert!(!check.applies(&BootstrapContext::new("packages", None)));
+    }
+
+    #[test]
+    fn the_production_probe_agrees_with_the_machine() {
+        // The registry read is the only piece an injected probe cannot cover:
+        // on a Windows development box it must find the WinFSP that is there
+        // (or honestly report its absence elsewhere). Either way the check
+        // must come back with a definite answer, never panic.
+        let installed = winfsp_install_dir().is_some();
+        let check = WinfspAvailable::default();
+        let status = check.inspect(&BootstrapContext::new("run", None));
+        assert_eq!(
+            status == Status::Satisfied,
+            installed,
+            "the check must agree with the registry probe"
+        );
     }
 
     // ---- LogStartup ----

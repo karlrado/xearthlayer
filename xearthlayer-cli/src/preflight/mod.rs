@@ -37,6 +37,7 @@ pub mod names {
     pub const XWORLD_PRO_SETUP: &str = "xworld-pro-setup";
     pub const AIRPORT_ICAO: &str = "airport-icao";
     pub const MACFUSE_AVAILABLE: &str = "macfuse-available";
+    pub const WINFSP_AVAILABLE: &str = "winfsp-available";
     pub const NO_RUNNING_INSTANCE: &str = "no-running-instance";
 }
 
@@ -81,6 +82,7 @@ pub struct RegistryEnv {
     pub legacy_packages_dir: PathBuf,
     pub lock_path: PathBuf,
     pub macfuse_probe: PathBuf,
+    pub winfsp_probe: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
     pub detect_custom_scenery: Box<dyn Fn() -> Option<PathBuf> + Send + Sync>,
 }
 
@@ -93,6 +95,7 @@ impl RegistryEnv {
             legacy_packages_dir: legacy_default_packages_dir(),
             lock_path: default_lock_path(),
             macfuse_probe: PathBuf::from(system::MACFUSE_BUNDLE),
+            winfsp_probe: Box::new(system::winfsp_install_dir),
             detect_custom_scenery: Box::new(|| xearthlayer::config::detect_custom_scenery().ok()),
         }
     }
@@ -115,6 +118,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
         legacy_packages_dir,
         lock_path,
         macfuse_probe,
+        winfsp_probe,
         detect_custom_scenery,
     } = env;
 
@@ -153,6 +157,7 @@ pub fn build_registry_with(env: RegistryEnv) -> Runner<BootstrapContext> {
     runner.register(Box::new(system::MacFuseAvailable::with_probe(
         macfuse_probe,
     )));
+    runner.register(Box::new(system::WinfspAvailable::with_probe(winfsp_probe)));
 
     // Last: the lock is claimed only for a run that will actually proceed.
     // Claiming it earlier would leave a lock behind for a run rejected by a
@@ -354,6 +359,13 @@ mod tests {
             legacy_packages_dir: dir.path().join("no-legacy-packages"),
             lock_path: dir.path().join("xearthlayer.lock"),
             macfuse_probe: macfuse,
+            // The check applies only on Windows, but a complete environment
+            // must satisfy it there: inject an installed WinFSP. The probe
+            // must outlive the TempDir, so it owns its answer.
+            winfsp_probe: {
+                let install_dir = dir.path().join("WinFSP");
+                Box::new(move || Some(install_dir.clone()))
+            },
             detect_custom_scenery: Box::new(|| None),
         };
         (dir, env)
@@ -367,6 +379,7 @@ mod tests {
             legacy_packages_dir: dir.path().join("absent-packages"),
             lock_path: dir.path().join("xearthlayer.lock"),
             macfuse_probe: dir.path().join("absent-macfuse.fs"),
+            winfsp_probe: Box::new(|| None),
             detect_custom_scenery: Box::new(|| None),
         }
     }
@@ -434,6 +447,20 @@ mod tests {
     }
 
     #[test]
+    fn the_fabricated_environment_satisfies_the_windows_only_check_too() {
+        // The mirror of the macFUSE completeness test above: the registry
+        // never runs winfsp-available off Windows, so asserting it directly
+        // keeps the fabrication complete on every platform.
+        let (_dir, env) = fabricate_complete_environment();
+        use xearthlayer::preflight::{Preflight, Status};
+        let check = system::WinfspAvailable::with_probe(env.winfsp_probe);
+        assert_eq!(
+            check.inspect(&BootstrapContext::new("run", None)),
+            Status::Satisfied
+        );
+    }
+
+    #[test]
     fn registration_order_reproduces_what_run_did_inline() {
         // Load-bearing and, until now, implicit in the shape of one function.
         let dir = tempfile::tempdir().unwrap();
@@ -460,6 +487,7 @@ mod tests {
                 names::XWORLD_PRO_SETUP,
                 names::AIRPORT_ICAO,
                 names::MACFUSE_AVAILABLE,
+                names::WINFSP_AVAILABLE,
                 names::NO_RUNNING_INSTANCE,
             ]
         );
