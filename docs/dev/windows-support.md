@@ -369,7 +369,7 @@ Phase 1 must not change the dependency graph); the gate-list plumbing
 - The WinFSP adapter compiles and implements the full op surface against the
   core.
 - A local, manual mount (on a machine with WinFSP installed) serves a real
-  scenery tree and synthesizes a virtual DDS on read (spike/e2e evidence, §9).
+  scenery tree and synthesizes a virtual DDS on read (manual integration test, §9).
 
 ### Phase 3 — Wiring + cross-platform enablement
 **Gate:** Phase 2 merged and green.
@@ -543,6 +543,52 @@ behavior must match (integer overflow is not normally trapped in this codebase's
 intent), so the dev profile's overflow-checks are aligned with release for the
 portable streaming path. Re-verify on the target base.
 
+### 8.10 WinFSP bindings strategy
+The WinFSP API is a C ABI (exposed via `winfsp-x64.lib` import libraries and
+`winfsp.h` headers). Rust needs a FFI binding layer. Three approaches are
+available:
+
+| Criterion | **A — Vendor in-repo** (prototype) | **B — Use `winfsp-sys` from crates.io** | **C — Generate at build time (bindgen)** |
+|---|---|---|---|
+| Build prerequisite | None (`.lib` + `bindings.rs` in repo) | None *if* the crate ships the `.lib` files; otherwise WinFSP SDK on PATH | WinFSP SDK headers + libclang on every build machine and CI image |
+| Update path | Re-run bindgen locally, commit updated `bindings.rs` + `.lib` | Bump crate version in `Cargo.toml` | Automatic — re-generates each build against installed SDK |
+| Staleness risk | Bindings frozen until a maintainer re-generates | Crate may lag WinFSP releases; if abandoned, same as A | Always tracks installed SDK version |
+| Repo impact | ~7 500 lines of generated Rust + ~110 KB binary `.lib` files | Minimal (crate reference only) | Minimal (only a `build.rs` + `bindgen` dep) |
+| Reproducibility | Fully pinned in the repo | Pinned via `Cargo.lock` | Depends on SDK version present on the build machine |
+| CI simplicity | No extra install step | No extra install step (if crate ships libs) | Must install WinFSP SDK in the CI image before `cargo build` |
+| Review burden | Large diff when WinFSP API changes | Small diff (version bump) | None visible in the repo |
+
+**Decision: A — vendor in-repo.**
+
+Rationale:
+- WinFSP's C ABI is **stable and rare to change** (it has not changed in
+  several years; the `winfsp` crate version we target pins a specific WinFSP
+  release). The staleness risk is low in practice.
+- It keeps Windows CI and local builds **hermetic**: no SDK install step, no
+  libclang dependency, no bindgen at build time. This was a hard requirement
+  for the "minimize extra installs" constraint.
+- The `.lib` import libraries are **binary artifacts that must exist at link
+  time** regardless; if we don't ship them in the repo, we must either rely on
+  the crates.io crate to ship them (which the current `winfsp-sys` crate does
+  not — it expects them from the system) or generate them (which requires the
+  SDK). Vendoring is the simplest self-contained path.
+- The generated `bindings.rs` is mechanical and reviewable as a one-time
+  artifact; future updates are a diff of the generated file, which is easy to
+  sanity-check against the WinFSP release notes.
+
+**Update procedure:** When the `winfsp` crate is bumped to a newer version
+that targets a newer WinFSP release, re-run `bindgen` against the new headers,
+replace `third-party/winfsp-sys/src/bindings.rs` and the `.lib` files, and
+commit. The `winfsp` safe-wrapper crate's version and the vendored
+`winfsp-sys` must stay in lockstep.
+
+**Licensing:** WinFSP is MIT-licensed. The vendored `bindings.rs` is generated
+from the MIT-licensed `winfsp.h`; the `.lib` files are binary artifacts of the
+same MIT-licensed project. A `LICENSE` file in `third-party/winfsp-sys/`
+carrying the MIT text and an attribution note ("Generated from WinFSP
+[vX.Y.Z](https://github.com/billziss-gh/winfsp), MIT © Bill Zissimopoulos")
+satisfies the MIT attribution requirement for redistribution.
+
 ---
 
 ## 9. Assumptions to re-validate on the target base
@@ -594,12 +640,7 @@ reference's history.
 2. **Shape of the backend split** — the one part that reorganizes shared code.
    Align on the seam (neutral core in `support/`; `fuse3` as a thin adapter)
    before it is written, especially if union-FS changes are already planned.
-3. **WinFSP bindings + licensing** — the reference vendors pre-generated
-   `winfsp-sys` bindings + import libraries (via a `[patch.crates-io]`
-   override) to keep Windows builds hermetic (no bindgen/libclang at build
-   time). Is the real `winfsp-sys` crate preferred, in-tree vendored bindings,
-   or a separate crate — and what does WinFSP's license allow for an MIT
-   project (the reference treats it as a private-fork, non-distributed use)?
+3. **WinFSP bindings + licensing** — resolved: vendor in-repo (§8.10).
 4. **PR shape** — one PR with phase-ordered commits, or stacked PRs (each phase
    merged green before the next builds on it)?
 5. **Windows CI** — a Windows build job (build + test, no mount) from the start
