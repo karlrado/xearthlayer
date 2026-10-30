@@ -39,17 +39,15 @@
 use super::inode::InodeManager;
 use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
-use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
-use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
+use crate::fuse::support::core::OrthoUnionCore;
+use crate::fuse::{parse_dds_filename, DdsFilename, TextureKind};
 use crate::geo_index::GeoIndex;
-use crate::night::{BlackLitSource, LitTextureSource};
+use crate::night::LitTextureSource;
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use bytes::Bytes;
-use dashmap::DashMap;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -62,23 +60,11 @@ use std::ffi::{OsStr, OsString};
 use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tokio::sync::OnceCell;
 use tracing::{debug, trace, warn, Instrument};
-
-/// Per-open state for one virtual DDS file.
-struct DdsHandle {
-    /// Which tile this handle refers to.
-    coords: DdsFilename,
-    /// The tile, produced on first read and reused by every later read.
-    /// `Bytes`: the handle shares the cache's allocation rather than owning
-    /// a copy, and `Bytes::slice` serves a ranged read without allocating.
-    tile: OnceCell<Bytes>,
-}
 
 /// FUSE open flag: bypass kernel page cache for this file.
 ///
@@ -122,6 +108,14 @@ const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
 ///   - Patches (`_patches/*`) always sort before packages
 ///   - Packages sort alphabetically by region (eu < na < sa)
 ///
+/// # Backend split (Phase 1)
+///
+/// All state and behaviour that is independent of the FUSE kernel lives in
+/// [`OrthoUnionCore`](crate::fuse::support::core::OrthoUnionCore); this
+/// struct is the thin FUSE adapter that adds the kernel identity (inodes)
+/// and the FUSE init handshake parameters. The public API is unchanged by
+/// the split — see `docs/dev/windows-backend-split.md` §4.5.
+///
 /// # Example
 ///
 /// ```ignore
@@ -137,61 +131,11 @@ const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
 /// fs.mount_spawned("/path/to/mountpoint").await?;
 /// ```
 pub struct Fuse3OrthoUnionFS {
-    /// Union index mapping virtual paths to real file locations
-    index: Arc<OrthoUnionIndex>,
-    /// Geospatial reference database for region-level ownership queries.
-    ///
-    /// Used to determine if a scenery file falls within a patch-owned region.
-    /// When set, FUSE filters lazy resolution to only serve patch sources in
-    /// those regions, hiding package files that would cause X-Plane conflicts.
-    geo_index: Option<Arc<GeoIndex>>,
-    /// Observer for prefetch state divergence (#176).
-    state_observer: Option<Arc<PrefetchStateObserver>>,
-    /// Client for DDS generation requests (new daemon architecture)
-    dds_client: Arc<dyn DdsClient>,
+    /// The backend-neutral core: state and logic shared with the WinFSP
+    /// backend (Phase 2). See `docs/dev/windows-backend-split.md` §4.4.
+    core: OrthoUnionCore,
     /// Inode manager for path mappings
     inode_manager: InodeManager,
-    /// Configuration for virtual DDS attributes
-    virtual_dds_config: VirtualDdsConfig,
-    /// Timeout for DDS generation
-    generation_timeout: Duration,
-    /// Limiter for concurrent disk I/O operations
-    disk_io_limiter: Arc<StorageConcurrencyLimiter>,
-    /// Optional callback for tile request tracking
-    tile_request_callback: Option<TileRequestCallback>,
-    /// Request coalescer for deduplicating concurrent requests
-    request_coalescer: Arc<RequestCoalescer>,
-    /// Source of lit textures (`<stem>_LIT.dds`). Lit inodes never reach the
-    /// DDS client, coalescer or caches above (night lighting, R8). Defaults
-    /// to [`BlackLitSource`], which serves the minimal black DDS.
-    lit_source: Arc<dyn LitTextureSource>,
-    /// Per-open state for virtual DDS files, keyed by file handle.
-    ///
-    /// The kernel caps each FUSE read at 1 MiB, so X-Plane reading one 11.17 MB
-    /// texture arrives as 12-23 ranged calls. Resolving the tile once per open
-    /// and slicing it turns those into a single executor round trip.
-    dds_handles: DashMap<u64, Arc<DdsHandle>>,
-    /// Source of file handles. Starts at 1: 0 means "no handle".
-    next_fh: AtomicU64,
-    /// Bytes of DDS tiles currently pinned by open handles, and the ceiling.
-    ///
-    /// Shared rather than private because prefetch reads the same figure as its
-    /// yield signal (#246). See [`PinnedTileBudget`].
-    pinned: Arc<PinnedTileBudget>,
-    /// Highest concurrent handle count seen. The current count drains to near
-    /// zero between bursts, so the peak is what the pinned ceiling has to be
-    /// sized against.
-    peak_handles_open: AtomicU64,
-    /// Whether the budget-exhausted warning has been emitted this session.
-    ///
-    /// Latched, because the cap engages for every open in a burst rather than
-    /// once: an unlatched warn would bury the log it exists to serve. The
-    /// per-occurrence count goes to metrics instead (#236).
-    budget_warning_logged: AtomicBool,
-    /// Optional metrics client for reporting FUSE-level metrics.
-    ///
-    /// When set, reports coalesced requests and other FUSE-specific metrics.
-    metrics_client: Option<crate::metrics::MetricsClient>,
     /// Maximum pending background FUSE requests (kernel limit).
     /// When set, overrides the kernel default (12) in the FUSE init handshake.
     fuse_max_background: Option<u16>,
@@ -219,38 +163,12 @@ impl Fuse3OrthoUnionFS {
         dds_client: Arc<dyn DdsClient>,
         expected_dds_size: usize,
     ) -> Self {
-        let disk_io_limiter = Arc::new(StorageConcurrencyLimiter::with_defaults(
-            "ortho_union_disk_io",
-        ));
-        let request_coalescer = Arc::new(RequestCoalescer::new());
-        debug!(
-            max_concurrent = disk_io_limiter.max_concurrent(),
-            sources = index.source_count(),
-            files = index.file_count(),
-            "Consolidated ortho union FUSE filesystem initialized"
-        );
-
         // Use a virtual root path for the inode manager
         let virtual_root = PathBuf::from("/");
 
         Self {
-            index: Arc::new(index),
-            geo_index: None,
-            state_observer: None,
-            dds_client,
+            core: OrthoUnionCore::new(index, dds_client, expected_dds_size),
             inode_manager: InodeManager::new(virtual_root),
-            virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
-            generation_timeout: Duration::from_secs(30),
-            disk_io_limiter,
-            tile_request_callback: None,
-            request_coalescer,
-            lit_source: Arc::new(BlackLitSource),
-            dds_handles: DashMap::new(),
-            next_fh: AtomicU64::new(1),
-            pinned: Arc::new(PinnedTileBudget::new()),
-            peak_handles_open: AtomicU64::new(0),
-            budget_warning_logged: AtomicBool::new(false),
-            metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
         }
@@ -267,26 +185,15 @@ impl Fuse3OrthoUnionFS {
         disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     ) -> Self {
         let virtual_root = PathBuf::from("/");
-        let request_coalescer = Arc::new(RequestCoalescer::new());
 
         Self {
-            index: Arc::new(index),
-            geo_index: None,
-            state_observer: None,
-            dds_client,
+            core: OrthoUnionCore::with_disk_io_limiter(
+                index,
+                dds_client,
+                expected_dds_size,
+                disk_io_limiter,
+            ),
             inode_manager: InodeManager::new(virtual_root),
-            virtual_dds_config: VirtualDdsConfig::new(expected_dds_size as u64),
-            generation_timeout: Duration::from_secs(30),
-            disk_io_limiter,
-            tile_request_callback: None,
-            request_coalescer,
-            lit_source: Arc::new(BlackLitSource),
-            dds_handles: DashMap::new(),
-            next_fh: AtomicU64::new(1),
-            pinned: Arc::new(PinnedTileBudget::new()),
-            peak_handles_open: AtomicU64::new(0),
-            budget_warning_logged: AtomicBool::new(false),
-            metrics_client: None,
             fuse_max_background: None,
             fuse_congestion_threshold: None,
         }
@@ -299,29 +206,45 @@ impl Fuse3OrthoUnionFS {
     /// demand on the mount (#246). Passing the runtime's budget makes the same
     /// number answer both questions.
     pub fn with_pinned_budget(mut self, budget: Arc<PinnedTileBudget>) -> Self {
-        self.pinned = budget;
+        self.core = self.core.with_pinned_budget(budget);
         self
     }
 
     /// Serve lit textures from `source` instead of the black default.
     pub fn with_lit_source(mut self, source: Arc<dyn LitTextureSource>) -> Self {
-        self.lit_source = source;
+        self.core = self.core.with_lit_source(source);
         self
     }
 
-    /// Attributes for a lit texture: a virtual DDS with the lit source's size.
-    fn lit_dds_attr(&self, ino: u64, size: u64) -> FileAttr {
-        let mut attr = self.virtual_dds_attr(ino);
-        attr.size = size;
-        attr.blocks = size.div_ceil(u64::from(attr.blksize));
-        attr
-    }
-
     /// Attributes for any virtual DDS, by kind.
+    ///
+    /// The core computes the neutral attributes (including the lit source's
+    /// size for lit textures); this adapter maps them onto `FileAttr`, adding
+    /// the inode number and the macOS-only fields.
     async fn virtual_attr_for(&self, ino: u64, coords: &DdsFilename) -> FileAttr {
-        match coords.kind {
-            TextureKind::Ortho => self.virtual_dds_attr(ino),
-            TextureKind::Lit => self.lit_dds_attr(ino, self.lit_source.size(coords).await),
+        let attrs = self.core.virtual_attrs_for(coords).await;
+        let now = SystemTime::now().into();
+
+        FileAttr {
+            ino,
+            size: attrs.size,
+            blocks: attrs.blocks,
+            atime: attrs.atime.into(),
+            mtime: attrs.mtime.into(),
+            ctime: now,
+            kind: FileType::RegularFile,
+            perm: attrs.perm,
+            nlink: attrs.nlink,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: attrs.rdev,
+            blksize: attrs.blksize,
+            // macFUSE's FileAttr carries the macOS-only creation time and
+            // BSD file flags. Mirror ctime for crtime; we expose no flags.
+            #[cfg(target_os = "macos")]
+            crtime: now,
+            #[cfg(target_os = "macos")]
+            flags: 0,
         }
     }
 
@@ -330,7 +253,7 @@ impl Fuse3OrthoUnionFS {
     /// After this timeout, a placeholder texture is returned to prevent
     /// X-Plane from blocking indefinitely.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.generation_timeout = timeout;
+        self.core = self.core.with_timeout(timeout);
         self
     }
 
@@ -339,7 +262,7 @@ impl Fuse3OrthoUnionFS {
     /// This callback is invoked whenever a tile is requested, enabling
     /// the prefetch system to infer aircraft position from FUSE requests.
     pub fn with_tile_request_callback(mut self, callback: TileRequestCallback) -> Self {
-        self.tile_request_callback = Some(callback);
+        self.core = self.core.with_tile_request_callback(callback);
         self
     }
 
@@ -348,7 +271,7 @@ impl Fuse3OrthoUnionFS {
     /// When set, reports coalesced requests and other FUSE-specific metrics
     /// to the metrics system.
     pub fn with_metrics(mut self, metrics: crate::metrics::MetricsClient) -> Self {
-        self.metrics_client = Some(metrics);
+        self.core = self.core.with_metrics(metrics);
         self
     }
 
@@ -358,7 +281,7 @@ impl Fuse3OrthoUnionFS {
     /// within a patch-owned DSF region. Files in patched regions are resolved
     /// only from patch sources, hiding package files that could conflict.
     pub fn with_geo_index(mut self, geo_index: Arc<GeoIndex>) -> Self {
-        self.geo_index = Some(geo_index);
+        self.core = self.core.with_geo_index(geo_index);
         self
     }
 
@@ -367,7 +290,7 @@ impl Fuse3OrthoUnionFS {
     /// When set, an on-demand generation in a region prefetch marked
     /// `Prefetched` or `NoCoverage` demotes that region.
     pub fn with_state_observer(mut self, observer: Arc<PrefetchStateObserver>) -> Self {
-        self.state_observer = Some(observer);
+        self.core = self.core.with_state_observer(observer);
         self
     }
 
@@ -385,125 +308,32 @@ impl Fuse3OrthoUnionFS {
 
     /// Returns the disk I/O limiter for monitoring/metrics.
     pub fn disk_io_limiter(&self) -> &Arc<StorageConcurrencyLimiter> {
-        &self.disk_io_limiter
-    }
-
-    /// Check if a scenery filename falls in a geo-filtered (patch-owned) region.
-    ///
-    /// Returns true when the file's DSF region has [`PatchCoverage`] in the
-    /// GeoIndex, meaning only patch sources should serve files for this region.
-    fn is_geo_filtered(&self, filename: &str) -> bool {
-        let geo_index = match self.geo_index {
-            Some(ref gi) => gi,
-            None => return false,
-        };
-
-        use crate::geo_index::{DsfRegion, PatchCoverage};
-        use crate::prefetch::tile_based::DsfTileCoord;
-
-        DsfTileCoord::from_scenery_filename(filename)
-            .map(|dsf| {
-                let region = DsfRegion::new(dsf.lat, dsf.lon);
-                geo_index.contains::<PatchCoverage>(&region)
-            })
-            .unwrap_or(false)
-    }
-
-    /// Resolve a lazy path with geospatial awareness.
-    ///
-    /// If the file is in a patch-owned region (per GeoIndex), patch sources are
-    /// searched first. If the file isn't found in patches, all sources are tried
-    /// as fallback — this handles cross-region DSF references where a non-patched
-    /// DSF references terrain (e.g., `_sea.ter`) in a patched region.
-    ///
-    /// DDS generation blocking is handled separately by the passthrough gate in
-    /// `lookup()`, not here.
-    ///
-    /// This is the composition point: GeoIndex (geography) + OrthoUnionIndex (files).
-    /// Produce a whole DDS tile.
-    ///
-    /// Called once per open when the handle memoises, once per read when it
-    /// does not.
-    async fn resolve_tile(&self, coords: &DdsFilename) -> Bytes {
-        // request_dds parses a filename; Display carries the correct zoom.
-        self.request_dds(&format!("{}.dds", coords))
-            .await
-            .unwrap_or_else(get_default_placeholder)
-    }
-
-    /// Publish the handle gauge. Called on open and release -- two events per
-    /// texture, against the 12-23 reads it takes to serve one.
-    /// Claims the one-shot budget warning: true on the first call of the
-    /// session, false ever after.
-    ///
-    /// The cap engages for every open in a burst, not once, so the warning is
-    /// latched and the per-occurrence count goes to metrics instead (#236).
-    fn claim_budget_warning(&self) -> bool {
-        !self.budget_warning_logged.swap(true, Ordering::Relaxed)
-    }
-
-    fn report_handle_gauge(&self) {
-        let open = self.dds_handles.len() as u64;
-        let pinned = self.pinned.pinned_bytes();
-        self.peak_handles_open.fetch_max(open, Ordering::Relaxed);
-
-        if let Some(metrics) = &self.metrics_client {
-            metrics.fuse_handles(
-                open,
-                pinned,
-                self.peak_handles_open.load(Ordering::Relaxed),
-                self.pinned.peak_bytes(),
-            );
-        }
+        self.core.disk_io_limiter()
     }
 
     /// Highest concurrent open handle count seen.
     pub fn peak_dds_handles(&self) -> u64 {
-        self.peak_handles_open.load(Ordering::Relaxed)
+        self.core.peak_dds_handles()
     }
 
     /// Highest pinned tile byte total seen.
     pub fn peak_pinned_tile_bytes(&self) -> u64 {
-        self.pinned.peak_bytes()
+        self.core.peak_pinned_tile_bytes()
     }
 
     /// Number of virtual DDS files currently open.
     pub fn open_dds_handles(&self) -> usize {
-        self.dds_handles.len()
+        self.core.open_dds_handles()
     }
 
     /// Bytes of DDS tiles currently pinned by open handles.
     pub fn pinned_tile_bytes(&self) -> u64 {
-        self.pinned.pinned_bytes()
-    }
-
-    /// Record one FUSE `read()` call for the amplification metric.
-    ///
-    /// `returned` is what this call hands back to the kernel; `materialised`
-    /// is what the handler had to obtain to produce it. The kernel caps each read
-    /// at 1 MiB, so a handler that builds the whole object per call inflates
-    /// the second against the first. See #233 and #234.
-    fn record_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
-        if let Some(metrics) = &self.metrics_client {
-            metrics.fuse_read(returned, materialised, virtual_dds);
-        }
-    }
-
-    fn resolve_lazy_geo(&self, virtual_path: &std::path::Path, filename: &str) -> Option<PathBuf> {
-        if self.is_geo_filtered(filename) {
-            // Patched region: patches first, packages fill gaps
-            self.index
-                .resolve_lazy_filtered(virtual_path, |s| s.is_patch())
-                .or_else(|| self.index.resolve_lazy(virtual_path))
-        } else {
-            // Normal: all sources
-            self.index.resolve_lazy(virtual_path)
-        }
+        self.core.pinned_tile_bytes()
     }
 
     /// Get the ortho union index.
     pub fn index(&self) -> &OrthoUnionIndex {
-        &self.index
+        self.core.index()
     }
 
     /// Mount the filesystem at the given path.
@@ -518,9 +348,9 @@ impl Fuse3OrthoUnionFS {
         // comparing dds_pinned_peak_mb against it does not have to know the
         // constant, and does not have to guess which build it came from (#236).
         tracing::info!(
-            dds_pinned_cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
+            dds_pinned_cap_mb = self.core.pinned().ceiling_bytes() / (1024 * 1024),
             dds_pinned_cap_tiles =
-                self.pinned.ceiling_bytes() / self.virtual_dds_config.size().max(1),
+                self.core.pinned().ceiling_bytes() / self.core.virtual_dds_config().size().max(1),
             "Virtual DDS handle memoisation budget"
         );
 
@@ -574,14 +404,6 @@ impl Fuse3OrthoUnionFS {
             handle, mount_path,
         ))
     }
-
-    /// Request DDS generation by filename string.
-    ///
-    /// Wrapper around the trait method that parses the filename first.
-    async fn request_dds(&self, name_str: &str) -> Option<Bytes> {
-        let coords = parse_dds_filename(name_str).ok()?;
-        Some(self.request_dds_impl(&coords).await)
-    }
 }
 
 /// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
@@ -620,47 +442,19 @@ fn volume_name_option(mount_path: &Path, macos: bool) -> Option<String> {
 
 impl FileAttrBuilder for Fuse3OrthoUnionFS {
     fn virtual_dds_config(&self) -> &VirtualDdsConfig {
-        &self.virtual_dds_config
+        self.core.virtual_dds_config()
     }
 }
 
-impl DdsRequestor for Fuse3OrthoUnionFS {
-    fn dds_client(&self) -> &Arc<dyn DdsClient> {
-        &self.dds_client
-    }
-
-    fn generation_timeout(&self) -> Duration {
-        self.generation_timeout
-    }
-
-    fn context_label(&self) -> &'static str {
-        "ortho_union"
-    }
-
-    fn tile_request_callback(&self) -> Option<&TileRequestCallback> {
-        self.tile_request_callback.as_ref()
-    }
-
-    fn request_coalescer(&self) -> Option<&Arc<RequestCoalescer>> {
-        Some(&self.request_coalescer)
-    }
-
-    fn metrics_client(&self) -> Option<&crate::metrics::MetricsClient> {
-        self.metrics_client.as_ref()
-    }
-
-    fn on_dds_response(&self, tile: TileCoord, cache_hit: bool) {
-        if let Some(ref observer) = self.state_observer {
-            observer.observe(tile, cache_hit);
-        }
-    }
-}
+// The `DdsRequestor` pipeline (parse, coalesce, submit, timeout, validate) is
+// backend-neutral and lives on the core: `impl DdsRequestor for
+// OrthoUnionCore` in `fuse::support::core` (windows-backend-split.md §3.3).
 
 impl Filesystem for Fuse3OrthoUnionFS {
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!(
-            sources = self.index.source_count(),
-            files = self.index.file_count(),
+            sources = self.core.index().source_count(),
+            files = self.core.index().file_count(),
             fuse_max_background = ?self.fuse_max_background,
             fuse_congestion_threshold = ?self.fuse_congestion_threshold,
             "fuse3 ortho union: init"
@@ -696,7 +490,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         let name_str = name.to_string_lossy();
 
         // Check if this path exists in the union index
-        if let Some(source) = self.index.resolve(&child_path) {
+        if let Some(source) = self.core.index().resolve(&child_path) {
             // Real file from a source
             if let Ok(metadata) = fs::metadata(&source.real_path).await {
                 let inode = self.inode_manager.get_or_create_inode(&child_path);
@@ -710,7 +504,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         }
 
         // Check if it's a virtual directory in the union
-        if self.index.is_directory(&child_path) {
+        if self.core.index().is_directory(&child_path) {
             let inode = self.inode_manager.get_or_create_inode(&child_path);
             let attr = self.virtual_dir_attr(inode);
             return Ok(ReplyEntry {
@@ -727,7 +521,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // Geospatial filtering: In patch-owned regions, only patch sources are
         // searched — package files are invisible. This prevents X-Plane from
         // discovering package terrain that references DDS files we won't generate.
-        if let Some(real_path) = self.resolve_lazy_geo(&child_path, &name_str) {
+        if let Some(real_path) = self.core.resolve_lazy_geo(&child_path, &name_str) {
             if let Ok(metadata) = fs::metadata(&real_path).await {
                 let inode = self.inode_manager.get_or_create_inode(&child_path);
                 let attr = self.metadata_to_attr(inode, &metadata);
@@ -752,7 +546,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // ENOENT so X-Plane falls back to the .png via lazy resolution.
             let png_name = name_str.replace(".dds", ".png");
             let png_path = parent_path.join(&*png_name);
-            if self.resolve_lazy_geo(&png_path, &png_name).is_some() {
+            if self.core.resolve_lazy_geo(&png_path, &png_name).is_some() {
                 trace!(file = %name_str, "Water mask PNG exists, skipping DDS generation");
                 return Err(Errno::from(libc::ENOENT));
             }
@@ -804,13 +598,13 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .ok_or(Errno::from(libc::ENOENT))?;
 
         // Check if it's a directory in the union
-        if self.index.is_directory(&virtual_path) {
+        if self.core.index().is_directory(&virtual_path) {
             let attr = self.virtual_dir_attr(ino);
             return Ok(ReplyAttr { ttl: TTL, attr });
         }
 
         // Must be a real file - try index lookup first
-        if let Some(source) = self.index.resolve(&virtual_path) {
+        if let Some(source) = self.core.index().resolve(&virtual_path) {
             let metadata = fs::metadata(&source.real_path)
                 .await
                 .map_err(|_| Errno::from(libc::ENOENT))?;
@@ -823,7 +617,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
-        if let Some(real_path) = self.resolve_lazy_geo(&virtual_path, filename) {
+        if let Some(real_path) = self.core.resolve_lazy_geo(&virtual_path, filename) {
             let metadata = fs::metadata(&real_path)
                 .await
                 .map_err(|_| Errno::from(libc::ENOENT))?;
@@ -859,7 +653,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // Lit textures come from the lit source alone: no executor, no
             // memoising handle, no DDS read metrics.
             if coords.kind == TextureKind::Lit {
-                let data = self.lit_source.read(&coords, offset, size).await;
+                let data = self.core.lit_source().read(&coords, offset, size).await;
                 return Ok(ReplyData { data });
             }
 
@@ -868,18 +662,18 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // Resolve the tile once per open. The kernel splits one X-Plane
             // texture read into 12-23 ranged calls (1 MiB ceiling), and this
             // branch used to re-enter the executor on every one of them.
-            let handle = self.dds_handles.get(&fh).map(|h| Arc::clone(&h));
+            let handle = self.core.dds_handles().get(&fh).map(|h| Arc::clone(&h));
 
             let tile = match handle {
                 Some(handle) => handle
                     .tile
                     .get_or_init(|| async {
-                        let data = self.resolve_tile(&handle.coords).await;
-                        self.pinned.pin(data.len() as u64);
+                        let data = self.core.resolve_tile(&handle.coords).await;
+                        self.core.pinned().pin(data.len() as u64);
                         // Report here, not at open(): the tile is produced
                         // on first read, so a gauge sampled only at open
                         // would never see the bytes it is meant to bound.
-                        self.report_handle_gauge();
+                        self.core.report_handle_gauge();
                         data
                     })
                     .instrument(fuse_read_span)
@@ -889,7 +683,12 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 // open() time, or the kernel sent a read we cannot attribute.
                 // Serve it the old way rather than fail -- a missing handle
                 // must never become a black texture.
-                None => self.resolve_tile(&coords).instrument(fuse_read_span).await,
+                None => {
+                    self.core
+                        .resolve_tile(&coords)
+                        .instrument(fuse_read_span)
+                        .await
+                }
             };
 
             let offset = offset as usize;
@@ -908,7 +707,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             // whole by the generation pipeline, which this counter does not --
             // and should not -- charge to the read path, so the ratio is 1.0
             // when delivery is zero-copy and climbs the moment it is not.
-            self.record_read(slice.len() as u64, slice.len() as u64, true);
+            self.core
+                .record_read(slice.len() as u64, slice.len() as u64, true);
 
             return Ok(ReplyData { data: slice });
         }
@@ -924,16 +724,16 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
-        let real_path = if let Some(source) = self.index.resolve(&virtual_path) {
+        let real_path = if let Some(source) = self.core.index().resolve(&virtual_path) {
             source.real_path.clone()
-        } else if let Some(lazy_path) = self.resolve_lazy_geo(&virtual_path, filename) {
+        } else if let Some(lazy_path) = self.core.resolve_lazy_geo(&virtual_path, filename) {
             lazy_path
         } else {
             return Err(Errno::from(libc::ENOENT));
         };
 
         // Acquire disk I/O permit
-        let _permit = self.disk_io_limiter.acquire().await;
+        let _permit = self.core.disk_io_limiter().acquire().await;
 
         // Read only the requested window. The kernel caps each FUSE read at
         // max_pages * PAGE_SIZE (1 MiB on Linux), so reading the whole file
@@ -957,7 +757,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Seeking past EOF is legal and yields nothing, so this also covers
         // the at-or-past-EOF case without a separate branch.
-        self.record_read(buf.len() as u64, buf.len() as u64, false);
+        self.core
+            .record_read(buf.len() as u64, buf.len() as u64, false);
 
         Ok(ReplyData {
             data: Bytes::from(buf),
@@ -985,7 +786,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         };
 
         // Verify it's a directory
-        if ino != 1 && !self.index.is_directory(&virtual_path) {
+        if ino != 1 && !self.core.index().is_directory(&virtual_path) {
             return Err(Errno::from(libc::ENOTDIR));
         }
 
@@ -1020,7 +821,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
         });
 
         // Get entries from union index
-        for (entry_offset, dir_entry) in (3i64..).zip(self.index.list_directory(&virtual_path)) {
+        for (entry_offset, dir_entry) in
+            (3i64..).zip(self.core.index().list_directory(&virtual_path))
+        {
             let child_path = virtual_path.join(&dir_entry.name);
             let entry_inode = self.inode_manager.get_or_create_inode(&child_path);
 
@@ -1068,7 +871,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         };
 
         // Verify it's a directory
-        if ino != 1 && !self.index.is_directory(&virtual_path) {
+        if ino != 1 && !self.core.index().is_directory(&virtual_path) {
             return Err(Errno::from(libc::ENOTDIR));
         }
 
@@ -1111,7 +914,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
         });
 
         // Get entries from union index
-        for (entry_offset, dir_entry) in (3i64..).zip(self.index.list_directory(&virtual_path)) {
+        for (entry_offset, dir_entry) in
+            (3i64..).zip(self.core.index().list_directory(&virtual_path))
+        {
             let child_path = virtual_path.join(&dir_entry.name);
             let entry_inode = self.inode_manager.get_or_create_inode(&child_path);
 
@@ -1121,7 +926,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 // For real files, get actual metadata from the source path
                 // This is critical for DSF and other passthrough files that need
                 // accurate file sizes reported to X-Plane
-                if let Some(source) = self.index.resolve(&child_path) {
+                if let Some(source) = self.core.index().resolve(&child_path) {
                     if let Ok(metadata) = fs::metadata(&source.real_path).await {
                         (
                             FileType::RegularFile,
@@ -1193,21 +998,21 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
         // resolve per call, which is slower but correct.
-        let expected = self.virtual_dds_config.size();
-        if self.pinned.would_exceed(expected) {
+        let expected = self.core.virtual_dds_config().size();
+        if self.core.pinned().would_exceed(expected) {
             // Count every refusal: this is what lets a flight log tell "the
             // cap engaged" from "the #234 fix stopped working", which look
             // identical otherwise -- both show fuse_dds_alloc_mb climbing.
-            if let Some(metrics) = &self.metrics_client {
+            if let Some(metrics) = self.core.metrics_client() {
                 metrics.fuse_handle_budget_exhausted();
             }
             // Warn once, at default level. Before #236 this was debug-only, so
             // the degradation was invisible on an ordinary flight.
-            if self.claim_budget_warning() {
+            if self.core.claim_budget_warning() {
                 warn!(
-                    pinned_mb = self.pinned.pinned_bytes() / (1024 * 1024),
-                    cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
-                    open_handles = self.dds_handles.len(),
+                    pinned_mb = self.core.pinned().pinned_bytes() / (1024 * 1024),
+                    cap_mb = self.core.pinned().ceiling_bytes() / (1024 * 1024),
+                    open_handles = self.core.dds_handles().len(),
                     "DDS handle budget exhausted - serving opens without memoisation. \
                      Reads now resolve their tile once per call. Further occurrences \
                      are counted in dds_budget_exhausted on the Memory sample line."
@@ -1219,16 +1024,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
             });
         }
 
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        self.dds_handles.insert(
-            fh,
-            Arc::new(DdsHandle {
-                coords,
-                tile: OnceCell::new(),
-            }),
-        );
+        let fh = self.core.new_dds_handle(coords);
 
-        self.report_handle_gauge();
+        self.core.report_handle_gauge();
 
         Ok(ReplyOpen {
             fh,
@@ -1247,11 +1045,11 @@ impl Filesystem for Fuse3OrthoUnionFS {
     ) -> Fuse3InternalResult<()> {
         // Drop the memoised tile. Without this every open file would pin
         // 11.17 MB for the life of the mount.
-        if let Some((_, handle)) = self.dds_handles.remove(&fh) {
+        if let Some((_, handle)) = self.core.dds_handles().remove(&fh) {
             if let Some(tile) = handle.tile.get() {
-                self.pinned.release(tile.len() as u64);
+                self.core.pinned().release(tile.len() as u64);
             }
-            self.report_handle_gauge();
+            self.core.report_handle_gauge();
         }
         Ok(())
     }
@@ -1296,7 +1094,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             blocks: 1000000,
             bfree: 0,
             bavail: 0,
-            files: self.index.file_count() as u64,
+            files: self.core.index().file_count() as u64,
             ffree: 0,
             bsize: 4096,
             namelen: 255,
@@ -1559,7 +1357,7 @@ mod tests {
         let client = create_test_client();
         let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_timeout(Duration::from_secs(60));
 
-        assert_eq!(fs.generation_timeout, Duration::from_secs(60));
+        assert_eq!(fs.core.generation_timeout(), Duration::from_secs(60));
     }
 
     /// Test that readdirplus returns correct file sizes for passthrough files.
@@ -1803,7 +1601,7 @@ mod tests {
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "lit files hold no memoising handle");
-        assert!(fs.dds_handles.is_empty());
+        assert!(fs.core.dds_handles().is_empty());
 
         let data = fs
             .read(test_request(), ino, opened.fh, 0, 1 << 20)
@@ -1829,7 +1627,7 @@ mod tests {
             kind: crate::fuse::TextureKind::Lit,
         };
 
-        let data = fs.request_dds_impl(&coords).await;
+        let data = fs.core.request_dds_impl(&coords).await;
 
         assert_eq!(data, crate::night::minimal_black_dds());
         assert_eq!(data.len(), 152);
@@ -1946,7 +1744,7 @@ mod tests {
         let ino = virtual_inode(&fs);
 
         // One tile short of the ceiling: pinned + expected must exceed it.
-        fs.pinned.pin(fs.pinned.ceiling_bytes());
+        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
@@ -1955,7 +1753,7 @@ mod tests {
             "the file must still bypass the page cache"
         );
         assert!(
-            fs.dds_handles.is_empty(),
+            fs.core.dds_handles().is_empty(),
             "a refused open must not leave a handle behind"
         );
     }
@@ -1968,7 +1766,7 @@ mod tests {
 
         let (fs, mut rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned.pin(fs.pinned.ceiling_bytes());
+        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
 
         for _ in 0..3 {
             let opened = fs.open(test_request(), ino, 0).await.unwrap();
@@ -1988,20 +1786,20 @@ mod tests {
 
         let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned.pin(fs.pinned.ceiling_bytes());
+        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
 
         // Assert the claim, not the flag. A flag assertion passes even if the
         // warn is emitted unconditionally, so long as something sets it.
         fs.open(test_request(), ino, 0).await.unwrap();
         assert!(
-            !fs.claim_budget_warning(),
+            !fs.core.claim_budget_warning(),
             "the first refusal must have consumed the one-shot claim"
         );
 
         for _ in 0..3 {
             fs.open(test_request(), ino, 0).await.unwrap();
             assert!(
-                !fs.claim_budget_warning(),
+                !fs.core.claim_budget_warning(),
                 "later refusals must not re-arm the warning"
             );
         }
@@ -2012,9 +1810,12 @@ mod tests {
     fn test_claim_budget_warning_is_one_shot() {
         let (fs, _requests, _temp) = virtual_dds_fixture();
 
-        assert!(fs.claim_budget_warning(), "first claim must succeed");
+        assert!(fs.core.claim_budget_warning(), "first claim must succeed");
         for _ in 0..5 {
-            assert!(!fs.claim_budget_warning(), "every later claim must fail");
+            assert!(
+                !fs.core.claim_budget_warning(),
+                "every later claim must fail"
+            );
         }
     }
 
@@ -2242,7 +2043,11 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = fs.dds_handles.get(&opened.fh).expect("handle is live");
+        let handle = fs
+            .core
+            .dds_handles()
+            .get(&opened.fh)
+            .expect("handle is live");
         let tile = handle.tile.get().expect("first read produced the tile");
 
         // The reply's buffer must sit inside the tile's allocation, at the
@@ -3192,7 +2997,7 @@ mod tests {
             map_type: "BI".to_string(),
             kind: crate::fuse::TextureKind::Ortho,
         };
-        let _ = fs.request_dds_impl(&coords).await;
+        let _ = fs.core.request_dds_impl(&coords).await;
         responder.await.unwrap();
 
         geo_index.get::<PrefetchedRegion>(&region).is_some()

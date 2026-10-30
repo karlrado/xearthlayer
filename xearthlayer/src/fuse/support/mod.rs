@@ -7,6 +7,7 @@
 //! - [`node`] - Backend-agnostic filesystem node identity
 //! - [`error`] - Backend-agnostic error type
 //! - [`requestor`] - Neutral DDS-generation request pipeline
+//! - [`core`] - The backend-neutral ortho union core (state + builders + accessors)
 
 // Shared types used by fuse3
 pub mod inode;
@@ -23,6 +24,10 @@ pub mod error;
 #[allow(dead_code)]
 pub mod node;
 pub mod requestor;
+
+/// The backend-neutral ortho union core: state, builders, and accessors
+/// shared by the FUSE backend and (Phase 2) the WinFSP backend.
+pub mod core;
 
 // Re-export shared types for use by fuse3 and public API
 pub use types::{DdsHandler, DdsRequest, DdsResponse};
