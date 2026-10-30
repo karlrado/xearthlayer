@@ -115,6 +115,11 @@ pub enum ManagerError {
         stage: &'static str,
         message: String,
     },
+
+    /// The operation is not yet supported on Windows. The scenery-package
+    /// installer path (queue lock, overlay symlinks) ships as explicit stubs
+    /// there until Phase 2 completes (docs/dev/winfsp-backend.md §5).
+    UnsupportedOnWindows,
 }
 
 impl std::fmt::Display for ManagerError {
@@ -244,6 +249,9 @@ impl std::fmt::Display for ManagerError {
             ),
             Self::Panicked { stage, message } => {
                 write!(f, "internal error during {stage}: {message}")
+            }
+            Self::UnsupportedOnWindows => {
+                write!(f, "this operation is not yet supported on Windows")
             }
         }
     }

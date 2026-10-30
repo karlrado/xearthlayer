@@ -403,11 +403,12 @@ mod tests {
     #[test]
     fn the_tile_cache_now_reads_through_the_active_layout() {
         // On Linux this is the same directory dirs::cache_dir() gave, so no
-        // existing cache moves. On macOS it gains the capitalised application
-        // name, which only affects a fresh install: an install with a config
-        // file keeps whatever cache.directory it already stored.
+        // existing cache moves. On macOS and Windows the active layout's
+        // cache directory is the platform-native one, which only affects a
+        // fresh install: an install with a config file keeps whatever
+        // cache.directory it already stored.
         assert_eq!(tile_cache_dir(), active().cache_dir());
-        if cfg!(not(target_os = "macos")) {
+        if cfg!(all(not(target_os = "macos"), not(target_os = "windows"))) {
             assert_eq!(
                 tile_cache_dir(),
                 dirs::cache_dir().unwrap().join("xearthlayer"),
@@ -416,20 +417,32 @@ mod tests {
         }
     }
 
+    /// A home directory that is absolute on this platform, so the
+    /// absolute-ness assertions below say something about the layout rather
+    /// than the platform's notion of a path root.
+    fn absolute_home() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\pilot")
+        } else {
+            PathBuf::from("/home/pilot")
+        }
+    }
+
     #[test]
     fn a_trait_object_can_hold_any_implementation() {
         // Nothing may depend on the concrete type: the whole point is that the
         // active implementation is chosen once and read through the trait.
+        let home = absolute_home();
         let all: Vec<Box<dyn BaseDirectories>> = vec![
             Box::new(XdgDirectories::from_parts(
-                PathBuf::from("/home/pilot"),
+                home.clone(),
                 None,
                 None,
                 None,
                 None,
             )),
-            Box::new(AppleDirectories::from_home(PathBuf::from("/Users/pilot"))),
-            Box::new(LegacyDirectories::from_home(PathBuf::from("/home/pilot"))),
+            Box::new(AppleDirectories::from_home(home.clone())),
+            Box::new(LegacyDirectories::from_home(home)),
         ];
         for d in all {
             assert!(d.config_dir().is_absolute());

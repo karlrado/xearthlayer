@@ -913,10 +913,14 @@ impl ValueSpecification for OptionalUrlSpec {
 // ============================================================================
 
 /// Convert path to display string, collapsing home dir to ~.
+///
+/// The remainder is written with forward slashes so it matches what
+/// `expand_tilde` (which expects `~/`) produces on every platform.
 fn path_to_display(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Ok(stripped) = path.strip_prefix(&home) {
-            return format!("~/{}", stripped.display());
+            let rest = stripped.to_string_lossy().replace('\\', "/");
+            return format!("~/{rest}");
         }
     }
     path.display().to_string()

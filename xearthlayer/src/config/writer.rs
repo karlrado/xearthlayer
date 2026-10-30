@@ -258,31 +258,31 @@ symbols = {}
 "#,
         update_check,
         config.general.layout_version,
-        config.provider.provider_type,
-        google_api_key,
-        mapbox_access_token,
-        path_to_string(&config.cache.directory),
+        toml_escape(&config.provider.provider_type),
+        toml_escape(google_api_key),
+        toml_escape(mapbox_access_token),
+        toml_escape(&path_to_string(&config.cache.directory)),
         format_size(config.cache.memory_size),
         format_size(config.cache.disk_size),
         config.cache.dds_disk_ratio,
-        config.texture.format.to_string().to_lowercase(),
-        config.texture.compressor,
-        config.texture.gpu_device,
+        toml_escape(&config.texture.format.to_string().to_lowercase()),
+        toml_escape(&config.texture.compressor),
+        toml_escape(&config.texture.gpu_device),
         config.generation.threads,
         config.generation.timeout,
         // Executor settings
         config.executor.request_timeout_secs,
         config.executor.max_retries,
-        scenery_dir,
-        library_url,
-        install_location,
-        custom_scenery_path,
+        toml_escape(&scenery_dir),
+        toml_escape(library_url),
+        toml_escape(&install_location),
+        toml_escape(&custom_scenery_path),
         auto_install_overlays,
         disable_overlays,
         xworld_pro,
-        temp_dir,
+        toml_escape(&temp_dir),
         config.packages.concurrent_downloads,
-        path_to_string(&config.logging.file),
+        toml_escape(&path_to_string(&config.logging.file)),
         config.prefetch.enabled,
         config.prefetch.web_api_port,
         config.prefetch.cycle_interval_ms,
@@ -299,12 +299,14 @@ symbols = {}
         config.prewarm.grid_rows,
         config.prewarm.grid_cols,
         config.patches.enabled,
-        config
-            .patches
-            .directory
-            .as_ref()
-            .map(|p| path_to_string(p))
-            .unwrap_or_default(),
+        toml_escape(
+            &config
+                .patches
+                .directory
+                .as_ref()
+                .map(|p| path_to_string(p))
+                .unwrap_or_default(),
+        ),
         // FUSE settings
         config.fuse.max_background,
         config.fuse.congestion_threshold,
@@ -312,7 +314,7 @@ symbols = {}
         config.night.enabled,
         config.night.brightness,
         // Terminal dashboard settings
-        config.tui.symbols,
+        toml_escape(&config.tui.symbols),
         help_library_url = ini_comment(ConfigKey::PackagesLibraryUrl),
         help_install_location = ini_comment(ConfigKey::PackagesInstallLocation),
         help_custom_scenery_path = ini_comment(ConfigKey::PackagesCustomSceneryPath),
@@ -326,11 +328,31 @@ symbols = {}
     )
 }
 
-/// Convert path to string, collapsing home dir to ~.
+/// Escape a string for the template's TOML basic strings.
+///
+/// The template interpolates raw text, so backslashes (Windows paths) and
+/// quotes (user-supplied keys) must be escaped or the file will not parse.
+fn toml_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+/// Convert path to string, collapsing home dir to ~. The remainder is
+/// written with forward slashes so it round-trips through `expand_tilde`
+/// (which expects `~/`) on every platform.
+///
+/// Plain conversion only: this must not escape. The INI boundary
+/// ([`toml_escape`], applied once in [`to_config_string`]) is the sole
+/// escaper, matching rust-ini's single unescape on read. Display contexts
+/// (help text, comments) use the result as-is.
 pub(super) fn path_to_string(path: &Path) -> String {
     if let Some(home) = dirs::home_dir() {
         if let Ok(stripped) = path.strip_prefix(&home) {
-            return format!("~/{}", stripped.display());
+            let rest = stripped.to_string_lossy().replace('\\', "/");
+            return format!("~/{rest}");
         }
     }
     path.display().to_string()
@@ -397,5 +419,39 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("xworld_pro = true"), "{text}");
         assert!(ConfigFile::load_from(&path).unwrap().packages.xworld_pro);
+    }
+
+    /// A path outside the home dir, written with Windows separators. It is
+    /// non-home on every platform (home is `C:\Users\...`, `~` or `/Users/...`),
+    /// so `path_to_string` always takes its non-home branch for it.
+    fn windows_style_non_home_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("C:\\Program Files\\X-Plane 12")
+    }
+
+    #[test]
+    fn a_non_home_path_is_escaped_exactly_once_in_the_file() {
+        let mut config = ConfigFile::default();
+        config.packages.install_location = Some(windows_style_non_home_path());
+        let text = super::to_config_string(&config);
+        // One escape layer: exactly two backslash characters per separator.
+        // Two layers (the historical double-escape) would show four, and no
+        // layer would mangle the path through rust-ini's escape-enabled read.
+        let line = "install_location = C:\\\\Program Files\\\\X-Plane 12";
+        assert!(
+            text.lines().any(|l| l.trim() == line),
+            "install_location must be escaped exactly once:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_non_home_path_with_backslashes_round_trips() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.ini");
+        let win_path = windows_style_non_home_path();
+        let mut config = ConfigFile::default();
+        config.packages.install_location = Some(win_path.clone());
+        config.save_to(&path).unwrap();
+        let loaded = ConfigFile::load_from(&path).unwrap();
+        assert_eq!(loaded.packages.install_location, Some(win_path));
     }
 }

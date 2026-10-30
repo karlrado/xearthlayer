@@ -7,10 +7,16 @@
 //! makes the sweep safe: no other process can be using the folders it
 //! deletes.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs;
+#[cfg(not(target_os = "windows"))]
+use std::fs::{File, OpenOptions};
 use std::path::{Path, PathBuf};
 
+// `flock` is Unix-only; Windows has no equivalent for this purpose, and the
+// queue ships as an explicit stub there (Phase 2, design doc §5).
+#[cfg(not(target_os = "windows"))]
 use nix::errno::Errno;
+#[cfg(not(target_os = "windows"))]
 use nix::fcntl::{Flock, FlockArg};
 use tracing::{info, warn};
 
@@ -18,13 +24,20 @@ use crate::manager::aside;
 use crate::manager::error::{ManagerError, ManagerResult};
 use crate::manager::installer::INSTALL_TEMP_PREFIX;
 
+// The lock file name is platform-neutral: the non-Windows tests compare
+// against it when checking that an install left no leftovers behind. On
+// Windows the queue and those tests are deferred (Phase 2, design doc §5),
+// so it is unread there and allowed to sit dead.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub(crate) const LOCK_FILE_NAME: &str = ".queue.lock";
 
 /// Held while a queue runs. Dropping it releases the lock.
+#[cfg(not(target_os = "windows"))]
 pub(crate) struct QueueLock {
     _lock: Flock<File>,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl QueueLock {
     pub(crate) fn acquire(temp_dir: &Path) -> ManagerResult<Self> {
         fs::create_dir_all(temp_dir).map_err(|e| ManagerError::CreateDirFailed {
@@ -49,6 +62,18 @@ impl QueueLock {
                 source: std::io::Error::from(errno),
             }),
         }
+    }
+}
+
+/// Windows: the queue lock is deferred with the installer (design doc §5).
+/// `acquire` is refused explicitly so no queue can silently start.
+#[cfg(target_os = "windows")]
+pub(crate) struct QueueLock;
+
+#[cfg(target_os = "windows")]
+impl QueueLock {
+    pub(crate) fn acquire(_temp_dir: &Path) -> ManagerResult<Self> {
+        Err(ManagerError::UnsupportedOnWindows)
     }
 }
 
@@ -124,6 +149,7 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_second_lock_on_the_same_directory_is_refused_until_the_first_is_dropped() {
         let temp = TempDir::new().unwrap();
@@ -193,6 +219,7 @@ mod tests {
     }
 
     /// The only copy of a package must survive a failed restore.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn an_aside_that_cannot_be_restored_is_left_on_disk() {
         use std::os::unix::fs::PermissionsExt;
@@ -225,5 +252,17 @@ mod tests {
             ),
             0
         );
+    }
+
+    /// The Windows stub must refuse explicitly (design doc §5), not merely
+    /// compile.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn acquire_is_refused_on_windows() {
+        let temp = TempDir::new().unwrap();
+        assert!(matches!(
+            QueueLock::acquire(temp.path()),
+            Err(ManagerError::UnsupportedOnWindows)
+        ));
     }
 }

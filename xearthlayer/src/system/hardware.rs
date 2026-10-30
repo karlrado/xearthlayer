@@ -208,6 +208,7 @@ pub fn detect_cpu_cores() -> usize {
 ///
 /// - **Linux**: Parses `/proc/meminfo`
 /// - **macOS**: Reads `hw.memsize` via `sysctl(8)`
+/// - **Windows**: Reads `ullTotalPhys` via `GlobalMemoryStatusEx`
 /// - **Other platforms**: Returns fallback of 8GB
 pub fn detect_total_memory() -> usize {
     try_detect_total_memory().unwrap_or_else(fallback_memory)
@@ -266,7 +267,21 @@ fn parse_sysctl_memsize(output: &str) -> Option<usize> {
         .filter(|&bytes| bytes > 0)
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Windows has neither `/proc/meminfo` nor `sysctl`; `GlobalMemoryStatusEx`
+/// reports total physical RAM in bytes.
+#[cfg(target_os = "windows")]
+pub fn try_detect_total_memory() -> Option<usize> {
+    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..Default::default()
+    };
+    unsafe { GlobalMemoryStatusEx(&mut status) }.ok()?;
+    let bytes = status.ullTotalPhys as usize;
+    (bytes > 0).then_some(bytes)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn try_detect_total_memory() -> Option<usize> {
     // No detection on unsupported platforms; callers fall back to 8GB.
     None
@@ -356,8 +371,9 @@ mod tests {
 
     #[test]
     fn detect_flags_memory_as_detected_on_supported_platforms() {
-        // Linux (/proc/meminfo) and macOS (sysctl) both detect reliably;
-        // the flag must be true so no caveat is shown for real values.
+        // Linux (/proc/meminfo), macOS (sysctl) and Windows
+        // (GlobalMemoryStatusEx) all detect reliably; the flag must be true
+        // so no caveat is shown for real values.
         // Storage is not asserted: /tmp may be tmpfs where detection
         // legitimately fails (and Unknown is then the correct answer).
         let info = SystemInfo::detect(Path::new("/tmp"));

@@ -146,11 +146,12 @@ pub trait ConfirmOrder: Send + Sync {
     fn decide(&self, violation: &OrderViolation, scenery_packs: &Path) -> OrderChoice;
 }
 
-/// Continue as if the user chose to: tests.
-#[cfg(test)]
+/// Continue as if the user chose to: tests. The order tests that use it are
+/// Unix-only (Phase 2, design doc §5).
+#[cfg(all(test, not(target_os = "windows")))]
 pub struct ContinueAnyway;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_os = "windows")))]
 impl ConfirmOrder for ContinueAnyway {
     fn decide(&self, _: &OrderViolation, _: &Path) -> OrderChoice {
         OrderChoice::Continue

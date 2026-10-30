@@ -120,6 +120,7 @@ impl FakeManager {
     }
 
     /// Hold the next `create_store` until `release` is sent to or dropped.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn holding_create_store(self, release: Receiver<()>) -> Self {
         *self.held_store.lock().unwrap() = Some(release);
         self
@@ -181,6 +182,8 @@ impl FakeManager {
     }
 
     /// Make removing `title` fail with `QueueBusy`, as a held queue lock does.
+    /// Its only caller is a Unix-only symlink test (Phase 2, design doc §5).
+    #[cfg(not(target_os = "windows"))]
     pub fn refusing_removal_of(mut self, title: &str) -> Self {
         self.refused_removals.push(title.to_string());
         self

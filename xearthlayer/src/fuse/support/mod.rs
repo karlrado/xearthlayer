@@ -9,6 +9,12 @@
 //! - [`requestor`] - Neutral DDS-generation request pipeline
 //! - [`core`] - The backend-neutral ortho union core (state + builders + accessors)
 
+// On Windows the FUSE3 backend is absent, so none of these neutral types has
+// a caller yet. They stay in the build graph on purpose: the WinFSP backend
+// (Phase 2, commit 6, docs/dev/winfsp-backend.md §4.1) consumes this same core,
+// and compiling it on Windows is what keeps commit 6 a pure addition.
+#![cfg_attr(target_os = "windows", allow(dead_code))]
+
 // Shared types used by fuse3
 pub mod inode;
 mod types;

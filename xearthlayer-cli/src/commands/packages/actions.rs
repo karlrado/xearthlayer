@@ -485,6 +485,8 @@ mod tests {
     // after_removal
     // ------------------------------------------------------------------------
 
+    /// Unix-only: it creates a real symlink (Phase 2, design doc §5).
+    #[cfg(not(target_os = "windows"))]
     fn symlink_for(region: &str, scenery: &Path) -> std::path::PathBuf {
         let target = scenery.join("target");
         std::fs::create_dir_all(&target).unwrap();
@@ -496,6 +498,7 @@ mod tests {
         link
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn after_removal_clears_the_per_region_overlay_symlink() {
         let scenery = tempfile::tempdir().unwrap();
@@ -506,6 +509,7 @@ mod tests {
         assert!(link.symlink_metadata().is_err());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn after_removal_leaves_an_ortho_removal_alone() {
         let scenery = tempfile::tempdir().unwrap();
@@ -601,6 +605,7 @@ mod tests {
         assert!(!report.failed);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn rebuild_reports_the_x_world_pro_line_and_leaves_its_continent_out() {
         let report = rebuild(false, true);
@@ -615,6 +620,7 @@ mod tests {
         assert!(!report.failed);
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn rebuild_with_x_world_pro_off_builds_every_region() {
         let report = rebuild(false, false);

@@ -76,10 +76,14 @@ mod tests {
 
     #[test]
     fn an_absolute_value_is_honoured() {
-        assert_eq!(
-            honour(Some("/xdg/config".into())),
-            Some(PathBuf::from("/xdg/config"))
-        );
+        // A path absolute on this platform: the rule is about absolute-ness,
+        // not about any particular root.
+        let absolute = if cfg!(windows) {
+            PathBuf::from(r"C:\xdg\config")
+        } else {
+            PathBuf::from("/xdg/config")
+        };
+        assert_eq!(honour(Some(absolute.clone().into())), Some(absolute));
     }
 
     #[test]

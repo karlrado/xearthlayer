@@ -22,15 +22,25 @@
 //! show the cursor" when the escape sequence cannot be written. With the
 //! descriptors redirected, nothing in the process can panic on the way out.
 
+// The descriptor plumbing is Unix-only; Windows has none of SIGHUP, `dup2`
+// or the `signal_hook` iterator, and its `SignalWatch` is a no-op stub
+// (Phase 2, docs/dev/winfsp-backend.md §5).
+#[cfg(not(target_os = "windows"))]
 use std::fs::OpenOptions;
 use std::io;
+#[cfg(not(target_os = "windows"))]
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+#[cfg(not(target_os = "windows"))]
 use std::thread::JoinHandle;
 
-use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+#[cfg(not(target_os = "windows"))]
+use signal_hook::consts::SIGHUP;
+use signal_hook::consts::{SIGINT, SIGTERM};
+#[cfg(not(target_os = "windows"))]
 use signal_hook::iterator::{Handle, Signals};
+#[cfg(not(target_os = "windows"))]
 use signal_hook::SigId;
 use xearthlayer::manager::Canceller;
 
@@ -48,6 +58,7 @@ pub fn terminal_gone() -> bool {
 
 /// Point every descriptor in `fds` at `/dev/null`, so a write to it succeeds
 /// and goes nowhere.
+#[cfg(not(target_os = "windows"))]
 fn redirect_to_null(fds: &[RawFd]) -> io::Result<()> {
     let null = OpenOptions::new().write(true).open("/dev/null")?;
     for &fd in fds {
@@ -61,6 +72,7 @@ fn redirect_to_null(fds: &[RawFd]) -> io::Result<()> {
 }
 
 /// The terminal is gone: stop every write to it from failing.
+#[cfg(not(target_os = "windows"))]
 fn detach_terminal() {
     // The test harness reports on this process's stdout.
     if cfg!(test) {
@@ -78,6 +90,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The signals that stop a package operation.
+///
+/// The Windows watch is a no-op stub, so the routing surface below is
+/// uncalled there (Phase 2, design doc §5); the API stays identical on every
+/// platform and Windows signal handling is a follow-up.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Interrupt,
@@ -86,10 +103,13 @@ pub enum Signal {
 }
 
 impl Signal {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn from_raw(raw: i32) -> Option<Self> {
         match raw {
             SIGINT => Some(Self::Interrupt),
             SIGTERM => Some(Self::Terminate),
+            // SIGHUP does not exist on Windows.
+            #[cfg(not(target_os = "windows"))]
             SIGHUP => Some(Self::Hangup),
             _ => None,
         }
@@ -99,7 +119,18 @@ impl Signal {
         match self {
             Self::Interrupt => SIGINT,
             Self::Terminate => SIGTERM,
-            Self::Hangup => SIGHUP,
+            Self::Hangup => {
+                #[cfg(not(target_os = "windows"))]
+                {
+                    SIGHUP
+                }
+                // SIGHUP is 1 on both Unix families. Hangup is unreachable on
+                // Windows; the placeholder keeps `exit_code()` stable there.
+                #[cfg(target_os = "windows")]
+                {
+                    1
+                }
+            }
         }
     }
 
@@ -120,6 +151,7 @@ impl std::fmt::Display for Signal {
 }
 
 /// What a signal does to the running queue. `Abandon` is the stronger.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Action {
     Cancel,
@@ -127,6 +159,7 @@ pub enum Action {
 }
 
 /// Only a first Ctrl+C waits for cleanup.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub fn action(signal: Signal, interrupts_before: u32) -> Action {
     match (signal, interrupts_before) {
         (Signal::Interrupt, 0) => Action::Cancel,
@@ -177,6 +210,7 @@ impl ActiveQueue {
     }
 
     #[cfg(test)]
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn current(&self) -> Option<Canceller> {
         lock(&self.0).canceller.clone()
     }
@@ -190,6 +224,7 @@ impl ActiveQueue {
     /// `Cancel`) and return what to apply to the running queue, if any.
     /// Nothing is applied here: applying can take long, and the slot must
     /// stay available meanwhile.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn request(&self, action: Action) -> Option<(Action, Canceller)> {
         let mut slot = lock(&self.0);
         let effective = slot
@@ -214,6 +249,7 @@ impl ActiveQueue {
 }
 
 /// Routes the three signals to the active queue until dropped.
+#[cfg(not(target_os = "windows"))]
 pub struct SignalWatch {
     handle: Handle,
     thread: Option<JoinHandle<()>>,
@@ -223,6 +259,7 @@ pub struct SignalWatch {
     hangup_flag: SigId,
 }
 
+#[cfg(not(target_os = "windows"))]
 impl SignalWatch {
     pub fn start(active: ActiveQueue, notice: impl Fn(&str) + Send + 'static) -> io::Result<Self> {
         Self::spawn(active, notice, true, None)
@@ -327,6 +364,7 @@ impl SignalWatch {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Drop for SignalWatch {
     fn drop(&mut self) {
         self.handle.close();
@@ -337,11 +375,52 @@ impl Drop for SignalWatch {
     }
 }
 
+/// Windows stub (Phase 2, docs/dev/winfsp-backend.md §5): signal routing is
+/// Unix-only, so a started watch never fires and Ctrl+C keeps the console
+/// default action. The API stays identical on every platform, so commands
+/// compile unchanged; real Windows signal handling is a follow-up.
+#[cfg(target_os = "windows")]
+pub struct SignalWatch;
+
+#[cfg(target_os = "windows")]
+impl SignalWatch {
+    pub fn start(
+        _active: ActiveQueue,
+        _notice: impl Fn(&str) + Send + 'static,
+    ) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    /// For `run`: on Windows the watch is inert; the front end's shutdown
+    /// flag is simply never raised by a signal.
+    pub fn start_for_shutdown(_shutdown: Arc<AtomicBool>) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub fn start_handling_all(
+        _active: ActiveQueue,
+        _notice: impl Fn(&str) + Send + 'static,
+    ) -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    /// No signal has been received: the watch is inert on Windows.
+    pub fn received(&self) -> Option<Signal> {
+        None
+    }
+
+    pub fn latest(&self) -> Option<(u64, Signal)> {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Condvar;
+    // Only the Unix-only real-signal test polls on a deadline.
+    #[cfg(not(target_os = "windows"))]
     use std::time::{Duration, Instant};
     use xearthlayer::manager::{Canceller, QueueControl};
 
@@ -362,10 +441,18 @@ mod tests {
 
     #[test]
     fn raw_numbers_map_to_the_three_signals_and_nothing_else() {
-        for signal in [Signal::Interrupt, Signal::Terminate, Signal::Hangup] {
+        // Hangup is Unix-only; on Windows it round-trips through the
+        // placeholder number and is never produced.
+        #[cfg(not(target_os = "windows"))]
+        let signals = [Signal::Interrupt, Signal::Terminate, Signal::Hangup];
+        #[cfg(target_os = "windows")]
+        let signals = [Signal::Interrupt, Signal::Terminate];
+        for signal in signals {
             assert_eq!(Signal::from_raw(signal.raw()), Some(signal));
         }
-        assert_eq!(Signal::from_raw(signal_hook::consts::SIGUSR1), None);
+        // 99 is not a signal number on any supported platform, including
+        // Windows, where `SIGUSR1` does not exist.
+        assert_eq!(Signal::from_raw(99), None);
     }
 
     /// Counts calls. `cancel_all` can be made to block until `release`.
@@ -377,6 +464,9 @@ mod tests {
         released: (Mutex<bool>, Condvar),
     }
     impl Recorded {
+        /// Only the Unix-only real-signal test holds a cancel open (Phase 2,
+        /// design doc §5).
+        #[cfg(not(target_os = "windows"))]
         fn release(&self) {
             *self.released.0.lock().unwrap() = true;
             self.released.1.notify_all();
@@ -449,6 +539,7 @@ mod tests {
         assert!(active.stop_requested());
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn a_redirected_descriptor_swallows_what_is_written_to_it() {
         use std::io::Write;
@@ -464,6 +555,9 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "before\n");
     }
 
+    /// Only the Unix-only real-signal test polls for delivery (Phase 2,
+    /// design doc §5).
+    #[cfg(not(target_os = "windows"))]
     fn eventually(condition: impl Fn() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !condition() {
@@ -475,6 +569,8 @@ mod tests {
     /// One test, because a raised signal reaches every watch in the process.
     /// The queue is always set before raising: with no queue, the watch
     /// falls back to the default action, which would end the test binary.
+    /// Unix-only: it raises real signals through `signal_hook`.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn real_signals_reach_the_active_queue() {
         let recorded = Arc::new(Recorded::default());

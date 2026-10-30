@@ -8,9 +8,14 @@
 //! manager's status display.
 
 use std::path::Path;
-use std::process::Command;
 
-use tracing::{debug, warn};
+// The unmount binaries and their stderr parsing exist only off-Windows;
+// on Windows the function body is a stub (Phase 2, design doc §5).
+#[cfg(not(target_os = "windows"))]
+use std::process::Command;
+#[cfg(not(target_os = "windows"))]
+use tracing::debug;
+use tracing::warn;
 
 /// Unmount the FUSE filesystem at `mountpoint`.
 ///
@@ -22,6 +27,15 @@ use tracing::{debug, warn};
 /// Returns `true` if the mountpoint ended up unmounted, including the benign
 /// case where it was already not mounted.
 pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        // No FUSE exists on Windows; the desired end state (nothing FUSE
+        // mounted) already holds. WinFSP unmount goes through the session
+        // (Phase 2, commit 5, docs/dev/winfsp-backend.md §4.5).
+        let _ = (mountpoint, force);
+        true
+    }
+
     #[cfg(target_os = "macos")]
     {
         // macFUSE unmounts via BSD umount(8). This helper is only reached as a
@@ -34,7 +48,7 @@ pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
         run_unmount(Command::new("umount").arg("-f").arg(mountpoint), mountpoint)
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
         let flag = if force { "-uz" } else { "-u" };
         // Prefer fusermount3 (libfuse3), fall back to fusermount (libfuse2).
@@ -138,11 +152,19 @@ pub fn is_stale_fuse_mount(mountpoint: &Path) -> bool {
 
 /// Classify an I/O error from `stat(2)` on a mountpoint as "stale FUSE
 /// mount" or not. Extracted as a pure function for testability.
+#[cfg(not(target_os = "windows"))]
 fn is_stale_mount_error(error: &std::io::Error) -> bool {
     matches!(
         error.raw_os_error(),
         Some(libc::ENXIO) | Some(libc::ENOTCONN)
     )
+}
+
+/// Windows: no FUSE corpses exist yet; stale WinFSP detection lands with the
+/// WinFSP backend (Phase 2, commit 5).
+#[cfg(target_os = "windows")]
+fn is_stale_mount_error(_error: &std::io::Error) -> bool {
+    false
 }
 
 /// Detect and clear a stale FUSE mount at `mountpoint`.
@@ -170,6 +192,7 @@ pub fn recover_stale_fuse_mount(mountpoint: &Path) -> bool {
 }
 
 /// Run one unmount command, treating "already unmounted" as success.
+#[cfg(not(target_os = "windows"))]
 fn run_unmount(cmd: &mut Command, mountpoint: &Path) -> bool {
     match cmd.output() {
         Ok(output) if output.status.success() => true,
@@ -223,6 +246,7 @@ mod tests {
     /// (Linux FUSE) mean a dead mount; anything else does not. A real dead
     /// mount cannot be created in CI, so the policy is tested via the pure
     /// classifier.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn stale_mount_error_classification() {
         let stale_macos = std::io::Error::from_raw_os_error(libc::ENXIO);
