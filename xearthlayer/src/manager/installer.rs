@@ -22,9 +22,7 @@ use xearthlayer_package::{PackageMetadata, PackageType};
 
 use super::aside;
 use super::cancel::CancelToken;
-#[cfg(not(target_os = "windows"))]
-use super::disk_check::available_bytes;
-use super::disk_check::{FsInfoProvider, RealFsInfoProvider};
+use super::disk_check::{available_bytes, FsInfoProvider, RealFsInfoProvider};
 use super::download::{DownloadProgressCallback, DownloadState, MultiPartDownloader};
 use super::error::{ManagerError, ManagerResult};
 use super::extractor::TarGzExtractor;
@@ -139,13 +137,9 @@ pub struct PackageInstaller {
     temp_dir: PathBuf,
     /// Fetches archive parts.
     transfer: Box<dyn PartTransfer>,
-    /// Filesystem info provider for the pre-flight disk-space check.
-    /// Defaults to `RealFsInfoProvider`; tests can substitute a stub
-    /// via `with_fs_info_provider`.
-    ///
-    /// The Windows installer path is deferred (Phase 2, design doc §5), so
-    /// nothing reads this there yet; it stays so the deferred path can use it.
-    #[cfg_attr(target_os = "windows", allow(dead_code))]
+    /// Filesystem info provider for the pre-flight disk-space check and the
+    /// capacity read. Defaults to `RealFsInfoProvider`; tests can substitute
+    /// a stub via `with_fs_info_provider`.
     fs_info_provider: Box<dyn FsInfoProvider>,
 }
 
@@ -200,12 +194,65 @@ impl PackageInstaller {
     /// The device and free bytes of the filesystem holding `folder`,
     /// creating the folder first so a fresh install can be measured.
     ///
-    /// Windows stub (Phase 2, design doc §5): the installer path is deferred
-    /// there, and the cross-filesystem device identity has no Unix
-    /// equivalent yet, so capacity is refused explicitly.
+    /// The device id is the filesystem identity: `st_dev` on Unix, and the
+    /// volume serial number on Windows, so two folders compare equal exactly
+    /// when they sit on the same volume.
     #[cfg(target_os = "windows")]
-    fn filesystem_of(&self, _folder: &Path) -> ManagerResult<(u64, u64)> {
-        Err(ManagerError::UnsupportedOnWindows)
+    fn filesystem_of(&self, folder: &Path) -> ManagerResult<(u64, u64)> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW};
+
+        fs::create_dir_all(folder).map_err(|e| ManagerError::CreateDirFailed {
+            path: folder.to_path_buf(),
+            source: e,
+        })?;
+        // NUL-terminated UTF-16 for the Win32 APIs; the buffers outlive their calls.
+        let wide: Vec<u16> = folder
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // `GetVolumeInformationW` wants the volume root, not a deep path, so
+        // resolve the root first (e.g. `C:\` or `\\server\\share`).
+        let mut volume_path = [0u16; 261];
+        // SAFETY: `wide` is a valid NUL-terminated UTF-16 path and `volume_path`
+        // is a NUL-terminated UTF-16 buffer the API fully writes on success.
+        unsafe { GetVolumePathNameW(PCWSTR::from_raw(wide.as_ptr()), &mut volume_path) }.map_err(
+            |e| ManagerError::ReadFailed {
+                path: folder.to_path_buf(),
+                source: std::io::Error::other(e),
+            },
+        )?;
+        // Keep the root the API returned, NUL terminator included, for the next call.
+        let len = volume_path
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(volume_path.len() - 1);
+        let root: Vec<u16> = volume_path[..len + 1].to_vec();
+
+        let mut volume_serial = 0u32;
+        let mut max_component_length = 0u32;
+        let mut filesystem_flags = 0u32;
+        // SAFETY: `root` is a valid NUL-terminated UTF-16 string, and the three
+        // outputs are initialized u32s the API fully writes on success. The
+        // volume-name and filesystem-name outputs are not needed, so omitted.
+        unsafe {
+            GetVolumeInformationW(
+                PCWSTR::from_raw(root.as_ptr()),
+                None,
+                Some(&mut volume_serial),
+                Some(&mut max_component_length),
+                Some(&mut filesystem_flags),
+                None,
+            )
+        }
+        .map_err(|e| ManagerError::ReadFailed {
+            path: folder.to_path_buf(),
+            source: std::io::Error::other(e),
+        })?;
+        let free = available_bytes(self.fs_info_provider.as_ref(), folder)?;
+        Ok((volume_serial as u64, free))
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -1088,6 +1135,30 @@ mod tests {
         );
         assert!(installer.temp_dir().is_dir());
         assert!(installer.packages_root().is_dir());
+    }
+
+    /// On Windows the device id comes from the volume serial number; it must
+    /// be stable for the same folder and the free space must be readable.
+    /// (The `Shared`/`Split` branching is covered by the platform-neutral
+    /// `Capacity` tests in `queue/ledger.rs`.)
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn filesystem_of_reports_a_stable_device_id_and_free_space() {
+        let temp = TempDir::new().unwrap();
+        let installer = PackageInstaller::new(
+            LocalPackageStore::new(temp.path().join("Custom Scenery")),
+            temp.path().join("tmp"),
+        );
+        let folder = temp.path().join("measure");
+        let (device_a, free_a) = installer.filesystem_of(&folder).unwrap();
+        let (device_b, free_b) = installer.filesystem_of(&folder).unwrap();
+
+        assert_eq!(
+            device_a, device_b,
+            "device id must be stable for the same folder"
+        );
+        assert!(free_a > 0, "free space must be reported: {free_a}");
+        assert!(free_b > 0, "free space must be reported: {free_b}");
     }
 
     #[cfg(not(target_os = "windows"))]
