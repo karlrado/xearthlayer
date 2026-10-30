@@ -875,3 +875,811 @@ impl DdsRequestor for OrthoUnionCore {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Behavioural tests for the neutral ops, at the core level.
+    //!
+    //! The FUSE adapter keeps the kernel-specific tests (inode numbering,
+    //! TTLs, open flags, errno mapping, readdir offsets). Everything that is
+    //! backend-neutral -- handle memoisation, the pinned-tile budget, the
+    //! gauges, ranged reads, lit passthrough, the water-mask guard, size
+    //! upgrades -- is exercised here against [`OrthoUnionCore`] directly:
+    //! no inodes, no `fuse3::raw::Request`, and `FsError` variants asserted
+    //! instead of errno numbers. The WinFSP backend (Phase 2) inherits
+    //! these for free.
+
+    use super::*;
+    use crate::coord::TileCoord;
+    use crate::executor::{DdsClient, DdsClientError, Priority};
+    use crate::fuse::EXPECTED_DDS_SIZE;
+    use crate::metrics::MetricEvent;
+    use crate::night::minimal_black_dds;
+    use crate::ortho_union::OrthoUnionIndexBuilder;
+    use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
+    use semver::Version;
+    use std::sync::atomic::AtomicUsize;
+    use tempfile::TempDir;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio_util::sync::CancellationToken;
+    use xearthlayer_package::{InstalledPackage, Package, PackageType};
+
+    /// A `DdsClient` that answers instantly and counts how many tile requests
+    /// it was asked for. The count is the point: the kernel splits one X-Plane
+    /// texture read into 12-23 ranged calls, and each one used to become a
+    /// separate executor round trip.
+    struct CountingDdsClient {
+        requests: Arc<AtomicUsize>,
+    }
+
+    impl CountingDdsClient {
+        fn new() -> (Arc<Self>, Arc<AtomicUsize>) {
+            let requests = Arc::new(AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    requests: Arc::clone(&requests),
+                }),
+                requests,
+            )
+        }
+
+        /// A DDS that passes `validate_dds_or_placeholder`: right magic, right
+        /// length, and a body whose byte at index i is `i as u8` so a slice
+        /// proves which window was served.
+        fn valid_dds() -> Vec<u8> {
+            let mut data: Vec<u8> = (0..EXPECTED_DDS_SIZE).map(|i| i as u8).collect();
+            data[0..4].copy_from_slice(b"DDS ");
+            data
+        }
+    }
+
+    impl DdsClient for CountingDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.requests.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(DdsResponse::cache_hit(
+                Self::valid_dds().into(),
+                Duration::from_millis(1),
+            ));
+            rx
+        }
+
+        fn request_dds_with_options(
+            &self,
+            tile: TileCoord,
+            _priority: Priority,
+            _origin: RequestOrigin,
+            cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            self.request_dds(tile, cancellation)
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    fn virtual_dds_fixture() -> (OrthoUnionCore, Arc<AtomicUsize>, TempDir) {
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (client, requests) = CountingDdsClient::new();
+        let core = OrthoUnionCore::new(index, client, EXPECTED_DDS_SIZE);
+        (core, requests, temp)
+    }
+
+    /// Fixture wired to an observable metrics channel.
+    fn virtual_dds_fixture_with_metrics() -> (
+        OrthoUnionCore,
+        mpsc::UnboundedReceiver<MetricEvent>,
+        TempDir,
+    ) {
+        let (core, _requests, temp) = virtual_dds_fixture();
+        let (tx, rx) = mpsc::unbounded_channel();
+        (
+            core.with_metrics(crate::metrics::MetricsClient::new(tx)),
+            rx,
+            temp,
+        )
+    }
+
+    fn virtual_dds_node() -> FsNode {
+        FsNode::VirtualDds(DdsFilename {
+            row: 12754,
+            col: 5279,
+            zoom: 16,
+            map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
+        })
+    }
+
+    fn lit_node() -> FsNode {
+        FsNode::VirtualDds(DdsFilename {
+            row: 25712,
+            col: 12960,
+            zoom: 16,
+            map_type: "BI".to_string(),
+            kind: TextureKind::Lit,
+        })
+    }
+
+    fn textures_dir() -> FsNode {
+        FsNode::Directory(PathBuf::from("textures"))
+    }
+
+    /// Build a one-package index containing a single file of `size` bytes and
+    /// return the core, its real-file node, and the metrics receiver.
+    fn passthrough_fixture(
+        temp: &TempDir,
+        size: usize,
+    ) -> (OrthoUnionCore, FsNode, mpsc::UnboundedReceiver<MetricEvent>) {
+        // Byte i = i as u8, so a slice's content proves which range was served.
+        let content: Vec<u8> = (0..size).map(|i| i as u8).collect();
+        passthrough_fixture_with(temp, &content)
+    }
+
+    fn passthrough_fixture_with(
+        temp: &TempDir,
+        content: &[u8],
+    ) -> (OrthoUnionCore, FsNode, mpsc::UnboundedReceiver<MetricEvent>) {
+        let pkg_dir = temp.path().join("test_ortho");
+        let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
+        std::fs::create_dir_all(&dsf_dir).unwrap();
+        std::fs::write(dsf_dir.join("+40-074.dsf"), content).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (client, _requests) = CountingDdsClient::new();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let core = OrthoUnionCore::new(index, client, EXPECTED_DDS_SIZE)
+            .with_metrics(crate::metrics::MetricsClient::new(tx));
+        let node = FsNode::RealFile(PathBuf::from("Earth nav data/+40-080/+40-074.dsf"));
+
+        (core, node, rx)
+    }
+
+    fn budget_exhausted_events(rx: &mut mpsc::UnboundedReceiver<MetricEvent>) -> usize {
+        let mut n = 0;
+        while let Ok(event) = rx.try_recv() {
+            if matches!(event, MetricEvent::FuseHandleBudgetExhausted) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Drain the single `FuseRead` event a read is expected to emit.
+    fn drain_one_read(rx: &mut mpsc::UnboundedReceiver<MetricEvent>) -> (u64, u64, bool) {
+        match rx
+            .try_recv()
+            .expect("read() must emit exactly one FuseRead")
+        {
+            MetricEvent::FuseRead {
+                returned,
+                materialised,
+                virtual_dds,
+            } => (returned, materialised, virtual_dds),
+            other => panic!("expected FuseRead, got {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // Virtual DDS handle reuse (#234), at the core level
+    // ========================================================================
+
+    /// One open, many reads, one tile request.
+    ///
+    /// This is the defect: `read()` re-entered the executor on every ranged
+    /// call, so a single texture cost 12-23 round trips, each of which cloned
+    /// the whole 11.17 MB tile twice. Fails against the pre-fix handler with
+    /// one request per read.
+    #[tokio::test]
+    async fn open_memoises_the_tile_once_per_open() {
+        let (core, requests, _temp) = virtual_dds_fixture();
+        let node = virtual_dds_node();
+
+        let fh = core.open(&node);
+        assert_ne!(fh, 0, "a known tile must get a memoising handle");
+
+        const CHUNK: u32 = 1024 * 1024;
+        for i in 0..5u64 {
+            let data = core.read(&node, fh, i * CHUNK as u64, CHUNK).await.unwrap();
+            assert_eq!(data.len(), CHUNK as usize, "read {i} short");
+        }
+
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "five ranged reads of one open file must cost one tile request"
+        );
+    }
+
+    /// Serving from the memoised tile must still return the right window.
+    #[tokio::test]
+    async fn reads_serve_the_requested_window() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+        let node = virtual_dds_node();
+        let fh = core.open(&node);
+
+        // Byte i of the tile is `i as u8`, except the four magic bytes.
+        for offset in [4096u64, 1_000_000, 8_000_000] {
+            let data = core.read(&node, fh, offset, 256).await.unwrap();
+            assert_eq!(data.len(), 256);
+            assert_eq!(data[0], (offset % 256) as u8, "offset {offset}");
+            assert_eq!(data[255], ((offset + 255) % 256) as u8);
+        }
+    }
+
+    /// The last window is short, and reads past the tile return nothing.
+    #[tokio::test]
+    async fn read_at_and_past_tile_end() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+        let node = virtual_dds_node();
+        let fh = core.open(&node);
+        let size = EXPECTED_DDS_SIZE as u64;
+
+        let tail = core.read(&node, fh, size - 100, 4096).await.unwrap();
+        assert_eq!(tail.len(), 100);
+
+        let past = core.read(&node, fh, size, 4096).await.unwrap();
+        assert!(past.is_empty());
+    }
+
+    /// The ratio is only honest if the delivery really is zero-copy, and the
+    /// counter cannot prove that -- it is charged by code we control. Pointer
+    /// identity can: the reply must alias the memoised tile, not copy it.
+    #[tokio::test]
+    async fn read_aliases_the_memoised_tile() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+        let node = virtual_dds_node();
+        let fh = core.open(&node);
+
+        const OFFSET: u64 = 4096;
+        let data = core.read(&node, fh, OFFSET, 256).await.unwrap();
+
+        let handle = core.dds_handles().get(&fh).expect("handle is live");
+        let tile = handle.tile.get().expect("first read produced the tile");
+
+        // The reply's buffer must sit inside the tile's allocation, at the
+        // requested offset -- not be a fresh 256-byte copy of it.
+        let expected = unsafe { tile.as_ptr().add(OFFSET as usize) };
+        assert_eq!(
+            data.as_ptr(),
+            expected,
+            "the reply must alias the tile at the read offset, not copy from it"
+        );
+    }
+
+    /// `release()` must drop the tile, or every open file leaks 11.17 MB.
+    #[tokio::test]
+    async fn release_frees_the_handle() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+        let node = virtual_dds_node();
+        let fh = core.open(&node);
+        core.read(&node, fh, 0, 4096).await.unwrap();
+
+        assert_eq!(core.open_dds_handles(), 1);
+        assert!(core.pinned_tile_bytes() > 0);
+
+        core.release(fh);
+
+        assert_eq!(core.open_dds_handles(), 0);
+        assert_eq!(core.pinned_tile_bytes(), 0);
+    }
+
+    /// A read with no handle still works, one request per read.
+    ///
+    /// The kernel always calls `open()` first, but a handler that returns
+    /// ENOENT when it does not recognise a handle would turn any bookkeeping
+    /// slip into a black texture.
+    #[tokio::test]
+    async fn read_without_a_handle_falls_back() {
+        let (core, requests, _temp) = virtual_dds_fixture();
+        let node = virtual_dds_node();
+
+        for _ in 0..3 {
+            let data = core.read(&node, 0, 0, 4096).await.unwrap();
+            assert_eq!(data.len(), 4096);
+        }
+
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+    }
+
+    /// The amplification metric must reflect the fix, not the old shape.
+    ///
+    /// Only the read that produces the tile materialises it; later reads slice
+    /// what is already held and obtain nothing. Counting the tile on every
+    /// call would pin `fuse_dds_alloc_mb / fuse_dds_read_mb` near 12-23 and
+    /// report the fix as ineffective.
+    #[tokio::test]
+    async fn metric_charges_only_what_it_delivers() {
+        let (core, mut rx, _temp) = virtual_dds_fixture_with_metrics();
+        let node = virtual_dds_node();
+        let fh = core.open(&node);
+
+        const CHUNK: u32 = 1024 * 1024;
+        const READS: u64 = 4;
+        for i in 0..READS {
+            core.read(&node, fh, i * CHUNK as u64, CHUNK).await.unwrap();
+        }
+
+        let mut returned_total = 0u64;
+        let mut materialised_total = 0u64;
+        let mut events = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let MetricEvent::FuseRead {
+                returned,
+                materialised,
+                virtual_dds,
+            } = event
+            {
+                assert!(virtual_dds);
+                returned_total += returned;
+                materialised_total += materialised;
+                events += 1;
+            }
+        }
+
+        assert_eq!(events, READS, "one FuseRead per read call");
+        assert_eq!(returned_total, READS * CHUNK as u64);
+        // #237 changed the contract. The handler now takes a refcount on the
+        // tile and slices it, so it obtains exactly what it returns and the
+        // amplification ratio is 1.0. Charging the tile here instead would
+        // report allocation that no longer happens.
+        assert_eq!(
+            materialised_total, returned_total,
+            "a zero-copy handler obtains exactly what it delivers"
+        );
+    }
+
+    /// Peaks must survive the drain that hides the current gauges.
+    ///
+    /// The live counts are sampled on open, on tile production and on release,
+    /// so a periodic reader almost always catches them just after a release
+    /// and sees zero -- which is exactly what the first KDEN run reported while
+    /// 31 files were open. `MAX_PINNED_TILE_BYTES` has to be sized against the
+    /// ceiling, so the ceiling is tracked separately.
+    #[tokio::test]
+    async fn handle_peaks_outlive_the_current_gauges() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+
+        let mut opened = Vec::new();
+        for col in 0..3u32 {
+            let node = FsNode::VirtualDds(DdsFilename {
+                row: 12754,
+                col: 5279 + col,
+                zoom: 16,
+                map_type: "BI".to_string(),
+                kind: TextureKind::Ortho,
+            });
+            let fh = core.open(&node);
+            core.read(&node, fh, 0, 4096).await.unwrap();
+            opened.push(fh);
+        }
+
+        assert_eq!(core.open_dds_handles(), 3);
+        let pinned_at_peak = core.pinned_tile_bytes();
+        assert_eq!(pinned_at_peak, 3 * EXPECTED_DDS_SIZE as u64);
+
+        for fh in opened {
+            core.release(fh);
+        }
+
+        // Current gauges drain...
+        assert_eq!(core.open_dds_handles(), 0);
+        assert_eq!(core.pinned_tile_bytes(), 0);
+        // ...peaks do not.
+        assert_eq!(core.peak_dds_handles(), 3);
+        assert_eq!(core.peak_pinned_tile_bytes(), pinned_at_peak);
+    }
+
+    // ========================================================================
+    // Pinned-tile budget and its warning latch (#236)
+    // ========================================================================
+
+    /// Past the ceiling `open()` hands back fh 0, so `read()` resolves per
+    /// call. Slower, but correct -- the bound costs throughput, never data.
+    #[tokio::test]
+    async fn open_past_budget_refuses_memoisation() {
+        let (core, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let node = virtual_dds_node();
+
+        // One tile short of the ceiling: pinned + expected must exceed it.
+        core.pinned().pin(core.pinned().ceiling_bytes());
+
+        assert_eq!(core.open(&node), 0, "refused opens get no memoising handle");
+        assert!(
+            core.dds_handles().is_empty(),
+            "a refused open must not leave a handle behind"
+        );
+    }
+
+    /// #236: the fallback was visible only under `--debug`, so a flight could
+    /// not tell "the cap engaged" from "the #234 fix stopped working".
+    #[tokio::test]
+    async fn open_past_budget_counts_every_refusal() {
+        let (core, mut rx, _temp) = virtual_dds_fixture_with_metrics();
+        let node = virtual_dds_node();
+        core.pinned().pin(core.pinned().ceiling_bytes());
+
+        for _ in 0..3 {
+            assert_eq!(core.open(&node), 0);
+        }
+
+        // Every refusal counts: the counter measures lost memoisations, and
+        // one event could not be told from an assignment.
+        assert_eq!(budget_exhausted_events(&mut rx), 3);
+    }
+
+    /// The warning latches. Once the cap engages it engages for every open in
+    /// the burst, and a per-open warn would bury the log it is meant to serve.
+    #[tokio::test]
+    async fn budget_warning_is_latched() {
+        let (core, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let node = virtual_dds_node();
+        core.pinned().pin(core.pinned().ceiling_bytes());
+
+        // Assert the claim, not the flag. A flag assertion passes even if the
+        // warn is emitted unconditionally, so long as something sets it.
+        assert_eq!(core.open(&node), 0);
+        assert!(
+            !core.claim_budget_warning(),
+            "the first refusal must have consumed the one-shot claim"
+        );
+
+        for _ in 0..3 {
+            assert_eq!(core.open(&node), 0);
+            assert!(
+                !core.claim_budget_warning(),
+                "later refusals must not re-arm the warning"
+            );
+        }
+    }
+
+    /// The latch in isolation: true exactly once, whatever the caller does.
+    #[test]
+    fn claim_budget_warning_is_one_shot() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+
+        assert!(core.claim_budget_warning(), "first claim must succeed");
+        for _ in 0..5 {
+            assert!(!core.claim_budget_warning(), "every later claim must fail");
+        }
+    }
+
+    // ========================================================================
+    // Passthrough read amplification (#233), at the core level
+    // ========================================================================
+
+    /// A ranged read must not materialise more than it returns.
+    ///
+    /// The kernel caps every read at 1 MiB, so X-Plane asking for a whole
+    /// 4 MiB file still arrives as several ranged calls. Answering each by
+    /// reading the entire file makes the handler move N times what it
+    /// delivers. This test fails against the pre-fix handler, which reports
+    /// materialised == 4 MiB for a 64 KiB request.
+    #[tokio::test]
+    async fn passthrough_read_materialises_only_the_requested_range() {
+        const FILE_SIZE: usize = 4 * 1024 * 1024;
+        const READ_SIZE: u32 = 64 * 1024;
+
+        let temp = TempDir::new().unwrap();
+        let (core, node, mut rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let data = core.read(&node, 0, 0, READ_SIZE).await.unwrap();
+        assert_eq!(data.len(), READ_SIZE as usize);
+
+        let (returned, materialised, virtual_dds) = drain_one_read(&mut rx);
+        assert!(
+            !virtual_dds,
+            "a real file on disk is not a virtual DDS tile"
+        );
+        assert_eq!(returned, READ_SIZE as u64);
+        assert_eq!(
+            materialised, returned,
+            "serving {READ_SIZE} bytes must not read {materialised} bytes from a {FILE_SIZE}-byte file"
+        );
+    }
+
+    /// The same guarantee mid-file: seeking must not re-read the prefix.
+    #[tokio::test]
+    async fn passthrough_read_mid_file_does_not_read_the_prefix() {
+        const FILE_SIZE: usize = 1024 * 1024;
+        const OFFSET: u64 = 768 * 1024;
+        const READ_SIZE: u32 = 128 * 1024;
+
+        let temp = TempDir::new().unwrap();
+        let (core, node, mut rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let data = core.read(&node, 0, OFFSET, READ_SIZE).await.unwrap();
+
+        // Content proves the right window was served, not just the right length.
+        assert_eq!(data.len(), READ_SIZE as usize);
+        assert_eq!(data[0], (OFFSET as usize % 256) as u8);
+
+        let (returned, materialised, _) = drain_one_read(&mut rx);
+        assert_eq!(returned, READ_SIZE as u64);
+        assert_eq!(materialised, returned);
+    }
+
+    /// A range that runs off the end returns a short read, not an error.
+    #[tokio::test]
+    async fn passthrough_read_spanning_eof_is_clamped() {
+        const FILE_SIZE: usize = 100_000;
+        const OFFSET: u64 = 90_000;
+
+        let temp = TempDir::new().unwrap();
+        let (core, node, mut rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        let data = core.read(&node, 0, OFFSET, 65536).await.unwrap();
+
+        let expected = FILE_SIZE as u64 - OFFSET;
+        assert_eq!(data.len() as u64, expected);
+
+        let (returned, materialised, _) = drain_one_read(&mut rx);
+        assert_eq!(returned, expected);
+        assert_eq!(materialised, returned);
+    }
+
+    /// Reading at or past EOF returns empty rather than erroring.
+    #[tokio::test]
+    async fn passthrough_read_at_and_past_eof_returns_empty() {
+        const FILE_SIZE: usize = 4096;
+
+        let temp = TempDir::new().unwrap();
+        let (core, node, mut rx) = passthrough_fixture(&temp, FILE_SIZE);
+
+        for offset in [FILE_SIZE as u64, FILE_SIZE as u64 * 4] {
+            let data = core.read(&node, 0, offset, 4096).await.unwrap();
+            assert!(data.is_empty(), "offset {offset} is at or past EOF");
+
+            let (returned, materialised, _) = drain_one_read(&mut rx);
+            assert_eq!(returned, 0);
+            assert_eq!(materialised, 0, "an empty reply must allocate nothing");
+        }
+    }
+
+    // ========================================================================
+    // Lookup semantics: water mask guard (#68), lit passthrough, size upgrades
+    // ========================================================================
+
+    /// X-Plane requests BORDER_TEX water masks as `.dds` first. If a `.png`
+    /// with the same stem exists on disk, the core must report the DDS
+    /// missing so X-Plane falls back to the real PNG water mask instead of
+    /// getting satellite imagery.
+    #[tokio::test]
+    async fn lookup_returns_not_found_for_dds_when_png_water_mask_exists() {
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("eu_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::write(
+            pkg_dir.join("Earth nav data/+40-080/+40-074.dsf"),
+            b"pkg dsf",
+        )
+        .unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        // A PNG water mask (the kind referenced by _sea_overlay.ter BORDER_TEX).
+        std::fs::write(
+            pkg_dir.join("textures/24496_33152_ZL16.png"),
+            b"fake png water mask",
+        )
+        .unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("eu", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (client, _requests) = CountingDdsClient::new();
+        let core = OrthoUnionCore::new(index, client, EXPECTED_DDS_SIZE);
+
+        let err = core
+            .lookup(&textures_dir(), "24496_33152_ZL16.dds")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, FsError::NotFound),
+            "a DDS over an on-disk PNG water mask must be reported missing"
+        );
+    }
+
+    /// The water mask guard must not block normal DDS generation: a DDS name
+    /// with no corresponding PNG on disk still resolves to a generated tile.
+    #[tokio::test]
+    async fn lookup_generates_a_virtual_dds_when_no_png_exists() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+
+        let (node, attrs) = core
+            .lookup(&textures_dir(), "10000_5000_BI16.dds")
+            .await
+            .unwrap();
+        assert!(
+            matches!(node, FsNode::VirtualDds(_)),
+            "no PNG on disk: the DDS is generated, not hidden"
+        );
+        assert_eq!(attrs.size, EXPECTED_DDS_SIZE as u64);
+    }
+
+    /// Lit lookups report the lit source's size; ortho lookups are unchanged.
+    #[tokio::test]
+    async fn lit_lookup_reports_the_minimal_black_size_and_ortho_is_unchanged() {
+        let (core, _requests, _temp) = virtual_dds_fixture();
+
+        let (lit, lit_attrs) = core
+            .lookup(&textures_dir(), "25712_12960_BI16_LIT.dds")
+            .await
+            .unwrap();
+        assert!(matches!(lit, FsNode::VirtualDds(_)));
+        assert_eq!(lit_attrs.size, 152);
+
+        let (ortho, ortho_attrs) = core
+            .lookup(&textures_dir(), "25712_12960_BI16.dds")
+            .await
+            .unwrap();
+        assert!(matches!(ortho, FsNode::VirtualDds(_)));
+        assert_eq!(
+            ortho_attrs.size, EXPECTED_DDS_SIZE as u64,
+            "ortho unchanged"
+        );
+    }
+
+    /// Lit textures come from the lit source alone: no executor, no
+    /// memoising handle, and the black payload is exactly the minimal DDS.
+    #[tokio::test]
+    async fn lit_read_serves_black_without_touching_the_executor() {
+        let (core, requests, _temp) = virtual_dds_fixture();
+        let node = lit_node();
+
+        let fh = core.open(&node);
+        assert_eq!(fh, 0, "lit files hold no memoising handle");
+        assert!(core.dds_handles().is_empty());
+
+        let data = core.read(&node, fh, 0, 1 << 20).await.unwrap();
+        assert_eq!(data, minimal_black_dds());
+        assert_eq!(requests.load(Ordering::SeqCst), 0, "no DDS request");
+    }
+
+    /// A lit file on disk in a source wins over the virtual black texture.
+    #[tokio::test]
+    async fn real_lit_file_on_disk_wins_over_the_virtual_lit_texture() {
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        std::fs::create_dir_all(pkg_dir.join("Earth nav data/+40-080")).unwrap();
+        std::fs::create_dir_all(pkg_dir.join("textures")).unwrap();
+        std::fs::write(pkg_dir.join("textures/25712_12960_BI16_LIT.dds"), [7u8; 10]).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (client, _requests) = CountingDdsClient::new();
+        let core = OrthoUnionCore::new(index, client, EXPECTED_DDS_SIZE);
+
+        let (node, attrs) = core
+            .lookup(&textures_dir(), "25712_12960_BI16_LIT.dds")
+            .await
+            .unwrap();
+        assert!(
+            matches!(node, FsNode::RealFile(_)),
+            "the real file on disk, not the virtual texture"
+        );
+        assert_eq!(
+            attrs.size, 10,
+            "the real file's size, not the 152-byte black"
+        );
+    }
+
+    /// The lit source is injectable: size and reads come from the source.
+    #[tokio::test]
+    async fn lit_source_is_injectable() {
+        struct Fixed;
+        impl LitTextureSource for Fixed {
+            fn size<'a>(&'a self, _n: &'a DdsFilename) -> futures::future::BoxFuture<'a, u64> {
+                Box::pin(async { 1000 })
+            }
+            fn read<'a>(
+                &'a self,
+                _n: &'a DdsFilename,
+                _o: u64,
+                _l: u32,
+            ) -> futures::future::BoxFuture<'a, Bytes> {
+                Box::pin(async { Bytes::from_static(b"lit") })
+            }
+        }
+
+        let (core, _requests, _temp) = virtual_dds_fixture();
+        let core = core.with_lit_source(Arc::new(Fixed));
+
+        let (node, attrs) = core
+            .lookup(&textures_dir(), "25712_12960_BI16_LIT.dds")
+            .await
+            .unwrap();
+        assert_eq!(attrs.size, 1000);
+        let data = core.read(&node, 0, 0, 16).await.unwrap();
+        assert_eq!(&data[..], b"lit");
+    }
+
+    /// `list_directory` stays I/O-free (placeholder file sizes), and the
+    /// upgrade path the backends use for `readdirplus`/`ReadDirectory`
+    /// (`attrs`) reports real file sizes -- accurate sizes are what DSF and
+    /// other passthrough files need reported to X-Plane.
+    ///
+    /// Regression: readdirplus once used the virtual DDS size (~11 MB) for
+    /// every non-directory entry, so X-Plane read DSF files based on a
+    /// wrong size and hit dsf_ErrMissingAtom crashes.
+    #[tokio::test]
+    async fn directory_listing_upgrades_file_sizes_to_real_metadata() {
+        let temp = TempDir::new().unwrap();
+        let pkg_dir = temp.path().join("test_ortho");
+        let dsf_dir = pkg_dir.join("Earth nav data/+40-080");
+        std::fs::create_dir_all(&dsf_dir).unwrap();
+
+        let dsf_content = b"this is fake dsf content!!";
+        std::fs::write(dsf_dir.join("+40-074.dsf"), dsf_content).unwrap();
+
+        let pkg = InstalledPackage::new(
+            Package::new("test", PackageType::Ortho, Version::new(1, 0, 0)),
+            &pkg_dir,
+        );
+        let index = OrthoUnionIndexBuilder::new()
+            .add_package(pkg)
+            .build()
+            .unwrap();
+
+        let (client, _requests) = CountingDdsClient::new();
+        let core = OrthoUnionCore::new(index, client, EXPECTED_DDS_SIZE);
+
+        let dir = FsNode::Directory(PathBuf::from("Earth nav data/+40-080"));
+        let entries = core.list_directory(&dir).await.unwrap();
+
+        let dsf = entries
+            .iter()
+            .find(|e| e.name.ends_with(".dsf"))
+            .expect("DSF file should be in the listing");
+
+        // The listing itself is I/O-free: file entries carry placeholders.
+        assert_eq!(dsf.attrs.size, EXPECTED_DDS_SIZE as u64);
+
+        // The upgrade reports the real size, not the virtual DDS size.
+        let real = core.attrs(&dsf.node).await.unwrap();
+        assert_eq!(
+            real.size,
+            dsf_content.len() as u64,
+            "DSF size must be the on-disk size, not the virtual DDS size"
+        );
+        assert_ne!(real.size, EXPECTED_DDS_SIZE as u64);
+    }
+}
