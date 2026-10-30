@@ -37,17 +37,18 @@
 //! missing textures dynamically using its configured imagery provider.
 
 use super::inode::InodeManager;
-use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
+use super::shared::{to_file_attr, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
+use crate::fuse::support::attrs::{FileAttributes, NodeKind};
 use crate::fuse::support::core::OrthoUnionCore;
-use crate::fuse::{parse_dds_filename, DdsFilename, TextureKind};
+use crate::fuse::support::error::FsError;
+use crate::fuse::support::node::FsNode;
 use crate::geo_index::GeoIndex;
 use crate::night::LitTextureSource;
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use bytes::Bytes;
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -57,14 +58,11 @@ use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
 use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
-use std::io::SeekFrom;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
-use tokio::fs;
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
-use tracing::{debug, trace, warn, Instrument};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, trace};
 
 /// FUSE open flag: bypass kernel page cache for this file.
 ///
@@ -144,7 +142,59 @@ pub struct Fuse3OrthoUnionFS {
     fuse_congestion_threshold: Option<u16>,
 }
 
+// =============================================================================
+// Adapter-side seam mappers (FUSE identity, ownership, and error policy)
+// =============================================================================
+
+/// Map the core's neutral error onto FUSE's (windows-backend-split.md §4.3).
+fn errno_from(err: FsError) -> Errno {
+    match err {
+        FsError::NotFound => Errno::from(libc::ENOENT),
+        FsError::NotADirectory => Errno::from(libc::ENOTDIR),
+        FsError::Io(_) => Errno::from(libc::EIO),
+    }
+}
+
+/// Whether a resolved core node is a real file of the union, as opposed to
+/// a virtual directory or a generated texture.
+fn is_real_file(node: &FsNode, attrs: &FileAttributes) -> bool {
+    matches!(node, FsNode::RealFile(_)) && attrs.kind != NodeKind::Directory
+}
+
+/// Apply the adapter's identity and time policy to a core node's neutral
+/// attributes (windows-backend-split.md §4.5): real files keep the
+/// source's uid/gid and report `UNIX_EPOCH` as `ctime`; everything else
+/// (virtual directories, generated textures, and file entries whose
+/// metadata could not be read) is owned by the mounting process and
+/// reports the current time.
+fn file_attr(ino: u64, real_file: bool, attrs: &FileAttributes) -> FileAttr {
+    if real_file {
+        to_file_attr(ino, attrs, UNIX_EPOCH, attrs.uid, attrs.gid)
+    } else {
+        to_file_attr(
+            ino,
+            attrs,
+            SystemTime::now(),
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
+    }
+}
+
 impl Fuse3OrthoUnionFS {
+    /// Map a neutral core node onto the FUSE inode that represents it.
+    fn inode_for(&self, node: &FsNode) -> u64 {
+        match node {
+            FsNode::VirtualDds(coords) => self.inode_manager.create_virtual_inode(coords.clone()),
+            // Root is always inode 1.
+            FsNode::Directory(p) if p.as_os_str().is_empty() => 1,
+            _ => {
+                let path = node.path().expect("Directory/RealFile nodes carry a path");
+                self.inode_manager.get_or_create_inode(path)
+            }
+        }
+    }
+
     /// Create a new consolidated ortho union filesystem.
     ///
     /// # Arguments
@@ -214,38 +264,6 @@ impl Fuse3OrthoUnionFS {
     pub fn with_lit_source(mut self, source: Arc<dyn LitTextureSource>) -> Self {
         self.core = self.core.with_lit_source(source);
         self
-    }
-
-    /// Attributes for any virtual DDS, by kind.
-    ///
-    /// The core computes the neutral attributes (including the lit source's
-    /// size for lit textures); this adapter maps them onto `FileAttr`, adding
-    /// the inode number and the macOS-only fields.
-    async fn virtual_attr_for(&self, ino: u64, coords: &DdsFilename) -> FileAttr {
-        let attrs = self.core.virtual_attrs_for(coords).await;
-        let now = SystemTime::now().into();
-
-        FileAttr {
-            ino,
-            size: attrs.size,
-            blocks: attrs.blocks,
-            atime: attrs.atime.into(),
-            mtime: attrs.mtime.into(),
-            ctime: now,
-            kind: FileType::RegularFile,
-            perm: attrs.perm,
-            nlink: attrs.nlink,
-            uid: unsafe { libc::getuid() },
-            gid: unsafe { libc::getgid() },
-            rdev: attrs.rdev,
-            blksize: attrs.blksize,
-            // macFUSE's FileAttr carries the macOS-only creation time and
-            // BSD file flags. Mirror ctime for crtime; we expose no flags.
-            #[cfg(target_os = "macos")]
-            crtime: now,
-            #[cfg(target_os = "macos")]
-            flags: 0,
-        }
     }
 
     /// Set the timeout for DDS generation.
@@ -477,92 +495,31 @@ impl Filesystem for Fuse3OrthoUnionFS {
     ) -> Fuse3InternalResult<ReplyEntry> {
         trace!(parent = parent, name = ?name, "fuse3 ortho union: lookup");
 
-        // Get parent path (virtual path)
-        let parent_path = if parent == 1 {
-            PathBuf::new() // Root
+        let parent_node = if parent == 1 {
+            FsNode::root()
         } else {
-            self.inode_manager
+            let path = self
+                .inode_manager
                 .get_path(parent)
-                .ok_or(Errno::from(libc::ENOENT))?
+                .ok_or(Errno::from(libc::ENOENT))?;
+            FsNode::Directory(path)
         };
 
-        let child_path = parent_path.join(name);
+        // Resolution order, the water-mask guard and all are the core's
+        // business (windows-backend-split.md §4.4).
         let name_str = name.to_string_lossy();
+        let (node, attrs) = self
+            .core
+            .lookup(&parent_node, &name_str)
+            .await
+            .map_err(errno_from)?;
+        let inode = self.inode_for(&node);
 
-        // Check if this path exists in the union index
-        if let Some(source) = self.core.index().resolve(&child_path) {
-            // Real file from a source
-            if let Ok(metadata) = fs::metadata(&source.real_path).await {
-                let inode = self.inode_manager.get_or_create_inode(&child_path);
-                let attr = self.metadata_to_attr(inode, &metadata);
-                return Ok(ReplyEntry {
-                    ttl: TTL,
-                    attr,
-                    generation: 0,
-                });
-            }
-        }
-
-        // Check if it's a virtual directory in the union
-        if self.core.index().is_directory(&child_path) {
-            let inode = self.inode_manager.get_or_create_inode(&child_path);
-            let attr = self.virtual_dir_attr(inode);
-            return Ok(ReplyEntry {
-                ttl: TTL,
-                attr,
-                generation: 0,
-            });
-        }
-
-        // Try lazy resolution for terrain/textures directories
-        // These directories are not fully scanned at startup for performance,
-        // so we resolve files on-demand by checking the real filesystem.
-        //
-        // Geospatial filtering: In patch-owned regions, only patch sources are
-        // searched — package files are invisible. This prevents X-Plane from
-        // discovering package terrain that references DDS files we won't generate.
-        if let Some(real_path) = self.core.resolve_lazy_geo(&child_path, &name_str) {
-            if let Ok(metadata) = fs::metadata(&real_path).await {
-                let inode = self.inode_manager.get_or_create_inode(&child_path);
-                let attr = self.metadata_to_attr(inode, &metadata);
-                return Ok(ReplyEntry {
-                    ttl: TTL,
-                    attr,
-                    generation: 0,
-                });
-            }
-        }
-
-        // Check if it's a DDS file we can generate.
-        //
-        // In patched regions, patch DDS files are served via resolve_lazy_geo() above
-        // (passthrough from the patch source). If we reach here, no source has this DDS
-        // on disk — generate it. This handles boundary cases where package `.ter` files
-        // reference DDS textures the patch doesn't provide (different naming convention).
-        if name_str.ends_with(".dds") {
-            // Water mask guard (#68): X-Plane requests BORDER_TEX as .dds first,
-            // but the actual water mask is a .png on disk. If we generate a virtual
-            // DDS, X-Plane gets satellite imagery instead of the alpha mask. Return
-            // ENOENT so X-Plane falls back to the .png via lazy resolution.
-            let png_name = name_str.replace(".dds", ".png");
-            let png_path = parent_path.join(&*png_name);
-            if self.core.resolve_lazy_geo(&png_path, &png_name).is_some() {
-                trace!(file = %name_str, "Water mask PNG exists, skipping DDS generation");
-                return Err(Errno::from(libc::ENOENT));
-            }
-
-            if let Ok(coords) = parse_dds_filename(&name_str) {
-                let inode = self.inode_manager.create_virtual_inode(coords.clone());
-                let attr = self.virtual_attr_for(inode, &coords).await;
-                return Ok(ReplyEntry {
-                    ttl: TTL,
-                    attr,
-                    generation: 0,
-                });
-            }
-        }
-
-        Err(Errno::from(libc::ENOENT))
+        Ok(ReplyEntry {
+            ttl: TTL,
+            attr: file_attr(inode, is_real_file(&node, &attrs), &attrs),
+            generation: 0,
+        })
     }
 
     async fn getattr(
@@ -574,58 +531,31 @@ impl Filesystem for Fuse3OrthoUnionFS {
     ) -> Fuse3InternalResult<ReplyAttr> {
         trace!(ino = ino, "fuse3 ortho union: getattr");
 
-        // Root inode
-        if ino == 1 {
-            return Ok(ReplyAttr {
-                ttl: TTL,
-                attr: self.root_dir_attr(),
-            });
-        }
+        let node = if ino == 1 {
+            FsNode::root()
+        } else if InodeManager::is_virtual_inode(ino) {
+            let coords = self
+                .inode_manager
+                .get_virtual_dds(ino)
+                .ok_or(Errno::from(libc::ENOENT))?;
+            FsNode::VirtualDds(coords)
+        } else {
+            // Path inodes: the kernel also addresses directory inodes as
+            // paths, so this is RealFile for both; the core's attrs() sorts
+            // directory vs. file out, as the op always did.
+            let path = self
+                .inode_manager
+                .get_path(ino)
+                .ok_or(Errno::from(libc::ENOENT))?;
+            FsNode::RealFile(path)
+        };
 
-        // Virtual DDS inode
-        if InodeManager::is_virtual_inode(ino) {
-            if let Some(coords) = self.inode_manager.get_virtual_dds(ino) {
-                let attr = self.virtual_attr_for(ino, &coords).await;
-                return Ok(ReplyAttr { ttl: TTL, attr });
-            }
-            return Err(Errno::from(libc::ENOENT));
-        }
+        let attrs = self.core.attrs(&node).await.map_err(errno_from)?;
 
-        // Real file or virtual directory
-        let virtual_path = self
-            .inode_manager
-            .get_path(ino)
-            .ok_or(Errno::from(libc::ENOENT))?;
-
-        // Check if it's a directory in the union
-        if self.core.index().is_directory(&virtual_path) {
-            let attr = self.virtual_dir_attr(ino);
-            return Ok(ReplyAttr { ttl: TTL, attr });
-        }
-
-        // Must be a real file - try index lookup first
-        if let Some(source) = self.core.index().resolve(&virtual_path) {
-            let metadata = fs::metadata(&source.real_path)
-                .await
-                .map_err(|_| Errno::from(libc::ENOENT))?;
-            let attr = self.metadata_to_attr(ino, &metadata);
-            return Ok(ReplyAttr { ttl: TTL, attr });
-        }
-
-        // Try lazy resolution for terrain/textures directories (geospatial-aware)
-        let filename = virtual_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
-        if let Some(real_path) = self.core.resolve_lazy_geo(&virtual_path, filename) {
-            let metadata = fs::metadata(&real_path)
-                .await
-                .map_err(|_| Errno::from(libc::ENOENT))?;
-            let attr = self.metadata_to_attr(ino, &metadata);
-            return Ok(ReplyAttr { ttl: TTL, attr });
-        }
-
-        Err(Errno::from(libc::ENOENT))
+        Ok(ReplyAttr {
+            ttl: TTL,
+            attr: file_attr(ino, is_real_file(&node, &attrs), &attrs),
+        })
     }
 
     async fn read(
@@ -643,126 +573,27 @@ impl Filesystem for Fuse3OrthoUnionFS {
             "fuse3 ortho union: read"
         );
 
-        // Virtual DDS file - generate on demand
-        if InodeManager::is_virtual_inode(ino) {
+        let node = if InodeManager::is_virtual_inode(ino) {
             let coords = self
                 .inode_manager
                 .get_virtual_dds(ino)
                 .ok_or(Errno::from(libc::ENOENT))?;
-
-            // Lit textures come from the lit source alone: no executor, no
-            // memoising handle, no DDS read metrics.
-            if coords.kind == TextureKind::Lit {
-                let data = self.core.lit_source().read(&coords, offset, size).await;
-                return Ok(ReplyData { data });
-            }
-
-            let fuse_read_span = tracing::debug_span!(target: "profiling", "fuse_read", ino = ino, offset = offset, size = size,);
-
-            // Resolve the tile once per open. The kernel splits one X-Plane
-            // texture read into 12-23 ranged calls (1 MiB ceiling), and this
-            // branch used to re-enter the executor on every one of them.
-            let handle = self.core.dds_handles().get(&fh).map(|h| Arc::clone(&h));
-
-            let tile = match handle {
-                Some(handle) => handle
-                    .tile
-                    .get_or_init(|| async {
-                        let data = self.core.resolve_tile(&handle.coords).await;
-                        self.core.pinned().pin(data.len() as u64);
-                        // Report here, not at open(): the tile is produced
-                        // on first read, so a gauge sampled only at open
-                        // would never see the bytes it is meant to bound.
-                        self.core.report_handle_gauge();
-                        data
-                    })
-                    .instrument(fuse_read_span)
-                    .await
-                    .clone(),
-                // No handle: either the memoisation budget was exhausted at
-                // open() time, or the kernel sent a read we cannot attribute.
-                // Serve it the old way rather than fail -- a missing handle
-                // must never become a black texture.
-                None => {
-                    self.core
-                        .resolve_tile(&coords)
-                        .instrument(fuse_read_span)
-                        .await
-                }
-            };
-
-            let offset = offset as usize;
-            let size = size as usize;
-
-            let end = std::cmp::min(offset.saturating_add(size), tile.len());
-            // Refcount, not memcpy: the reply borrows the tile's allocation and
-            // the kernel gets its window without one byte being copied (#237).
-            let slice = if offset < end {
-                tile.slice(offset..end)
-            } else {
-                Bytes::new()
-            };
-
-            // The handler obtains exactly what it returns. The tile is produced
-            // whole by the generation pipeline, which this counter does not --
-            // and should not -- charge to the read path, so the ratio is 1.0
-            // when delivery is zero-copy and climbs the moment it is not.
-            self.core
-                .record_read(slice.len() as u64, slice.len() as u64, true);
-
-            return Ok(ReplyData { data: slice });
-        }
-
-        // Real file from union index
-        let virtual_path = self
-            .inode_manager
-            .get_path(ino)
-            .ok_or(Errno::from(libc::ENOENT))?;
-
-        // Try to resolve the real path - first from index, then lazy (geospatial-aware)
-        let filename = virtual_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .unwrap_or("");
-        let real_path = if let Some(source) = self.core.index().resolve(&virtual_path) {
-            source.real_path.clone()
-        } else if let Some(lazy_path) = self.core.resolve_lazy_geo(&virtual_path, filename) {
-            lazy_path
+            FsNode::VirtualDds(coords)
         } else {
-            return Err(Errno::from(libc::ENOENT));
+            let path = self
+                .inode_manager
+                .get_path(ino)
+                .ok_or(Errno::from(libc::ENOENT))?;
+            FsNode::RealFile(path)
         };
 
-        // Acquire disk I/O permit
-        let _permit = self.core.disk_io_limiter().acquire().await;
-
-        // Read only the requested window. The kernel caps each FUSE read at
-        // max_pages * PAGE_SIZE (1 MiB on Linux), so reading the whole file
-        // here would move it once per call -- 238x for the largest installed
-        // ortho DSF. See #233.
-        let mut file = fs::File::open(&real_path)
+        let data = self
+            .core
+            .read(&node, fh, offset, size)
             .await
-            .map_err(|_| Errno::from(libc::EIO))?;
-        file.seek(SeekFrom::Start(offset))
-            .await
-            .map_err(|_| Errno::from(libc::EIO))?;
+            .map_err(errno_from)?;
 
-        // `take` bounds the read at `size`; `read_to_end` stops early at EOF,
-        // which is how a range spanning the end becomes a short read.
-        let mut buf = Vec::with_capacity(size as usize);
-        (&mut file)
-            .take(size as u64)
-            .read_to_end(&mut buf)
-            .await
-            .map_err(|_| Errno::from(libc::EIO))?;
-
-        // Seeking past EOF is legal and yields nothing, so this also covers
-        // the at-or-past-EOF case without a separate branch.
-        self.core
-            .record_read(buf.len() as u64, buf.len() as u64, false);
-
-        Ok(ReplyData {
-            data: Bytes::from(buf),
-        })
+        Ok(ReplyData { data })
     }
 
     async fn readdir(
@@ -776,73 +607,43 @@ impl Filesystem for Fuse3OrthoUnionFS {
     > {
         tracing::debug!(ino = ino, offset = offset, "FUSE readdir called");
 
-        // Get virtual path for this directory
-        let virtual_path = if ino == 1 {
-            PathBuf::new()
+        let dir_node = if ino == 1 {
+            FsNode::root()
         } else {
-            self.inode_manager
+            let path = self
+                .inode_manager
                 .get_path(ino)
-                .ok_or(Errno::from(libc::ENOENT))?
+                .ok_or(Errno::from(libc::ENOENT))?;
+            FsNode::Directory(path)
         };
 
-        // Verify it's a directory
-        if ino != 1 && !self.core.index().is_directory(&virtual_path) {
-            return Err(Errno::from(libc::ENOTDIR));
-        }
+        let entries = self
+            .core
+            .list_directory(&dir_node)
+            .await
+            .map_err(errno_from)?;
 
-        let mut entries: Vec<DirectoryEntry> = Vec::new();
-
-        // Add . and ..
-        entries.push(DirectoryEntry {
-            inode: ino,
-            kind: FileType::Directory,
-            name: OsString::from("."),
-            offset: 1,
-        });
-
-        // Parent inode
-        let parent_inode = if ino == 1 {
-            1 // Root's parent is itself
-        } else if let Some(parent) = virtual_path.parent() {
-            if parent.as_os_str().is_empty() {
-                1 // Parent is root
-            } else {
-                self.inode_manager.get_inode(parent).unwrap_or(1)
-            }
-        } else {
-            1
-        };
-
-        entries.push(DirectoryEntry {
-            inode: parent_inode,
-            kind: FileType::Directory,
-            name: OsString::from(".."),
-            offset: 2,
-        });
-
-        // Get entries from union index
-        for (entry_offset, dir_entry) in
-            (3i64..).zip(self.core.index().list_directory(&virtual_path))
-        {
-            let child_path = virtual_path.join(&dir_entry.name);
-            let entry_inode = self.inode_manager.get_or_create_inode(&child_path);
-
-            let kind = if dir_entry.is_dir {
-                FileType::Directory
-            } else {
-                FileType::RegularFile
-            };
-
-            entries.push(DirectoryEntry {
-                inode: entry_inode,
-                kind,
-                name: dir_entry.name.clone(),
-                offset: entry_offset,
-            });
-        }
-
-        // Skip entries based on offset
-        let entries: Vec<_> = entries.into_iter().skip(offset as usize).map(Ok).collect();
+        // An entry's offset is its 1-based position in the full list, so a
+        // re-read at the offset resumes where the previous read stopped.
+        // Plain readdir stays I/O-free: file entries' placeholder attrs are
+        // never sent, only name/kind/inode/offset are.
+        let entries: Vec<_> = entries
+            .into_iter()
+            .enumerate()
+            .skip(offset as usize)
+            .map(|(index, entry)| {
+                Ok(DirectoryEntry {
+                    inode: self.inode_for(&entry.node),
+                    kind: if entry.is_dir {
+                        FileType::Directory
+                    } else {
+                        FileType::RegularFile
+                    },
+                    name: OsString::from(entry.name),
+                    offset: (index + 1) as i64,
+                })
+            })
+            .collect();
 
         Ok(ReplyDirectory {
             entries: stream::iter(entries).boxed(),
@@ -861,94 +662,51 @@ impl Filesystem for Fuse3OrthoUnionFS {
     > {
         tracing::debug!(ino = ino, offset = offset, "FUSE readdirplus called");
 
-        // Get virtual path for this directory
-        let virtual_path = if ino == 1 {
-            PathBuf::new()
+        let dir_node = if ino == 1 {
+            FsNode::root()
         } else {
-            self.inode_manager
+            let path = self
+                .inode_manager
                 .get_path(ino)
-                .ok_or(Errno::from(libc::ENOENT))?
+                .ok_or(Errno::from(libc::ENOENT))?;
+            FsNode::Directory(path)
         };
 
-        // Verify it's a directory
-        if ino != 1 && !self.core.index().is_directory(&virtual_path) {
-            return Err(Errno::from(libc::ENOTDIR));
-        }
+        let dir_entries = self
+            .core
+            .list_directory(&dir_node)
+            .await
+            .map_err(errno_from)?;
 
-        let mut entries: Vec<DirectoryEntryPlus> = Vec::new();
-
-        // Add . entry
-        entries.push(DirectoryEntryPlus {
-            inode: ino,
-            generation: 0,
-            kind: FileType::Directory,
-            name: OsString::from("."),
-            offset: 1,
-            attr: self.virtual_dir_attr(ino),
-            entry_ttl: TTL,
-            attr_ttl: TTL,
-        });
-
-        // Parent inode for ..
-        let parent_inode = if ino == 1 {
-            1 // Root's parent is itself
-        } else if let Some(parent) = virtual_path.parent() {
-            if parent.as_os_str().is_empty() {
-                1 // Parent is root
+        // File entries arrive with placeholder attributes; readdirplus is
+        // the one op that upgrades them to real metadata -- accurate sizes
+        // are what DSF and other passthrough files need reported to
+        // X-Plane. Plain readdir above stays I/O-free, as it always did.
+        let mut entries: Vec<DirectoryEntryPlus> = Vec::with_capacity(dir_entries.len());
+        for (index, entry) in dir_entries.into_iter().enumerate() {
+            let inode = self.inode_for(&entry.node);
+            let (attrs, real_file) = if entry.is_dir {
+                (entry.attrs, false)
             } else {
-                self.inode_manager.get_inode(parent).unwrap_or(1)
-            }
-        } else {
-            1
-        };
-
-        entries.push(DirectoryEntryPlus {
-            inode: parent_inode,
-            generation: 0,
-            kind: FileType::Directory,
-            name: OsString::from(".."),
-            offset: 2,
-            attr: self.virtual_dir_attr(parent_inode),
-            entry_ttl: TTL,
-            attr_ttl: TTL,
-        });
-
-        // Get entries from union index
-        for (entry_offset, dir_entry) in
-            (3i64..).zip(self.core.index().list_directory(&virtual_path))
-        {
-            let child_path = virtual_path.join(&dir_entry.name);
-            let entry_inode = self.inode_manager.get_or_create_inode(&child_path);
-
-            let (kind, attr) = if dir_entry.is_dir {
-                (FileType::Directory, self.virtual_dir_attr(entry_inode))
-            } else {
-                // For real files, get actual metadata from the source path
-                // This is critical for DSF and other passthrough files that need
-                // accurate file sizes reported to X-Plane
-                if let Some(source) = self.core.index().resolve(&child_path) {
-                    if let Ok(metadata) = fs::metadata(&source.real_path).await {
-                        (
-                            FileType::RegularFile,
-                            self.metadata_to_attr(entry_inode, &metadata),
-                        )
-                    } else {
-                        // Fallback if metadata read fails
-                        (FileType::RegularFile, self.virtual_dds_attr(entry_inode))
-                    }
-                } else {
-                    // Entry not in index (shouldn't happen for list_directory entries)
-                    (FileType::RegularFile, self.virtual_dds_attr(entry_inode))
+                match self.core.attrs(&entry.node).await {
+                    Ok(real_attrs) => (real_attrs, true),
+                    // Fallback if metadata read fails: the placeholder, with
+                    // the virtual policy, as before.
+                    Err(_) => (entry.attrs, false),
                 }
             };
 
             entries.push(DirectoryEntryPlus {
-                inode: entry_inode,
+                inode,
                 generation: 0,
-                kind,
-                name: dir_entry.name.clone(),
-                offset: entry_offset,
-                attr,
+                kind: if entry.is_dir {
+                    FileType::Directory
+                } else {
+                    FileType::RegularFile
+                },
+                name: OsString::from(entry.name),
+                offset: (index + 1) as i64,
+                attr: file_attr(inode, real_file, &attrs),
                 entry_ttl: TTL,
                 attr_ttl: TTL,
             });
@@ -970,63 +728,18 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Virtual DDS files: bypass the kernel page cache so every read()
         // reaches this handler (see VIRTUAL_DDS_OPEN_FLAGS).
-        //
-        // Allocate a handle so the tile is produced once and every later read
-        // slices it. The tile itself is NOT produced here: generation can take
-        // up to the configured timeout, and X-Plane may open a file it never
-        // reads. First read pays, as it always did.
-        // An inode we cannot map to a tile gets no handle rather than an error:
-        // open() used to succeed for any virtual inode, and read() is where a
-        // genuinely unknown one becomes ENOENT. Failing here instead would turn
-        // any gap in the inode map into a failed open.
         let Some(coords) = self.inode_manager.get_virtual_dds(inode) else {
+            // An inode we cannot map to a tile gets no handle rather than an
+            // error: read() is where a genuinely unknown one becomes ENOENT.
             return Ok(ReplyOpen {
                 fh: 0,
                 flags: VIRTUAL_DDS_OPEN_FLAGS,
             });
         };
 
-        // Lit textures are small or served by range from their source; they
-        // pin nothing and need no handle. Same flags, so Linux reads bypass
-        // the page cache and a size change can never be served stale.
-        if coords.kind == TextureKind::Lit {
-            return Ok(ReplyOpen {
-                fh: 0,
-                flags: VIRTUAL_DDS_OPEN_FLAGS,
-            });
-        }
-
-        // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
-        // resolve per call, which is slower but correct.
-        let expected = self.core.virtual_dds_config().size();
-        if self.core.pinned().would_exceed(expected) {
-            // Count every refusal: this is what lets a flight log tell "the
-            // cap engaged" from "the #234 fix stopped working", which look
-            // identical otherwise -- both show fuse_dds_alloc_mb climbing.
-            if let Some(metrics) = self.core.metrics_client() {
-                metrics.fuse_handle_budget_exhausted();
-            }
-            // Warn once, at default level. Before #236 this was debug-only, so
-            // the degradation was invisible on an ordinary flight.
-            if self.core.claim_budget_warning() {
-                warn!(
-                    pinned_mb = self.core.pinned().pinned_bytes() / (1024 * 1024),
-                    cap_mb = self.core.pinned().ceiling_bytes() / (1024 * 1024),
-                    open_handles = self.core.dds_handles().len(),
-                    "DDS handle budget exhausted - serving opens without memoisation. \
-                     Reads now resolve their tile once per call. Further occurrences \
-                     are counted in dds_budget_exhausted on the Memory sample line."
-                );
-            }
-            return Ok(ReplyOpen {
-                fh: 0,
-                flags: VIRTUAL_DDS_OPEN_FLAGS,
-            });
-        }
-
-        let fh = self.core.new_dds_handle(coords);
-
-        self.core.report_handle_gauge();
+        // Handle allocation -- lit-source passthrough, the pinned-bytes budget
+        // refusal, and the gauges around them -- is the core's business.
+        let fh = self.core.open(&FsNode::VirtualDds(coords));
 
         Ok(ReplyOpen {
             fh,
@@ -1043,14 +756,9 @@ impl Filesystem for Fuse3OrthoUnionFS {
         _lock_owner: u64,
         _flush: bool,
     ) -> Fuse3InternalResult<()> {
-        // Drop the memoised tile. Without this every open file would pin
+        // Drop the memoised tile; without this every open file would pin
         // 11.17 MB for the life of the mount.
-        if let Some((_, handle)) = self.core.dds_handles().remove(&fh) {
-            if let Some(tile) = handle.tile.get() {
-                self.core.pinned().release(tile.len() as u64);
-            }
-            self.core.report_handle_gauge();
-        }
+        self.core.release(fh);
         Ok(())
     }
 
@@ -1090,15 +798,16 @@ impl Filesystem for Fuse3OrthoUnionFS {
     }
 
     async fn statfs(&self, _req: Request, _ino: u64) -> Fuse3InternalResult<ReplyStatFs> {
+        let stats = self.core.statfs();
         Ok(ReplyStatFs {
-            blocks: 1000000,
-            bfree: 0,
-            bavail: 0,
-            files: self.core.index().file_count() as u64,
-            ffree: 0,
-            bsize: 4096,
-            namelen: 255,
-            frsize: 4096,
+            blocks: stats.blocks,
+            bfree: stats.bfree,
+            bavail: stats.bavail,
+            files: stats.files,
+            ffree: stats.ffree,
+            bsize: stats.bsize,
+            namelen: stats.namelen,
+            frsize: stats.frsize,
         })
     }
 }
@@ -1109,8 +818,10 @@ mod tests {
     use super::*;
     use crate::coord::TileCoord;
     use crate::executor::{DdsClientError, Priority};
+    use crate::fuse::support::requestor::DdsRequestor;
     use crate::ortho_union::OrthoUnionIndexBuilder;
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
+    use bytes::Bytes;
     use semver::Version;
     use std::sync::Arc;
     use tempfile::TempDir;

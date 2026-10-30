@@ -14,17 +14,25 @@
 
 use bytes::Bytes;
 use dashmap::DashMap;
+use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::OnceCell;
-use tracing::debug;
+use tracing::{debug, warn, Instrument};
 
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::support::attrs::{virtual_dds_attrs, FileAttributes, VirtualDdsConfig};
+use crate::fuse::support::attrs::{
+    attrs_from_metadata, root_dir_attrs, virtual_dds_attrs, virtual_dir_attrs, DirEntry,
+    FileAttributes, StatFsInfo, VirtualDdsConfig,
+};
+use crate::fuse::support::error::FsError;
+use crate::fuse::support::node::FsNode;
 use crate::fuse::support::requestor::DdsRequestor;
 use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use crate::geo_index::GeoIndex;
@@ -263,12 +271,12 @@ impl OrthoUnionCore {
         &self.pinned
     }
 
-    /// The lit texture source.
-    pub fn lit_source(&self) -> &Arc<dyn LitTextureSource> {
-        &self.lit_source
-    }
-
     /// Per-open virtual-DDS handle state, keyed by file handle.
+    ///
+    /// The core ops drive the map directly; this accessor is the white-box
+    /// surface the adapter's tests use to inspect a live tile (e.g. the
+    /// zero-copy read test), so it has no production caller yet.
+    #[allow(dead_code)]
     pub fn dds_handles(&self) -> &DashMap<u64, Arc<DdsHandle>> {
         &self.dds_handles
     }
@@ -433,6 +441,405 @@ impl OrthoUnionCore {
     pub fn record_read(&self, returned: u64, materialised: u64, virtual_dds: bool) {
         if let Some(metrics) = &self.metrics_client {
             metrics.fuse_read(returned, materialised, virtual_dds);
+        }
+    }
+
+    // =========================================================================
+    // Neutral ops: every backend (FUSE today, WinFSP in Phase 2) calls
+    // exactly these. See windows-backend-split.md §3.4 and §4.4.
+    // =========================================================================
+
+    /// Resolve `name` inside the directory `parent` of the union view.
+    ///
+    /// Resolution order, exactly as the FUSE `lookup` op has always done it:
+    ///
+    /// 1. a real file in the union index (a metadata failure falls through,
+    ///    it is not an error);
+    /// 2. a virtual directory of the union;
+    /// 3. lazy geospatial resolution — in patch-owned regions only patch
+    ///    sources are searched, so package files that reference DDS we will
+    ///    not generate stay invisible (#68 lineage);
+    /// 4. a texture we can generate. The water-mask guard (#68) runs here:
+    ///    when the real file is a `.png` on disk, the `.dds` name is
+    ///    reported missing so X-Plane falls back to the PNG via lazy
+    ///    resolution instead of getting satellite imagery.
+    ///
+    /// `name` is the kernel's lossy-UTF-8 view of the entry name; joining
+    /// and parsing it here is the same lossy path the adapter used to take.
+    pub async fn lookup(
+        &self,
+        parent: &FsNode,
+        name: &str,
+    ) -> Result<(FsNode, FileAttributes), FsError> {
+        let parent_path = match parent {
+            FsNode::Directory(p) => p.clone(),
+            _ => return Err(FsError::NotADirectory),
+        };
+        let child_path = parent_path.join(name);
+
+        // 1. Real file from a source.
+        if let Some(source) = self.index.resolve(&child_path) {
+            if let Ok(metadata) = fs::metadata(&source.real_path).await {
+                return Ok((FsNode::RealFile(child_path), attrs_from_metadata(&metadata)));
+            }
+        }
+
+        // 2. Virtual directory in the union.
+        if self.index.is_directory(&child_path) {
+            return Ok((FsNode::Directory(child_path), virtual_dir_attrs()));
+        }
+
+        // 3. Lazy resolution for terrain/textures directories. These
+        //    directories are not fully scanned at startup for performance,
+        //    so we resolve files on-demand by checking the real filesystem.
+        if let Some(real_path) = self.resolve_lazy_geo(&child_path, name) {
+            if let Ok(metadata) = fs::metadata(&real_path).await {
+                return Ok((FsNode::RealFile(child_path), attrs_from_metadata(&metadata)));
+            }
+        }
+
+        // 4. A DDS file we can generate.
+        //
+        // In patched regions, patch DDS files are served via
+        // resolve_lazy_geo() above (passthrough from the patch source). If we
+        // reach here, no source has this DDS on disk — generate it. This
+        // handles boundary cases where package `.ter` files reference DDS
+        // textures the patch doesn't provide (different naming convention).
+        if name.ends_with(".dds") {
+            // Water mask guard (#68): X-Plane requests BORDER_TEX as .dds
+            // first, but the actual water mask is a .png on disk. If we
+            // generate a virtual DDS, X-Plane gets satellite imagery instead
+            // of the alpha mask. Report missing so X-Plane falls back to the
+            // .png via lazy resolution.
+            let png_name = name.replace(".dds", ".png");
+            let png_path = parent_path.join(&png_name);
+            if self.resolve_lazy_geo(&png_path, &png_name).is_some() {
+                debug!(file = %name, "Water mask PNG exists, skipping DDS generation");
+                return Err(FsError::NotFound);
+            }
+
+            if let Ok(coords) = parse_dds_filename(name) {
+                let attrs = self.virtual_attrs_for(&coords).await;
+                return Ok((FsNode::VirtualDds(coords), attrs));
+            }
+        }
+
+        Err(FsError::NotFound)
+    }
+
+    /// The attributes of `node` in the union view.
+    ///
+    /// Path nodes (either variant) resolve exactly as the FUSE `getattr` op
+    /// has always done: root, then virtual directory, then real file via the
+    /// index, then lazy geospatial resolution. A path that used to resolve
+    /// but whose source has disappeared is reported missing (ENOENT), which
+    /// is what the FUSE backend has always reported.
+    pub async fn attrs(&self, node: &FsNode) -> Result<FileAttributes, FsError> {
+        match node {
+            FsNode::VirtualDds(coords) => Ok(self.virtual_attrs_for(coords).await),
+            FsNode::Directory(p) | FsNode::RealFile(p) => self.path_attrs(p).await,
+        }
+    }
+
+    /// Attributes for a path node of the union view (see [`Self::attrs`]).
+    async fn path_attrs(&self, path: &Path) -> Result<FileAttributes, FsError> {
+        if path.as_os_str().is_empty() {
+            return Ok(root_dir_attrs());
+        }
+
+        if self.index.is_directory(path) {
+            return Ok(virtual_dir_attrs());
+        }
+
+        let filename = path.file_name().and_then(|f| f.to_str()).unwrap_or("");
+        let real_path = self
+            .index
+            .resolve(path)
+            .map(|s| s.real_path.clone())
+            .or_else(|| self.resolve_lazy_geo(path, filename))
+            .ok_or(FsError::NotFound)?;
+
+        // A source that vanished between lookup and getattr: missing, not an
+        // I/O failure -- the kernel treats both as "nothing here" for a
+        // read-only view, and ENOENT is what the FUSE op has always sent.
+        let metadata = fs::metadata(&real_path)
+            .await
+            .map_err(|_| FsError::NotFound)?;
+
+        Ok(attrs_from_metadata(&metadata))
+    }
+
+    /// Read `size` bytes of `node` starting at `offset`, serving whatever the
+    /// source has (a short read at the end, empty past the end).
+    ///
+    /// Virtual DDS: lit textures come from the lit source alone (no
+    /// executor, no memoising handle, no DDS read metrics); ortho textures
+    /// resolve the tile once per open and slice it, so the kernel's 12-23
+    /// ranged reads of one texture cost a single executor round trip. Real
+    /// files read only the requested window under the disk I/O limiter --
+    /// reading the whole file here would move it once per call (#233).
+    pub async fn read(
+        &self,
+        node: &FsNode,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<Bytes, FsError> {
+        match node {
+            FsNode::VirtualDds(coords) => self.read_virtual_dds(coords, fh, offset, size).await,
+            FsNode::RealFile(p) | FsNode::Directory(p) => {
+                self.read_real_file(p, offset, size).await
+            }
+        }
+    }
+
+    /// Serve one ranged read of a virtual DDS (see [`Self::read`]).
+    async fn read_virtual_dds(
+        &self,
+        coords: &DdsFilename,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<Bytes, FsError> {
+        // Lit textures come from the lit source alone: no executor, no
+        // memoising handle, no DDS read metrics.
+        if coords.kind == TextureKind::Lit {
+            return Ok(self.lit_source.read(coords, offset, size).await);
+        }
+
+        // The span is backend-neutral now: the inode number was a FUSE
+        // concept and is no longer in scope; offset/size identify the call.
+        let fuse_read_span =
+            tracing::debug_span!(target: "profiling", "fuse_read", offset = offset, size = size);
+
+        // Resolve the tile once per open. The kernel splits one X-Plane
+        // texture read into 12-23 ranged calls (1 MiB ceiling), and this
+        // branch used to re-enter the executor on every one of them.
+        let handle = self.dds_handles.get(&fh).map(|h| Arc::clone(&h));
+
+        let tile = match handle {
+            Some(handle) => handle
+                .tile
+                .get_or_init(|| async {
+                    let data = self.resolve_tile(&handle.coords).await;
+                    self.pinned.pin(data.len() as u64);
+                    // Report here, not at open(): the tile is produced
+                    // on first read, so a gauge sampled only at open
+                    // would never see the bytes it is meant to bound.
+                    self.report_handle_gauge();
+                    data
+                })
+                .instrument(fuse_read_span)
+                .await
+                .clone(),
+            // No handle: either the memoisation budget was exhausted at
+            // open() time, or the kernel sent a read we cannot attribute.
+            // Serve it the old way rather than fail -- a missing handle
+            // must never become a black texture.
+            None => self.resolve_tile(coords).instrument(fuse_read_span).await,
+        };
+
+        let offset = offset as usize;
+        let size = size as usize;
+
+        let end = std::cmp::min(offset.saturating_add(size), tile.len());
+        // Refcount, not memcpy: the reply borrows the tile's allocation and
+        // the kernel gets its window without one byte being copied (#237).
+        let slice = if offset < end {
+            tile.slice(offset..end)
+        } else {
+            Bytes::new()
+        };
+
+        // The handler obtains exactly what it returns. The tile is produced
+        // whole by the generation pipeline, which this counter does not --
+        // and should not -- charge to the read path, so the ratio is 1.0
+        // when delivery is zero-copy and climbs the moment it is not.
+        self.record_read(slice.len() as u64, slice.len() as u64, true);
+
+        Ok(slice)
+    }
+
+    /// Read a ranged window of a real file from its source (see
+    /// [`Self::read`]).
+    async fn read_real_file(
+        &self,
+        virtual_path: &Path,
+        offset: u64,
+        size: u32,
+    ) -> Result<Bytes, FsError> {
+        let filename = virtual_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        let real_path = self
+            .index
+            .resolve(virtual_path)
+            .map(|s| s.real_path.clone())
+            .or_else(|| self.resolve_lazy_geo(virtual_path, filename))
+            .ok_or(FsError::NotFound)?;
+
+        // Acquire disk I/O permit
+        let _permit = self.disk_io_limiter.acquire().await;
+
+        // Read only the requested window. The kernel caps each read at
+        // max_pages * PAGE_SIZE (1 MiB on Linux), so reading the whole file
+        // here would move it once per call -- 238x for the largest installed
+        // ortho DSF. See #233.
+        let mut file = fs::File::open(&real_path).await?;
+        file.seek(SeekFrom::Start(offset)).await?;
+
+        // `take` bounds the read at `size`; `read_to_end` stops early at EOF,
+        // which is how a range spanning the end becomes a short read.
+        let mut buf = Vec::with_capacity(size as usize);
+        (&mut file).take(size as u64).read_to_end(&mut buf).await?;
+
+        // Seeking past EOF is legal and yields nothing, so this also covers
+        // the at-or-past-EOF case without a separate branch.
+        self.record_read(buf.len() as u64, buf.len() as u64, false);
+
+        Ok(Bytes::from(buf))
+    }
+
+    /// List the union view's entries of directory `node`.
+    ///
+    /// `.` (the directory itself; the root's parent is itself), `..` (the
+    /// parent, or the root), then the index's entries in their order.
+    ///
+    /// Directory entries carry their virtual attributes; file entries
+    /// carry the placeholder (virtual DDS) attributes. A backend that needs
+    /// real file sizes (FUSE `readdirplus`, WinFSP `ReadDirectory`) upgrades
+    /// each file entry through [`Self::attrs`], exactly as `readdirplus`
+    /// has always done -- while plain `readdir` stays I/O-free, as it has
+    /// always been.
+    pub async fn list_directory(&self, node: &FsNode) -> Result<Vec<DirEntry>, FsError> {
+        let path = match node {
+            FsNode::Directory(p) => p.clone(),
+            _ => return Err(FsError::NotADirectory),
+        };
+        if !path.as_os_str().is_empty() && !self.index.is_directory(&path) {
+            return Err(FsError::NotADirectory);
+        }
+
+        let mut entries = Vec::new();
+
+        // Add . and ..
+        entries.push(DirEntry {
+            name: ".".to_string(),
+            is_dir: true,
+            node: node.clone(),
+            attrs: virtual_dir_attrs(),
+        });
+
+        // The root's parent is itself.
+        entries.push(DirEntry {
+            name: "..".to_string(),
+            is_dir: true,
+            node: node.parent_node(),
+            attrs: virtual_dir_attrs(),
+        });
+
+        // Get entries from union index
+        for dir_entry in self.index.list_directory(&path) {
+            let child_path = path.join(&dir_entry.name);
+            let is_dir = dir_entry.is_dir;
+            let child_node = if is_dir {
+                FsNode::Directory(child_path.clone())
+            } else {
+                FsNode::RealFile(child_path.clone())
+            };
+
+            entries.push(DirEntry {
+                name: dir_entry.name.to_string_lossy().into_owned(),
+                is_dir,
+                node: child_node,
+                attrs: if is_dir {
+                    virtual_dir_attrs()
+                } else {
+                    virtual_dds_attrs(&self.virtual_dds_config)
+                },
+            });
+        }
+
+        Ok(entries)
+    }
+
+    /// Open `node` for reading and return the per-open file handle.
+    ///
+    /// Real passthrough files and lit textures carry no per-open state and
+    /// get handle 0. Ortho virtual DDS get a memoising handle, unless the
+    /// pinned-bytes ceiling refuses: handle 0 then makes reads resolve per
+    /// call, which is slower but correct.
+    pub fn open(&self, node: &FsNode) -> u64 {
+        let coords = match node {
+            // Real passthrough files: use default kernel caching, no
+            // handle state.
+            FsNode::VirtualDds(c) => c,
+            _ => return 0,
+        };
+
+        // Lit textures are small or served by range from their source; they
+        // pin nothing and need no handle.
+        if coords.kind == TextureKind::Lit {
+            return 0;
+        }
+
+        // Refuse to memoise past the pinned-bytes ceiling. fh 0 makes read()
+        // resolve per call, which is slower but correct.
+        let expected = self.virtual_dds_config.size();
+        if self.pinned.would_exceed(expected) {
+            // Count every refusal: this is what lets a flight log tell "the
+            // cap engaged" from "the #234 fix stopped working", which look
+            // identical otherwise -- both show fuse_dds_alloc_mb climbing.
+            if let Some(metrics) = self.metrics_client() {
+                metrics.fuse_handle_budget_exhausted();
+            }
+            // Warn once, at default level. Before #236 this was debug-only,
+            // so the degradation was invisible on an ordinary flight.
+            if self.claim_budget_warning() {
+                warn!(
+                    pinned_mb = self.pinned.pinned_bytes() / (1024 * 1024),
+                    cap_mb = self.pinned.ceiling_bytes() / (1024 * 1024),
+                    open_handles = self.dds_handles.len(),
+                    "DDS handle budget exhausted - serving opens without memoisation. \
+                     Reads now resolve their tile once per call. Further occurrences \
+                     are counted in dds_budget_exhausted on the Memory sample line."
+                );
+            }
+            return 0;
+        }
+
+        let fh = self.new_dds_handle(coords.clone());
+
+        self.report_handle_gauge();
+
+        fh
+    }
+
+    /// Release the per-open state of handle `fh`.
+    pub fn release(&self, fh: u64) {
+        // Drop the memoised tile. Without this every open file would pin
+        // 11.17 MB for the life of the mount.
+        if let Some((_, handle)) = self.dds_handles.remove(&fh) {
+            if let Some(tile) = handle.tile.get() {
+                self.pinned.release(tile.len() as u64);
+            }
+            self.report_handle_gauge();
+        }
+    }
+
+    /// Volume statistics: the union's file count with the current
+    /// (constant) block figures, exactly as the FUSE `statfs` op reports.
+    pub fn statfs(&self) -> StatFsInfo {
+        StatFsInfo {
+            blocks: 1_000_000,
+            bfree: 0,
+            bavail: 0,
+            files: self.index.file_count() as u64,
+            ffree: 0,
+            bsize: 4096,
+            namelen: 255,
+            frsize: 4096,
         }
     }
 }

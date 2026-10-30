@@ -2,10 +2,11 @@
 //!
 //! These types describe *what* a file's attributes are without naming the
 //! kernel that reports them. The FUSE adapter maps them onto
-//! `fuse3::FileAttr` (adding the inode number, `ctime` — always
-//! `UNIX_EPOCH` in the union view — and the macOS-only `crtime`/`flags`
-//! fields); the WinFSP adapter (Phase 2) maps them onto WinFSP's attribute
-//! types.
+//! `fuse3::FileAttr` (adding the inode number, the adapter's `ctime`/uid/gid
+//! policy — `UNIX_EPOCH` and the source's uid/gid for real files, the
+//! current time and the mounting process for virtual nodes — and the
+//! macOS-only `crtime`/`flags` fields); the WinFSP adapter (Phase 2) maps
+//! them onto WinFSP's attribute types.
 //!
 //! See `docs/dev/windows-backend-split.md` §4.3 for the design.
 

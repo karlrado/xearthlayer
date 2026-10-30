@@ -14,14 +14,11 @@ pub mod inode;
 mod types;
 
 // Backend-agnostic core types (shared by the FUSE backend and, later,
-// the WinFSP backend). Introduced ahead of the core that consumes them
-// (docs/dev/windows-backend-split.md §6, commits 2–4); silence dead_code
-// until those commits wire them in.
-#[allow(dead_code)]
+// the WinFSP backend), wired in by docs/dev/windows-backend-split.md §6
+// commits 2–4. (A couple of pure API-surface helpers in `node` carry their
+// own scoped `#[allow(dead_code)]` until the WinFSP backend uses them.)
 pub mod attrs;
-#[allow(dead_code)]
 pub mod error;
-#[allow(dead_code)]
 pub mod node;
 pub mod requestor;
 
