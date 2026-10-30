@@ -18,7 +18,7 @@ env:
 
 jobs:
   verify:
-    name: Verify
+    name: Verify (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -60,3 +60,31 @@ jobs:
 
       - name: Run make verify
         run: make verify
+
+  # Windows is a Tier 1 platform for this fork (Phase 2: WinFSP backend,
+  # see docs/dev/winfsp-backend.md). No dependency-install step is needed:
+  # winfsp-sys bundles its own import libraries and headers (WinFSP itself
+  # is a runtime-only dependency, and a hosted runner cannot mount a file
+  # system in any case — this job builds and unit-tests, never mounts), and
+  # fuse3 is target-gated off on Windows, so there is no libfuse3-dev
+  # equivalent to install.
+  #
+  # Runs scripts/verify.ps1 rather than `make verify`: hosted Windows images
+  # ship no GNU make, and the script mirrors the Makefile's fmt/clippy/test
+  # targets verbatim. test-scripts is deliberately not part of it — it is
+  # the bash test suite for the macOS release tooling, covered by the Linux
+  # job.
+  verify-windows:
+    name: Verify (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run verify.ps1
+        run: powershell -ExecutionPolicy Bypass -File scripts/verify.ps1

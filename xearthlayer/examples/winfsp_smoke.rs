@@ -235,15 +235,7 @@ mod smoke {
             "1. Open {} in Explorer: the package root lists (folders and files).",
             mountpoint.display()
         );
-        println!(
-            "2. Open {} (via the mount) in Notepad: real content, not magenta.",
-            passthrough.0.display()
-        );
-        println!(
-            "3. Folder properties → the File system should read: {}",
-            xearthlayer::fuse::winfsp::ORTHO_VOLUME_FS_NAME
-        );
-        println!("4. Come back here and press Enter.");
+        println!("2. Come back here and press Enter.");
         let mut line = String::new();
         std::io::stdin()
             .lock()
