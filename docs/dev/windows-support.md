@@ -21,10 +21,10 @@ that intercepts X-Plane's texture reads and synthesizes DDS in response, with
 Windows as part of the same effort.
 
 This is an **additive backend, not a rewrite**. The union-filesystem logic is
-extracted into a backend-neutral core; the existing FUSE backend becomes a thin
-adapter over that core (serving **Linux and macOS**); a new `winfsp` adapter
-(Windows only) implements the same core. Existing Linux and macOS behavior is
-unchanged.
+extracted into a backend-neutral core; the existing FUSE backend splits into
+thin `LinuxFuse` and `MacFuse` adapters over a **shared fuse3 translation**;
+a new `WinFsp` adapter (Windows only) implements the same core. Existing
+Linux and macOS behavior is unchanged.
 
 ---
 
@@ -47,33 +47,100 @@ Consequences that fix the architecture:
 
 ---
 
-## 3. One core, two adapters — the shape
+## 3. One core, one adapter per implementation — the shape
 
 ```text
-                        ┌─────────────────────────────────────────────┐
-   X-Plane (any OS) ───►│  neutral core (fuse/support)                │
-   reads virtual DDS ──►│   · FsNode / FsError (neutral identity & err)│
-                        │   · OrthoUnionCore: state + the ops          │
-                        │   · DdsRequestor / attrs / request coalescing│
-                        └───────────────┬─────────────────────────────┘
-                                        │  (backend-neutral op surface)
-                     ┌──────────────────┴──────────────────┐
-                     ▼                                     ▼
-          ┌────────────────────┐                 ┌────────────────────┐
-          │  fuse3 adapter     │                 │  winfsp adapter    │
-          │  (Linux, macOS)    │                 │  (Windows)         │
-          │  ino ⇄ FsNode      │                 │  ctx ⇄ FsNode      │
-          │  FUSE Filesystem   │                 │  WinFSP service    │
-          └────────────────────┘                 └────────────────────┘
+             UnionFilesystem (implemented by OrthoUnionCore)
+                               ▲
+                         MountBackend
+        ┌───────────────┬──────┴───────┬─────────────────┐
+    LinuxFuse        MacFuse         WinFsp            FsKit (future)
+        └───────┬───────┘
+    shared fuse3 translation
+    + a small FusePlatform policy per OS
 ```
 
-- **Neutral core** (`fuse/support/`): owns the union-filesystem state and
-  expresses the operations against a neutral identity (`FsNode`) and a neutral
-  error (`FsError`). Carries **no** FUSE, WinFSP, or Unix symbol.
-- **Adapters**: each maps its kernel identity onto `FsNode`, implements the
-  op surface for its provider, and maps `FsError` onto its provider's error
-  type. The FUSE adapter keeps its public type name and API so nothing that
-  references it changes.
+- **Neutral core.** `OrthoUnionCore` owns the union-filesystem state (index,
+  requestor, budget/handle bookkeeping, config) and implements
+  `UnionFilesystem`, the neutral op surface over `FsNode`/`FsError` (§6.1).
+  The core carries **no inodes, no kernel flags, no caching policy**, and no
+  backend symbol. `read` keeps returning `Bytes`, preserving the zero-copy
+  path (#237).
+- **`MountBackend`.** Each filesystem implementation provides a backend that
+  mounts the core:
+  ```rust
+  /// Neutral union-filesystem op surface. Implemented by `OrthoUnionCore`.
+  pub trait UnionFilesystem: Send + Sync {
+      fn lookup(&self, node: &FsNode, name: &str) -> Result<FsNode, FsError>;
+      fn attrs(&self, node: &FsNode) -> Result<FileAttributes, FsError>;
+      async fn read(&self, node: &FsNode, fh: u64, offset: u64, size: usize)
+          -> Result<Bytes, FsError>;
+      fn list_directory(&self, node: &FsNode) -> Result<Vec<DirEntry>, FsError>;
+      fn open(&self, node: &FsNode) -> Result<u64, FsError>;
+      fn release(&self, fh: u64) -> Result<(), FsError>;
+      fn statfs(&self) -> StatFsInfo;
+  }
+
+  /// One backend per filesystem implementation.
+  pub trait MountBackend {
+      fn mount(&self, fs: Arc<dyn UnionFilesystem>, at: &Path)
+          -> Result<Box<dyn MountSession>, MountError>;
+  }
+
+  /// Lifecycle of an active mount, backend-neutral.
+  pub trait MountSession: Send {
+      fn mountpoint(&self) -> &Path;
+      fn unmount(self: Box<Self>) -> impl Future<Output = std::io::Result<()>> + Send;
+      fn is_mounted(&self) -> bool;   // stale-mount detection stays core-side
+  }
+  ```
+  The shape follows the maintainer's sketch; the signatures are our
+  proposal. Seam requirements: `MountError` is a **neutral** type that wraps
+  provider errors (the prototype's `MountError` is WinFSP-module-local and
+  must be promoted); per-open handles cross the seam as neutral `u64` ids,
+  not provider handles; `read` is async because it may block-and-generate.
+- **`FusePlatform` policy** — the per-OS differences inside the shared fuse3
+  translation, replacing today's `cfg` branches:
+  ```rust
+  pub trait FusePlatform {
+      /// Linux: `FOPEN_DIRECT_IO` (every read reaches the handler).
+      /// macOS: 0 — virtual DDS served through the page cache.
+      fn virtual_dds_open_flags(&self) -> u32;
+      /// macOS: macFUSE `volname` naming the volume after the mount point (#305).
+      /// Linux: `None`.
+      fn volume_name_option(&self, mount_path: &Path) -> Option<String>;
+  }
+  ```
+  `crtime`/BSD flags are a difference in struct shape and keep their one
+  `cfg` in the attribute builder, outside the policy.
+- **Adapters.**
+  - **`LinuxFuse` / `MacFuse`** — today macOS shares the `fuse3` code with
+    Linux through `cfg` branches; the split moves macOS behind the interface
+    too. **One shared fuse3 translation** (the `Filesystem` dispatch,
+    `ino ⇄ FsNode`, the attribute builder — two copies would drift); each
+    adapter is thin, constructing it with its `FusePlatform` policy and the
+    core.
+  - **`WinFsp`** — Windows only (lands with the WinFSP adapter phase); op
+    mapping in §6.2.
+  - **`FsKit`** — future, macOS (#210). `cfg` decides which backends exist on
+    a platform; a **runtime probe may choose between them** because FSKit
+    availability depends on the macOS version.
+- **The boundary rule (acceptance test):** `manager/mounts.rs` contains
+  **no `cfg` and names no backend** — it builds a `dyn UnionFilesystem`, asks
+  the selected `dyn MountBackend` to mount it, and drives
+  `Box<dyn MountSession>`. (The prototype has ~30 `cfg` blocks there; that is
+  the regression this rule guards against.)
+- **One contract test suite** in `vfs/contract/` runs against every adapter —
+  both FUSE adapters in Phase 1; `WinFsp` added with the WinFSP adapter phase
+  — in place of per-backend op-level tests.
+- **Other platform differences** (unmount and stale-mount recovery, signals,
+  process checks, disk capacity) follow the same pattern: narrow interfaces,
+  not inline `cfg`. Where the code is plain Rust, use `cfg!` so it compiles
+  and gets tested on every platform. The concrete seams for signals, process
+  checks, and disk capacity are proposed with the portable-seams phase; the
+  pattern they must follow is this one.
+- **Module home.** The backend tree moves `fuse/` → `vfs/` in a
+  **move-only commit** — WinFSP is not FUSE, and neither is the core.
 
 ---
 
@@ -85,11 +152,13 @@ Operation bodies move verbatim (or as close to verbatim as the type
 change allows); the op-level tests stay as the safety net. The FUSE backend
 keeps its name and public API.
 
-### 4.2 One core, two adapters
-The union-FS logic lives exactly once (the core). `fuse3` and `winfsp` are
-sibling adapters over it. No union-FS behavior is duplicated per backend; the
-only per-backend code is identity translation, provider-specific op plumbing,
-and error mapping.
+### 4.2 One core, one adapter per implementation
+The union-FS logic lives exactly once (the core). Each filesystem
+implementation — `LinuxFuse`, `MacFuse`, `WinFsp`, and later `FsKit` — is a
+sibling adapter behind `MountBackend`. The two FUSE adapters share one fuse3
+translation (two copies would drift); per-adapter code is limited to identity
+translation, provider-specific op plumbing, error mapping, and the small
+`FusePlatform` policy. No union-FS behavior is duplicated.
 
 ### 4.3 OS dependency rule (compile/link boundary)
 The codebase compiles to two distinct binaries from one source tree:
@@ -201,11 +270,11 @@ carries a Windows branch. These are reused as-is by the core and both adapters.
 
 ## 6. The design
 
-### 6.1 The neutral core (`fuse/support/`)
+### 6.1 The neutral core (`vfs/support/`)
 
-The core **extends the existing `support/` module** (the established neutral
-home in the base) rather than introducing a parallel directory. New, backend-
-neutral members:
+The core **extends the existing `support/` module** (moved with the tree
+into `vfs/`) and implements `UnionFilesystem` (§3), rather than introducing a
+parallel directory. New, backend-neutral members:
 
 - **`FsNode`** (neutral identity) — the core's notion of "a thing in the union
   view":
@@ -245,19 +314,22 @@ neutral members:
 (both backends need per-open state); inode allocation and the FUSE `readdir`
 `.`/`..` inode math stay in the FUSE adapter.
 
-### 6.2 The adapters and the op mapping
+### 6.2 The adapters
 
-**FUSE adapter** (`fuse/fuse3/`) — thin after the split:
-- `ino ⇄ FsNode` via `InodeManager`; core result → `ino` via
-  `get_or_create_inode` / `create_virtual_inode`.
-- Keeps `Fuse3OrthoUnionFS`, `impl Filesystem`, `mount`/`mount_spawned`, and
-  the FUSE-specific `FileAttrBuilder` (including the macOS `crtime` fields,
-  which move *with the mapper* into the adapter's `FileAttributes → FileAttr`).
-- `with_fuse_limits` (FUSE `max_background`/`congestion_threshold`) stays
-  adapter-specific.
+**Shared fuse3 translation** (`vfs/fuse3/`) — one copy, used by both FUSE
+adapters (two copies would drift): the `Filesystem` implementation
+(`Fuse3OrthoUnionFS` keeps its name and API so nothing that references it
+changes), `ino ⇄ FsNode` via `InodeManager` (`get_or_create_inode` /
+`create_virtual_inode`), the FUSE-specific `FileAttrBuilder` (including the
+macOS `crtime` fields, which stay with the mapper), and `mount`/
+`mount_spawned` with the mount options.
 
-**WinFSP adapter** (`fuse/winfsp/`) — the new backend, target-gated to
-Windows:
+**`LinuxFuse` / `MacFuse`** — each implements `MountBackend`; constructs the
+shared translation with its `FusePlatform` policy (§3) and the core, and
+mounts it. `with_fuse_limits` (FUSE `max_background`/`congestion_threshold`)
+stays in the translation, adapter-agnostic.
+
+**`WinFsp`** (`vfs/winfsp/`) — the new backend, target-gated to Windows:
 
 | WinFSP op | Delegates to core |
 |---|---|
@@ -269,21 +341,24 @@ Windows:
 | `Cleanup(ctx)` | `release(fh)` |
 | `GetVolumeInfo` | `statfs()` |
 | errors | `FsError → FspError` mapping (3 variants) |
-| mount lifecycle | a WinFSP service + a `SpawnedMountHandle`-equivalent; the mount manager gains a neutral mount-handle seam |
+| mount lifecycle | a WinFSP service + a `MountSession` implementation; the mount manager holds `Box<dyn MountSession>` |
 | `with_fuse_limits` | dropped — WinFSP manages its own request queue |
 
 The two tree kinds (ortho + night-lit) are handled by the core (`FsNode::
 VirtualDds` carries the kind); WinFSP sees one filesystem with two kinds of
 virtual files, exactly as FUSE does.
 
-### 6.3 Platform backend selection + mount flow
-The consolidated mount flow (`manager/mounts.rs` + the `run` command) selects
-the backend by platform and drives a **neutral mount-handle seam**:
-- Linux / macOS → `fuse3` adapter.
-- Windows → `winfsp` adapter.
+### 6.3 Backend selection + mount flow
+The consolidated mount flow (`manager/mounts.rs` + the `run` command) is
+backend-neutral per the boundary rule (§3): it builds the core, selects a
+backend, and drives the resulting `Box<dyn MountSession>`:
+- `cfg` decides **which backends exist** on a platform.
+- A **runtime probe may choose between** the backends that exist (FSKit
+  availability on macOS depends on the OS version, #210).
 
 The mount manager's public shape is preserved so the CLI, tests, and docs that
-reference it keep working; only the backend it instantiates changes per target.
+reference it keep working; it holds `Box<dyn MountSession>` in place of the
+FUSE `SpawnedMountHandle`.
 
 ### 6.4 Cross-platform seams (the "installer/enablement" plumbing)
 These are the non-FUSE seams that block a working Windows build and are solved
@@ -330,26 +405,31 @@ Each phase has a **gate** (what must be true to start) and **completion
 criteria** (what must be true to call it done). Every phase is independently
 green.
 
-### Phase 1 — Backend split (no behavior change)
+### Phase 1 — Core, interfaces, and the `LinuxFuse`/`MacFuse` split
 **Gate:** none (first).
 **Changes:**
-- Extract the neutral core into `fuse/support/` per §6.1 (`FsNode`, `FsError`,
-  seam types, `DdsRequestor` + `chunk_to_tile_coords`, `OrthoUnionCore` +
-  `DdsHandle`).
-- Reduce `fuse/fuse3/` to a thin adapter per §6.2; `Fuse3OrthoUnionFS` keeps
-  its name and API.
-- Port the op-level behavioural tests to the core level.
+1. Move-only commit: `fuse/` → `vfs/`.
+2. Extract the neutral core into `vfs/support/` per §6.1; it implements
+   `UnionFilesystem`.
+3. Introduce `MountBackend`/`MountSession` and the neutral `MountError`;
+   split the existing backend into `LinuxFuse` and `MacFuse` over the shared
+   fuse3 translation + `FusePlatform` policy; the cross-OS `cfg` branches in
+   shared code move to the policy (except `crtime`'s one struct-shape `cfg`).
+4. `manager/mounts.rs` mounts through `dyn MountBackend` — no `cfg`, no
+   backend named (acceptance test, §3).
+5. The contract suite in `vfs/contract/` runs against both FUSE adapters.
 **Not in Phase 1 (explicitly):** any `winfsp`/`winfsp-sys` dependency or
-`fuse/winfsp/` module; any `Cargo.toml` target-gating (that is Phase 2 —
-Phase 1 must not change the dependency graph); the gate-list plumbing
-(Phase 3); the neutral mount-handle seam (Phase 2/3).
+`vfs/winfsp/` module; any dependency-graph change; the gate-list plumbing
+(later phases).
 **Completion criteria:**
-- Linux and macOS build + test green; behavior preserved (op-level tests pass
-  at the core level).
-- The core contains no `fuse3::`/Unix symbol (§6.1 rule).
-- **No dependency-graph change** and **no new build failures** on any target.
-  A clean *Windows* build is **not** a Phase 1 gate (the split is not
-  target-gated yet) — that is Phase 2's exit.
+- Linux and macOS build + test green; **behavior preserved** — the maintainer
+  regression-flies both.
+- The core contains no `fuse3::`/Unix symbol, inode, kernel flag, or caching
+  policy.
+- `manager/mounts.rs` contains no `cfg` and names no backend.
+- No dependency-graph change and no new build failures on any target.
+- **Lands early** — ahead of #111 and the daemon split, which touch the same
+  code.
 
 ### Phase 2 — WinFSP backend
 **Gate:** Phase 1 merged and green.
@@ -392,7 +472,8 @@ so they still need to be built and proven.
 1. **WinFSP prerequisite handling** (low risk) — detect a missing WinFSP and
    point the user at the installer, using the existing preflight-prerequisite
    framework (the macFUSE check is the model): a Windows-gated preflight
-   `inspect()` that probes for WinFSP and returns an unsatisfied status with an
+   `inspect()` that probes for WinFSP, with `cfg!` in `applies()` and an
+   **injected probe** (testability), returning an unsatisfied status with an
    install hint, so the user is told *before* a mount is attempted. The
    DLL-resolution that lets the app start without the DLL and find it when
    present is **already handled by the `winfsp` crate's `delayload` + `system`
@@ -638,6 +719,19 @@ step 4 references `install_XWP_Linux_Mac.sh`, a Unix-only script run by the
 user under X-World Pro's own instructions; the Windows guide must point
 Windows users at X-World Pro's Windows instructions instead. XEarthLayer
 itself never runs it.
+
+### 8.12 One adapter per implementation; shared fuse3 translation; `vfs/` home
+The split is one core + **one adapter per implementation** behind
+`MountBackend`, not one core + two adapters. Reasons: (1) macOS has no clean
+boundary today — it shares the fuse3 code with Linux through `cfg` branches,
+and FSKit is being explored for macOS (#210), so the adapter boundary must
+exist *before* a third macOS backend arrives, not after; (2) #111 and the
+daemon split touch this same code, so the seam lands early; (3) `LinuxFuse`
+and `MacFuse` share **one** fuse3 translation with a `FusePlatform` policy —
+two copies would drift, while the policy carries the real differences (open
+flags, volume naming). The acceptance test is structural:
+`manager/mounts.rs` contains no `cfg` and names no backend. The tree moves
+`fuse/` → `vfs/` because WinFSP is not FUSE, and neither is the core.
 
 ---
 
