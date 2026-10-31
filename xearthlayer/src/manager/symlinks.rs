@@ -21,19 +21,47 @@ use xearthlayer_package::{self as package, PackageType};
 use super::local::LocalPackageStore;
 use super::{ManagerError, ManagerResult};
 
-// Unix symlinks are the overlay mechanism; Windows has none of this yet and
-// the overlay machinery ships as an explicit stub (Phase 2, design doc §5).
+// Unix symlinks are the overlay mechanism. The overlay code chooses the
+// per-platform leaf mechanism itself ([`materialize_overlay_leaf`]); this
+// raw seam keeps the honest meaning "make a symlink" on every platform.
 #[cfg(not(target_os = "windows"))]
 use std::os::unix::fs::symlink;
 
 /// Windows stand-in for `std::os::unix::fs::symlink`: refused with an
-/// explicit error instead of compiling to nothing.
+/// explicit error rather than silently doing something else. A function named
+/// `symlink` must mean "make a symlink" on every platform; a caller that
+/// needs a leaf without that requirement uses [`materialize_overlay_leaf`],
+/// and a caller that genuinely wants a Windows symlink sees the refusal and
+/// adds the `symlink_file` path deliberately.
+///
+/// Not called by production code on Windows (the overlay uses
+/// [`materialize_overlay_leaf`]); the test module exercises it, so the
+/// dead-code allowance is scoped to non-test builds only.
 #[cfg(target_os = "windows")]
+#[cfg_attr(not(test), allow(dead_code))]
 fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(_original: P, _link: Q) -> std::io::Result<PathBuf> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "symlinks are not yet supported on Windows",
+        "symlinks are not supported on Windows",
     ))
+}
+
+/// Materialise one overlay leaf (a DSF file) into the consolidated folder.
+///
+/// This is where the per-platform mechanism decision lives (design doc
+/// §8.11). Unix: a symlink — zero disk cost, and deleting it to drop in a
+/// user file is the override model. Windows: a real file copy — no Developer
+/// Mode / `SeCreateSymbolicLinkPrivilege` requirement, the folder-level
+/// contract (contents, rebuild, ownership marker) is identical, and the
+/// overlay data is nav-data sized.
+#[cfg(not(target_os = "windows"))]
+fn materialize_overlay_leaf(source: &Path, target: &Path) -> std::io::Result<PathBuf> {
+    symlink(source, target)
+}
+
+#[cfg(target_os = "windows")]
+fn materialize_overlay_leaf(source: &Path, target: &Path) -> std::io::Result<PathBuf> {
+    fs::copy(source, target).map(|_| target.to_path_buf())
 }
 
 /// Marker file name used to identify XEarthLayer symlinks.
@@ -515,14 +543,14 @@ pub fn create_consolidated_overlay_except(
                     continue;
                 }
 
-                // Create symlink
+                // Materialise the leaf (symlink on Unix, copy on Windows)
                 let symlink_path = consolidated_grid_path.join(&dsf_name);
-                if let Err(e) = symlink(&dsf_path, &symlink_path) {
+                if let Err(e) = materialize_overlay_leaf(&dsf_path, &symlink_path) {
                     tracing::warn!(
                         source = %dsf_path.display(),
                         target = %symlink_path.display(),
                         error = %e,
-                        "Failed to create DSF symlink"
+                        "Failed to materialise DSF leaf"
                     );
                     continue;
                 }
@@ -1038,14 +1066,122 @@ mod tests {
     }
 }
 
-/// Windows stub seam (design doc §5): the overlay machinery must refuse
-/// explicitly, not merely compile.
+/// Windows overlay tests (design doc §8.11): the leaves are real file copies.
+///
+/// The Unix test module above is gated `not(windows)`; these cover the same
+/// folder-level contract through the copy mechanism, on Windows.
 #[cfg(all(test, target_os = "windows"))]
-mod windows_stub_tests {
+mod windows_overlay_tests {
     use super::*;
+    use tempfile::TempDir;
+
+    /// A minimal overlay package: two DSF files in one 10° grid plus the
+    /// package metadata, like the Unix mock's.
+    fn create_mock_overlay_with_dsf(packages_dir: &Path, region: &str) {
+        let folder_name = package::package_mountpoint(region, PackageType::Overlay);
+        let package_dir = packages_dir.join(&folder_name);
+        let grid_dir = package_dir.join("Earth nav data/+30-120");
+        fs::create_dir_all(&grid_dir).unwrap();
+        fs::write(grid_dir.join("+33-119.dsf"), "fake dsf").unwrap();
+        fs::write(grid_dir.join("+34-118.dsf"), "fake dsf").unwrap();
+        let metadata = format!(
+            "REGIONAL SCENERY PACKAGE\n1.0.0\n{}  1.0.0\n2024-01-01T00:00:00Z\nY\n{}\ntest.tar.gz\n1\n\nabc123  test.tar.gz  http://example.com/test.tar.gz\n",
+            region.to_uppercase(),
+            folder_name
+        );
+        fs::write(
+            package_dir.join("xearthlayer_scenery_package.txt"),
+            metadata,
+        )
+        .unwrap();
+    }
 
     #[test]
-    fn symlink_is_refused_on_windows() {
+    fn consolidated_overlay_leaves_are_real_file_copies() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        create_mock_overlay_with_dsf(packages_dir.path(), "na");
+
+        let store = LocalPackageStore::new(packages_dir.path());
+        let result = create_consolidated_overlay(&store, scenery_dir.path());
+        assert!(result.success, "Error: {:?}", result.error);
+        assert_eq!(result.file_count, 2);
+
+        let leaf = scenery_dir
+            .path()
+            .join(CONSOLIDATED_OVERLAY_NAME)
+            .join("Earth nav data/+30-120/+33-119.dsf");
+        assert!(leaf.is_file(), "leaf must be a regular file");
+        assert!(!leaf.is_symlink(), "leaf must not be a symlink");
+        assert_eq!(fs::read_to_string(&leaf).unwrap(), "fake dsf");
+
+        // The ownership marker travels with the folder, as on Unix.
+        let marker = scenery_dir
+            .path()
+            .join(CONSOLIDATED_OVERLAY_NAME)
+            .join(SYMLINK_MARKER);
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn a_rebuild_restores_the_package_version_of_a_user_modified_leaf() {
+        // The documented semantics: the rebuild removes and recreates the
+        // folder, so a user-modified leaf reverts. The copy mechanism must
+        // not change that.
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        create_mock_overlay_with_dsf(packages_dir.path(), "na");
+
+        let store = LocalPackageStore::new(packages_dir.path());
+        let result = create_consolidated_overlay(&store, scenery_dir.path());
+        assert!(result.success, "Error: {:?}", result.error);
+
+        let leaf = scenery_dir
+            .path()
+            .join(CONSOLIDATED_OVERLAY_NAME)
+            .join("Earth nav data/+30-120/+33-119.dsf");
+        fs::write(&leaf, "my custom version").unwrap();
+
+        let result = create_consolidated_overlay(&store, scenery_dir.path());
+        assert!(result.success, "Error: {:?}", result.error);
+        assert_eq!(
+            fs::read_to_string(&leaf).unwrap(),
+            "fake dsf",
+            "the rebuild must restore the package version"
+        );
+    }
+
+    #[test]
+    fn remove_consolidated_overlay_removes_the_copied_folder() {
+        let packages_dir = TempDir::new().unwrap();
+        let scenery_dir = TempDir::new().unwrap();
+        create_mock_overlay_with_dsf(packages_dir.path(), "na");
+
+        let store = LocalPackageStore::new(packages_dir.path());
+        let result = create_consolidated_overlay(&store, scenery_dir.path());
+        assert!(result.success, "Error: {:?}", result.error);
+
+        let removed = remove_consolidated_overlay(scenery_dir.path()).unwrap();
+        assert!(removed);
+        assert!(!consolidated_overlay_exists(scenery_dir.path()));
+    }
+
+    #[test]
+    fn remove_consolidated_overlay_refuses_a_folder_without_the_marker() {
+        let scenery_dir = TempDir::new().unwrap();
+        let fake = scenery_dir.path().join(CONSOLIDATED_OVERLAY_NAME);
+        fs::create_dir(&fake).unwrap();
+
+        let result = remove_consolidated_overlay(scenery_dir.path());
+        assert!(result.is_err(), "must refuse a user folder");
+        assert!(fake.exists(), "the user folder must survive");
+    }
+
+    #[test]
+    fn the_raw_symlink_seam_is_still_refused_on_windows() {
+        // The mechanism decision lives in materialize_overlay_leaf, not in
+        // symlink(): the seam keeps the honest meaning "make a symlink" and
+        // refuses explicitly instead of silently doing something else.
         let result = symlink(Path::new("/a"), Path::new("/b"));
         let err = result.expect_err("symlink must be refused on Windows");
         assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
