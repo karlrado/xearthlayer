@@ -314,7 +314,7 @@ Every Unix-only site and its Windows resolution (the concrete "gate list"):
 | `metrics/memory_probe.rs` | `/proc/self/status` `RssAnon` | `GetProcessMemoryInfo` (`PROCESS_MEMORY_COUNTERS`); documented `None` fallback if flaky (probe is best-effort) |
 | `diagnostics/report.rs` | `/proc/meminfo` | reuse the `hardware.rs` detection (DRY) |
 | `fuse/support/attrs.rs` (attr fields) | `MetadataExt` (dev/rdev/blksize/nlink) | map from `std::fs::Metadata`: `dev=rdev=0`, `blksize=4096`, `nlink=1` |
-| `manager/symlinks.rs` | `std::os::unix::fs::symlink` | **Phase 4** (overlay/symlink) — see §7, Phase 4 |
+| `manager/symlinks.rs` | `std::os::unix::fs::symlink` | **Phase 4** — Windows leaf becomes a real-file copy (§8.11); Unix keeps symlinks |
 | `manager/installer.rs` (`filesystem_of`) | `MetadataExt::dev()` | **Phase 4** (app installer) — covered by the capacity-identity seam |
 | `xearthlayer-cli` preflight `FdLimit` | `rlimit` raise | cfg satisfied no-op |
 | `xearthlayer-cli` / `xworld_pro` tests | `unix symlink` in tests | `#[cfg(not(target_os = "windows"))]` the affected tests |
@@ -402,10 +402,31 @@ so they still need to be built and proven.
 2. **Windows installer / packaging** (low risk) — a Windows build + installer
    for XEarthLayer alongside the existing macOS installer work (signing,
    SmartScreen, and the `winfsp` DLL's availability at install time).
-3. **Overlay / symlink path** (needs care) — the `yzXEL_overlay` symlink path
-   implemented for Windows. Watch-item: Windows symlink creation requires
-   Developer Mode or elevation, so the mechanism differs from the Unix
-   symlink and needs its own handling.
+3. **Overlay path** (low risk) — materialise the consolidated
+   `yzXEL_overlay/` folder on Windows as **real file copies** from the overlay
+   packages, rather than the Unix symlink leaves. The folder, its contents, and
+   its behaviour are otherwise identical to Unix:
+
+   - **The user-visible contract is unchanged.** Same folder name, same
+     per-region contents, same rebuild semantics — the rebuild already removes
+     and recreates the whole folder, so user-modified files are ephemeral on
+     every platform, and the copy changes nothing about that. `disable_overlays`
+     and `xworld_pro` (SimHeaven X-World Pro coexistence) operate at the folder
+     level through pure file I/O, so they work on Windows without modification.
+   - **No privilege surface.** Windows symlink creation requires Developer Mode
+     or `SeCreateSymbolicLinkPrivilege` on each machine — a new per-machine
+     variable, plus detection and user guidance, to save disk space. Copies
+     work on any NTFS and match the platform convention of the Windows ortho
+     ecosystem (AutoOrtho ships real files into Custom Scenery).
+   - **The disk cost is negligible.** Overlay packages are nav-data patches,
+     not imagery — the NA-USA overlay is ≈ 5.7 MB. Copying every installed
+     overlay is small beside the multi-GB ortho packages they accompany.
+   - **Implementation.** The `symlink()` stub in `manager/symlinks.rs` becomes
+     a copy-based leaf for `cfg(windows)`; the existing ownership marker
+     (`.xearthlayer_symlink`) is kept in a form appropriate to real files so
+     the "don't clobber a user folder" guard and the cleanup paths keep working.
+     Unix keeps symlinks; nothing in the rest of the pipeline knows the
+     difference.
 4. **Documentation close-out** (do last, after items 1–3 are merged and
    proven) — not a feature; a **repo-wide documentation consistency pass** that
    makes Windows a first-class supported platform, not just a platforms-list
@@ -426,7 +447,8 @@ so they still need to be built and proven.
 
 **Completion criteria (per item):** the item builds green on Windows, is
 exercised end-to-end on a real machine, and its failure/edge cases (notably the
-symlink privilege path and the WinFSP-absent preflight path) are covered by
+overlay copy path — rebuild over user-modified files, and the ownership marker
+on a real folder — and the WinFSP-absent preflight path) are covered by
 tests or a documented manual check. For item 4 specifically: no in-repo doc
 still says "Windows support planned" or omits Windows where it lists the other
 platforms, and a human has confirmed the consistency pass is complete. *(If the
@@ -588,6 +610,34 @@ same MIT-licensed project. A `LICENSE` file in `third-party/winfsp-sys/`
 carrying the MIT text and an attribution note ("Generated from WinFSP
 [vX.Y.Z](https://github.com/billziss-gh/winfsp), MIT © Bill Zissimopoulos")
 satisfies the MIT attribution requirement for redistribution.
+
+### 8.11 Overlay materialisation on Windows: copies, not links
+
+The three candidates were Windows symlinks, hard links, and file copies. Hard
+links were rejected outright: two names for the same bytes cannot express "my
+version shadows the package version" — editing through the Custom Scenery name
+edits the shared package data, which inverts the override model. That left:
+
+| | Windows symlinks | File copies |
+|---|---|---|
+| Privilege | Developer Mode or admin, per machine | none |
+| Override model | delete link, drop your file | edit the file directly |
+| Rebuild/update semantics | wipes user files (existing behaviour) | identical |
+| `xworld_pro` / `disable_overlays` | unchanged | unchanged |
+| Disk cost | zero | overlay data size (≈ MB per region) |
+| Code | `symlink_file` + capability check + error UX | `fs::copy` |
+
+Copies win on every axis except disk, and the disk cost is measured in
+megabytes against a product whose ortho packages run to gigabytes. Unix keeps
+symlinks; the mechanism is an implementation detail below the folder-level
+contract that every consumer (X-Plane, the preflight checks, the package
+commands) already treats as opaque.
+
+Note for the documentation pass (Phase 4 item 4): `docs/x-world-pro.md`
+step 4 references `install_XWP_Linux_Mac.sh`, a Unix-only script run by the
+user under X-World Pro's own instructions; the Windows guide must point
+Windows users at X-World Pro's Windows instructions instead. XEarthLayer
+itself never runs it.
 
 ---
 
