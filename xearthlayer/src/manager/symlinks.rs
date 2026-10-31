@@ -56,7 +56,8 @@ fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(_original: P, _link: Q) -> std::io::R
 /// overlay data is nav-data sized.
 #[cfg(not(target_os = "windows"))]
 fn materialize_overlay_leaf(source: &Path, target: &Path) -> std::io::Result<PathBuf> {
-    symlink(source, target)
+    symlink(source, target)?;
+    Ok(target.to_path_buf())
 }
 
 #[cfg(target_os = "windows")]
