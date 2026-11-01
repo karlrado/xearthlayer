@@ -5,7 +5,10 @@
 //! - [`inode`] - Inode allocation and management
 
 // Shared types used by fuse3
+pub mod attrs;
+pub mod error;
 pub mod inode;
+pub mod node;pub mod requestor;
 mod types;
 
 // Re-export shared types for use by fuse3 and public API
