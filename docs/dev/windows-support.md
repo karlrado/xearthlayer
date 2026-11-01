@@ -71,11 +71,11 @@ Consequences that fix the architecture:
   ```rust
   /// Neutral union-filesystem op surface. Implemented by `OrthoUnionCore`.
   pub trait UnionFilesystem: Send + Sync {
-      fn lookup(&self, node: &FsNode, name: &str) -> Result<FsNode, FsError>;
-      fn attrs(&self, node: &FsNode) -> Result<FileAttributes, FsError>;
+      async fn lookup(&self, node: &FsNode, name: &str) -> Result<FsNode, FsError>;
+      async fn attrs(&self, node: &FsNode) -> Result<FileAttributes, FsError>;
       async fn read(&self, node: &FsNode, fh: u64, offset: u64, size: usize)
           -> Result<Bytes, FsError>;
-      fn list_directory(&self, node: &FsNode) -> Result<Vec<DirEntry>, FsError>;
+      async fn list_directory(&self, node: &FsNode) -> Result<Vec<DirEntry>, FsError>;
       fn open(&self, node: &FsNode) -> Result<u64, FsError>;
       fn release(&self, fh: u64) -> Result<(), FsError>;
       fn statfs(&self) -> StatFsInfo;
