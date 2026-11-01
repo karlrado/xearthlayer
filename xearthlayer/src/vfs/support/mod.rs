@@ -6,10 +6,13 @@
 
 // Shared types used by fuse3
 pub mod attrs;
+pub mod core;
 pub mod error;
 pub mod inode;
-pub mod node;pub mod requestor;
+pub mod node;
+pub mod requestor;
 mod types;
+pub mod union;
 
 // Re-export shared types for use by fuse3 and public API
 pub use types::{DdsHandler, DdsRequest, DdsResponse};
