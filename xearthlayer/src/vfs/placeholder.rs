@@ -163,9 +163,9 @@ pub fn init_placeholder_cache() -> Result<(), DdsError> {
 /// The computation lives in `cache::integrity` (the canonical cache
 /// integrity model shared by all cache tiers) so that DDS disk cache
 /// validation and this FUSE-boundary check can never drift apart. This
-/// re-export exists so existing callers of `fuse::EXPECTED_DDS_SIZE` keep
-/// working. The dependency direction is `fuse -> cache::integrity`, never
-/// the reverse: `cache::integrity` must not import anything from `fuse`.
+/// re-export exists so existing callers of `vfs::EXPECTED_DDS_SIZE` keep
+/// working. The dependency direction is `vfs -> cache::integrity`, never
+/// the reverse: `cache::integrity` must not import anything from `vfs`.
 pub use crate::cache::integrity::EXPECTED_DDS_SIZE;
 
 /// Validates that DDS data is well-formed and returns it, or substitutes

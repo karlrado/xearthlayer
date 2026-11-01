@@ -116,7 +116,7 @@ pub(crate) const fn full_chain_bc1_dds_size(width: u32, height: u32) -> usize {
 /// This is the standard size for X-Plane ortho tiles: 13 levels, 11,184,952
 /// bytes. `validate_dds_or_placeholder` gates every FUSE read against it, so
 /// it must track what the encoder actually emits —
-/// `fuse::placeholder::tests::test_generate_default_placeholder` asserts both
+/// `vfs::placeholder::tests::test_generate_default_placeholder` asserts both
 /// agree, through the real `DdsEncoder`.
 ///
 // TODO(#253): BC1-only; texture.format also accepts bc3
