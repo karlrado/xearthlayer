@@ -130,9 +130,11 @@ Consequences that fix the architecture:
   the selected `dyn MountBackend` to mount it, and drives
   `Box<dyn MountSession>`. (The prototype has ~30 `cfg` blocks there; that is
   the regression this rule guards against.)
-- **One contract test suite** in `vfs/contract/` runs against every adapter —
-  both FUSE adapters in Phase 1; `WinFsp` added with the WinFSP adapter phase
-  — in place of per-backend op-level tests.
+- **One shared conformance suite** — `run_conformance_suite`, defined beside
+  the `UnionFilesystem` trait in `vfs/support/` (each adapter's test module
+  invokes it) — runs against every adapter: both FUSE adapters in Phase 1,
+  `WinFsp` added with the WinFSP adapter phase — in place of per-backend
+  op-level tests.
 - **Other platform differences** (unmount and stale-mount recovery, signals,
   process checks, disk capacity) follow the same pattern: narrow interfaces,
   not inline `cfg`. Where the code is plain Rust, use `cfg!` so it compiles
@@ -417,7 +419,9 @@ green.
    shared code move to the policy (except `crtime`'s one struct-shape `cfg`).
 4. `manager/mounts.rs` mounts through `dyn MountBackend` — no `cfg`, no
    backend named (acceptance test, §3).
-5. The contract suite in `vfs/contract/` runs against both FUSE adapters.
+5. The shared conformance suite (`run_conformance_suite`, defined beside the
+   `UnionFilesystem` trait in `vfs/support/`) is invoked by both FUSE
+   adapters' test modules.
 **Not in Phase 1 (explicitly):** any `winfsp`/`winfsp-sys` dependency or
 `vfs/winfsp/` module; any dependency-graph change; the gate-list plumbing
 (later phases).
