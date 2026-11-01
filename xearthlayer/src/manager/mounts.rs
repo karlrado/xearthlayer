@@ -12,8 +12,6 @@ use std::time::Duration;
 use crate::config::defaults::{
     DEFAULT_FUSE_CONGESTION_THRESHOLD, DEFAULT_FUSE_MAX_BACKGROUND, DEFAULT_GENERATION_TIMEOUT_SECS,
 };
-use crate::fuse::fuse3::Fuse3OrthoUnionFS;
-use crate::fuse::SpawnedMountHandle;
 use crate::geo_index::{DsfRegion, GeoIndex, PatchCoverage};
 use crate::metrics::TelemetrySnapshot;
 use crate::ortho_union::{
@@ -23,6 +21,8 @@ use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
+use crate::vfs::fuse3::Fuse3OrthoUnionFS;
+use crate::vfs::SpawnedMountHandle;
 use xearthlayer_package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
 };

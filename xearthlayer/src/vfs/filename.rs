@@ -130,7 +130,7 @@ fn dds_pattern() -> &'static Regex {
 /// # Examples
 ///
 /// ```
-/// use xearthlayer::fuse::parse_dds_filename;
+/// use xearthlayer::vfs::parse_dds_filename;
 ///
 /// // Europe tile
 /// let coords = parse_dds_filename("100000_125184_BI18.dds").unwrap();

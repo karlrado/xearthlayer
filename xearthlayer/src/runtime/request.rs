@@ -304,7 +304,7 @@ impl DdsResponse {
     }
 
     /// Converts from the fuse module's DdsResponse.
-    pub fn from_fuse(fuse: crate::fuse::DdsResponse) -> Self {
+    pub fn from_fuse(fuse: crate::vfs::DdsResponse) -> Self {
         // FUSE responses are always "successful" since they come from actual data
         let job_succeeded = !fuse.data.is_empty();
         Self {
@@ -316,8 +316,8 @@ impl DdsResponse {
     }
 
     /// Converts to the fuse module's DdsResponse.
-    pub fn to_fuse(self) -> crate::fuse::DdsResponse {
-        crate::fuse::DdsResponse {
+    pub fn to_fuse(self) -> crate::vfs::DdsResponse {
+        crate::vfs::DdsResponse {
             data: self.data,
             cache_hit: self.cache_hit,
             duration: self.duration,

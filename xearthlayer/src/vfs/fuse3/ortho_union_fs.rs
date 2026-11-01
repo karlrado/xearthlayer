@@ -41,13 +41,13 @@ use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
-use crate::fuse::coalesce::RequestCoalescer;
-use crate::fuse::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use crate::geo_index::GeoIndex;
 use crate::night::{BlackLitSource, LitTextureSource};
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
+use crate::vfs::coalesce::RequestCoalescer;
+use crate::vfs::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use bytes::Bytes;
 use dashmap::DashMap;
 use fuse3::raw::prelude::*;
@@ -125,8 +125,8 @@ const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::fuse::fuse3::Fuse3OrthoUnionFS;
 /// use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
+/// use xearthlayer::vfs::fuse3::Fuse3OrthoUnionFS;
 ///
 /// let index = OrthoUnionIndexBuilder::new()
 ///     .with_patches_dir("/home/user/.xearthlayer/patches")
@@ -1513,12 +1513,12 @@ mod tests {
 
     #[test]
     fn test_chunk_to_tile_coords() {
-        let coords = crate::fuse::DdsFilename {
+        let coords = crate::vfs::DdsFilename {
             row: 160000,
             col: 84000,
             zoom: 20,
             map_type: "BI".to_string(),
-            kind: crate::fuse::TextureKind::Ortho,
+            kind: crate::vfs::TextureKind::Ortho,
         };
 
         let tile = chunk_to_tile_coords(&coords);
@@ -1665,7 +1665,7 @@ mod tests {
         /// length, and a body whose byte at index i is `i as u8` so a slice
         /// proves which window was served.
         fn valid_dds() -> Vec<u8> {
-            let mut data: Vec<u8> = (0..crate::fuse::EXPECTED_DDS_SIZE)
+            let mut data: Vec<u8> = (0..crate::vfs::EXPECTED_DDS_SIZE)
                 .map(|i| i as u8)
                 .collect();
             data[0..4].copy_from_slice(b"DDS ");
@@ -1726,18 +1726,18 @@ mod tests {
             .unwrap();
 
         let (client, requests) = CountingDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE);
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE);
         (fs, requests, temp)
     }
 
     fn virtual_inode(fs: &Fuse3OrthoUnionFS) -> u64 {
         fs.inode_manager
-            .create_virtual_inode(crate::fuse::DdsFilename {
+            .create_virtual_inode(crate::vfs::DdsFilename {
                 row: 12754,
                 col: 5279,
                 zoom: 16,
                 map_type: "BI".to_string(),
-                kind: crate::fuse::TextureKind::Ortho,
+                kind: crate::vfs::TextureKind::Ortho,
             })
     }
 
@@ -1769,7 +1769,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ortho.attr.size,
-            crate::fuse::EXPECTED_DDS_SIZE as u64,
+            crate::vfs::EXPECTED_DDS_SIZE as u64,
             "ortho unchanged"
         );
         assert_ne!(lit.attr.ino, ortho.attr.ino);
@@ -1821,12 +1821,12 @@ mod tests {
     #[tokio::test]
     async fn test_request_dds_impl_serves_black_for_a_lit_name_without_a_request() {
         let (fs, requests, _temp) = virtual_dds_fixture();
-        let coords = crate::fuse::DdsFilename {
+        let coords = crate::vfs::DdsFilename {
             row: 25712,
             col: 12960,
             zoom: 16,
             map_type: "BI".to_string(),
-            kind: crate::fuse::TextureKind::Lit,
+            kind: crate::vfs::TextureKind::Lit,
         };
 
         let data = fs.request_dds_impl(&coords).await;
@@ -1857,7 +1857,7 @@ mod tests {
             .build()
             .unwrap();
         let (client, _requests) = CountingDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE);
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE);
 
         let entry = fs
             .lookup(test_request(), textures_inode(&fs), lit_name())
@@ -1866,7 +1866,7 @@ mod tests {
 
         assert_eq!(entry.attr.size, 10, "the real file, not the 152-byte black");
         assert!(
-            entry.attr.ino < crate::fuse::support::inode::VIRTUAL_INODE_BASE,
+            entry.attr.ino < crate::vfs::support::inode::VIRTUAL_INODE_BASE,
             "a real file has a real inode"
         );
     }
@@ -1878,13 +1878,13 @@ mod tests {
         impl crate::night::LitTextureSource for Fixed {
             fn size<'a>(
                 &'a self,
-                _n: &'a crate::fuse::DdsFilename,
+                _n: &'a crate::vfs::DdsFilename,
             ) -> futures::future::BoxFuture<'a, u64> {
                 Box::pin(async { 1000 })
             }
             fn read<'a>(
                 &'a self,
-                _n: &'a crate::fuse::DdsFilename,
+                _n: &'a crate::vfs::DdsFilename,
                 _o: u64,
                 _l: u32,
             ) -> futures::future::BoxFuture<'a, Bytes> {
@@ -2078,7 +2078,7 @@ mod tests {
         let (fs, _requests, _temp) = virtual_dds_fixture();
         let ino = virtual_inode(&fs);
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
-        let size = crate::fuse::EXPECTED_DDS_SIZE as u64;
+        let size = crate::vfs::EXPECTED_DDS_SIZE as u64;
 
         let tail = fs
             .read(test_request(), ino, opened.fh, size - 100, 4096)
@@ -2128,12 +2128,12 @@ mod tests {
         for col in 0..3u32 {
             let ino = fs
                 .inode_manager
-                .create_virtual_inode(crate::fuse::DdsFilename {
+                .create_virtual_inode(crate::vfs::DdsFilename {
                     row: 12754,
                     col: 5279 + col,
                     zoom: 16,
                     map_type: "BI".to_string(),
-                    kind: crate::fuse::TextureKind::Ortho,
+                    kind: crate::vfs::TextureKind::Ortho,
                 });
             let reply = fs.open(test_request(), ino, 0).await.unwrap();
             fs.read(test_request(), ino, reply.fh, 0, 4096)
@@ -2144,7 +2144,7 @@ mod tests {
 
         assert_eq!(fs.open_dds_handles(), 3);
         let pinned_at_peak = fs.pinned_tile_bytes();
-        assert_eq!(pinned_at_peak, 3 * crate::fuse::EXPECTED_DDS_SIZE as u64);
+        assert_eq!(pinned_at_peak, 3 * crate::vfs::EXPECTED_DDS_SIZE as u64);
 
         for (ino, fh) in opened {
             fs.release(test_request(), ino, fh, 0, 0, false)
@@ -2183,7 +2183,7 @@ mod tests {
             .unwrap();
         let (client, _requests) = CountingDdsClient::new();
         let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::fuse::EXPECTED_DDS_SIZE)
+        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE)
             .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
         let ino = virtual_inode(&fs);
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
@@ -3075,7 +3075,7 @@ mod tests {
         };
 
         // Virtual DDS inode (above VIRTUAL_INODE_BASE)
-        use crate::fuse::support::inode::VIRTUAL_INODE_BASE;
+        use crate::vfs::support::inode::VIRTUAL_INODE_BASE;
         let virtual_inode = VIRTUAL_INODE_BASE + 42;
         let result: Fuse3InternalResult<ReplyOpen> =
             fs.open(req, virtual_inode, libc::O_RDONLY as u32).await;
@@ -3185,12 +3185,12 @@ mod tests {
                 .ok();
         });
 
-        let coords = crate::fuse::DdsFilename {
+        let coords = crate::vfs::DdsFilename {
             row: tile.row * 16,
             col: tile.col * 16,
             zoom: tile.zoom + 4,
             map_type: "BI".to_string(),
-            kind: crate::fuse::TextureKind::Ortho,
+            kind: crate::vfs::TextureKind::Ortho,
         };
         let _ = fs.request_dds_impl(&coords).await;
         responder.await.unwrap();

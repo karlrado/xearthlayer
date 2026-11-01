@@ -122,7 +122,7 @@ pub fn parse_dds_filename(filename: &str) -> Result<DdsFilename, ParseError>
 
 **Example:**
 ```rust
-use xearthlayer::fuse::parse_dds_filename;
+use xearthlayer::vfs::parse_dds_filename;
 
 let coords = parse_dds_filename("100000_125184_BI18.dds")?;
 assert_eq!(coords.row, 100000);
@@ -501,8 +501,8 @@ println!("Tile bounds: ({}, {}) to ({}, {})", nw_lat, nw_lon, se_lat, se_lon);
 ### Working with AutoOrtho Filenames
 
 ```rust
-use xearthlayer::fuse::parse_dds_filename;
 use xearthlayer::coord::{TileCoord, tile_to_lat_lon_center};
+use xearthlayer::vfs::parse_dds_filename;
 
 // Parse an AutoOrtho DDS filename
 let coords = parse_dds_filename("100000_125184_BI18.dds")?;

@@ -12,7 +12,7 @@
 //! ensure safe concurrent access from async contexts without blocking Tokio
 //! worker threads.
 
-use crate::fuse::{DdsFilename, TextureKind};
+use crate::vfs::{DdsFilename, TextureKind};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -43,8 +43,8 @@ pub const LIT_INODE_FLAG: u64 = 1 << 59;
 /// # Example
 ///
 /// ```ignore
-/// use xearthlayer::fuse::support::inode::InodeManager;
 /// use std::path::PathBuf;
+/// use xearthlayer::vfs::support::inode::InodeManager;
 ///
 /// let manager = InodeManager::new(PathBuf::from("/scenery"));
 ///

@@ -124,12 +124,12 @@ impl LitGenerator for CpuLitGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::{DdsFilename, TextureKind};
     use crate::night::generator::field::tests_support::synthetic;
     use crate::night::generator::led::{LedModel, LedRegion, RegionTone, Tone};
     use crate::night::generator::noise::{hash2, unit};
     use crate::night::parse_recipe;
     use crate::night::recipe::Recipe;
+    use crate::vfs::{DdsFilename, TextureKind};
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 

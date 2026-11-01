@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use crate::coord::TileCoord;
 use crate::executor::DdsClient;
-use crate::fuse::coalesce::{CoalesceResult, CoalescedResult, RequestCoalescer};
-use crate::fuse::{get_default_placeholder, validate_dds_or_placeholder, DdsFilename};
+use crate::vfs::coalesce::{CoalesceResult, CoalescedResult, RequestCoalescer};
+use crate::vfs::{get_default_placeholder, validate_dds_or_placeholder, DdsFilename};
 
 /// Time-to-live for FUSE attribute caching.
 ///
@@ -363,7 +363,7 @@ pub trait DdsRequestor: FileAttrBuilder {
         // Defence in depth (R8): lit names are routed to the lit source before
         // they get here. If one arrives anyway, it must never reach the
         // coalescer or the client, whose keys would collide with the ortho tile.
-        if coords.kind == crate::fuse::TextureKind::Lit {
+        if coords.kind == crate::vfs::TextureKind::Lit {
             return crate::night::minimal_black_dds();
         }
 
@@ -562,7 +562,7 @@ mod tests {
             col: 125184,
             zoom: 18,
             map_type: "BI".to_string(),
-            kind: crate::fuse::TextureKind::Ortho,
+            kind: crate::vfs::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.row, 100000 / 16);
@@ -577,7 +577,7 @@ mod tests {
             col: 10368,
             zoom: 16,
             map_type: "GO2".to_string(),
-            kind: crate::fuse::TextureKind::Ortho,
+            kind: crate::vfs::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.row, 25264 / 16);
@@ -593,7 +593,7 @@ mod tests {
             col: 200,
             zoom: 2,
             map_type: "BI".to_string(),
-            kind: crate::fuse::TextureKind::Ortho,
+            kind: crate::vfs::TextureKind::Ortho,
         };
         let tile = chunk_to_tile_coords(&coords);
         assert_eq!(tile.zoom, 0); // saturating_sub prevents underflow

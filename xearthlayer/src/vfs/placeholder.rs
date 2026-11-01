@@ -44,8 +44,8 @@ static DEFAULT_PLACEHOLDER: OnceLock<Bytes> = OnceLock::new();
 /// # Examples
 ///
 /// ```
-/// use xearthlayer::fuse::generate_magenta_placeholder;
 /// use xearthlayer::dds::DdsFormat;
+/// use xearthlayer::vfs::generate_magenta_placeholder;
 ///
 /// let placeholder = generate_magenta_placeholder(4096, 4096, DdsFormat::BC1, 5).unwrap();
 /// assert!(placeholder.len() > 0);
@@ -107,7 +107,7 @@ pub fn generate_default_placeholder() -> Result<Vec<u8>, DdsError> {
 /// # Example
 ///
 /// ```
-/// use xearthlayer::fuse::get_default_placeholder;
+/// use xearthlayer::vfs::get_default_placeholder;
 ///
 /// // Always returns valid DDS data
 /// let placeholder = get_default_placeholder();
@@ -139,7 +139,7 @@ pub fn get_default_placeholder() -> Bytes {
 /// # Example
 ///
 /// ```
-/// use xearthlayer::fuse::init_placeholder_cache;
+/// use xearthlayer::vfs::init_placeholder_cache;
 ///
 /// // Initialize at startup
 /// init_placeholder_cache().expect("Failed to initialize placeholder cache");
