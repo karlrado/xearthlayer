@@ -290,7 +290,7 @@ parallel directory. New, backend-neutral members:
   pub enum FsError {
       NotFound,       // FUSE: ENOENT      WinFSP: ERROR_FILE_NOT_FOUND
       NotADirectory,  // FUSE: ENOTDIR     WinFSP: ERROR_NOT_DIR
-      Io,             // other I/O failures
+      Io(#[from] io::Error),             // other I/O failures (carries the OS error)
   }
   ```
 - **Seam types** (`attrs`): `FileAttributes`, `DirEntry`, `StatFsInfo`,
