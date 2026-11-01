@@ -37,7 +37,7 @@
 //! missing textures dynamically using its configured imagery provider.
 
 use super::inode::InodeManager;
-use super::shared::{DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
+use super::shared::{to_file_attr, DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
 use crate::coord::TileCoord;
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
@@ -47,6 +47,9 @@ use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::vfs::coalesce::RequestCoalescer;
+use crate::vfs::support::attrs::{FileAttributes, NodeKind};
+use crate::vfs::support::error::FsError;
+use crate::vfs::support::node::FsNode;
 use crate::vfs::{get_default_placeholder, parse_dds_filename, DdsFilename, TextureKind};
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -64,7 +67,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::OnceCell;
@@ -581,6 +584,19 @@ impl Fuse3OrthoUnionFS {
     async fn request_dds(&self, name_str: &str) -> Option<Bytes> {
         let coords = parse_dds_filename(name_str).ok()?;
         Some(self.request_dds_impl(&coords).await)
+    }
+
+    /// Map a neutral core node onto the FUSE inode that represents it.
+    fn inode_for(&self, node: &FsNode) -> u64 {
+        match node {
+            FsNode::VirtualDds(coords) => self.inode_manager.create_virtual_inode(coords.clone()),
+            // Root is always inode 1.
+            FsNode::Directory(p) if p.as_os_str().is_empty() => 1,
+            _ => {
+                let path = node.path().expect("Directory/RealFile nodes carry a path");
+                self.inode_manager.get_or_create_inode(path)
+            }
+        }
     }
 }
 
@@ -1302,6 +1318,40 @@ impl Filesystem for Fuse3OrthoUnionFS {
             namelen: 255,
             frsize: 4096,
         })
+    }
+}
+
+/// Map the core's neutral error onto FUSE's.
+fn errno_from(err: FsError) -> Errno {
+    match err {
+        FsError::NotFound => Errno::from(libc::ENOENT),
+        FsError::NotADirectory => Errno::from(libc::ENOTDIR),
+        FsError::Io(_) => Errno::from(libc::EIO),
+    }
+}
+
+/// Whether a resolved core node is a real file of the union, as opposed to
+/// a virtual directory or a generated texture.
+fn is_real_file(node: &FsNode, attrs: &FileAttributes) -> bool {
+    matches!(node, FsNode::RealFile(_)) && attrs.kind != NodeKind::Directory
+}
+
+/// Apply the adapter's identity and time policy to a core node's neutral
+/// attributes: real files keep the source's uid/gid and report `UNIX_EPOCH` as
+/// `ctime`; everything else (virtual directories, generated textures, and file
+/// entries whose metadata could not be read) is owned by the mounting process
+/// and reports the current time.
+fn file_attr(ino: u64, real_file: bool, attrs: &FileAttributes) -> FileAttr {
+    if real_file {
+        to_file_attr(ino, attrs, UNIX_EPOCH, attrs.uid, attrs.gid)
+    } else {
+        to_file_attr(
+            ino,
+            attrs,
+            SystemTime::now(),
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
+        )
     }
 }
 

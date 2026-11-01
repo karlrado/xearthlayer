@@ -13,10 +13,11 @@
 use std::os::unix::fs::MetadataExt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub use crate::vfs::support::attrs::{chunk_to_tile_coords, VirtualDdsConfig};
+use crate::vfs::support::attrs::{FileAttributes, NodeKind};
+pub use crate::vfs::support::requestor::DdsRequestor;
 use fuse3::raw::reply::FileAttr;
 use fuse3::FileType;
-pub use crate::vfs::support::attrs::{chunk_to_tile_coords, VirtualDdsConfig};
-pub use crate::vfs::support::requestor::DdsRequestor;
 
 /// Time-to-live for FUSE attribute caching.
 ///
@@ -176,3 +177,37 @@ pub trait FileAttrBuilder {
     }
 }
 
+pub fn to_file_attr(
+    ino: u64,
+    attrs: &FileAttributes,
+    ctime: SystemTime,
+    uid: u32,
+    gid: u32,
+) -> FileAttr {
+    let kind = match attrs.kind {
+        NodeKind::Directory => FileType::Directory,
+        NodeKind::Symlink => FileType::Symlink,
+        NodeKind::RegularFile => FileType::RegularFile,
+    };
+    let ctime = ctime.into();
+
+    FileAttr {
+        ino,
+        size: attrs.size,
+        blocks: attrs.blocks,
+        atime: attrs.atime.into(),
+        mtime: attrs.mtime.into(),
+        ctime,
+        kind,
+        perm: attrs.perm,
+        nlink: attrs.nlink,
+        uid,
+        gid,
+        rdev: attrs.rdev,
+        blksize: attrs.blksize,
+        #[cfg(target_os = "macos")]
+        crtime: ctime,
+        #[cfg(target_os = "macos")]
+        flags: 0,
+    }
+}
