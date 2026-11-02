@@ -21,8 +21,8 @@ use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
-use crate::vfs::fuse3::{current_platform, Fuse3OrthoUnionFS};
-use crate::vfs::SpawnedMountHandle;
+use crate::vfs::support::core::OrthoUnionCore;
+use crate::vfs::{select_backend, MountRequest, MountSession};
 use xearthlayer_package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
 };
@@ -117,8 +117,8 @@ impl ConsolidatedOrthoMountResult {
 /// static DSF files that don't need on-demand generation.
 pub struct MountManager {
     /// Active mount sessions, keyed by region.
-    /// Uses SpawnedMountHandle which can be safely dropped from any context.
-    sessions: HashMap<String, SpawnedMountHandle>,
+    /// Dropping a session unmounts its filesystem (the session owns the mount task).
+    sessions: HashMap<String, Box<dyn MountSession>>,
     /// Services that own the Tokio runtimes - MUST be kept alive while sessions are active.
     /// The service contains the runtime that processes DDS generation requests.
     services: HashMap<String, XEarthLayerService>,
@@ -128,13 +128,13 @@ pub struct MountManager {
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
     /// Active patches union filesystem mount (if any).
-    patches_session: Option<SpawnedMountHandle>,
+    patches_session: Option<Box<dyn MountSession>>,
     /// Patches mount info for display.
     patches_mount: Option<ActiveMount>,
     /// Service for patches (owns the runtime for DDS generation).
     patches_service: Option<XEarthLayerService>,
     /// Consolidated ortho union filesystem mount (if any).
-    consolidated_session: Option<SpawnedMountHandle>,
+    consolidated_session: Option<Box<dyn MountSession>>,
     /// Consolidated ortho mount info for display.
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
@@ -569,40 +569,41 @@ impl MountManager {
         // so the filesystem accounts against the same one prefetch reads (#246).
         let pinned_budget = dds_client.pinned_budget();
 
-        // Transitional: the manager picks this platform's FUSE policy until
-        // it mounts through a MountBackend.
-        let fuse_platform = current_platform();
-
-        let mut ortho_union_fs = Fuse3OrthoUnionFS::new(
-            (*index_for_prefetch).clone(),
-            dds_client,
-            expected_dds_size,
-            fuse_platform,
-        )
-        .with_geo_index(Arc::clone(&geo_index))
-        .with_state_observer(state_observer)
-        .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
-        .with_timeout(Duration::from_secs(self.generation_timeout_secs));
+        // Build the neutral core the backend will mount. It carries the
+        // generation behavior (sources, budget, timeout, ...); the platform
+        // policy and the FUSE background-request limits live in the adapter and
+        // the mount request, not here.
+        let mut core =
+            OrthoUnionCore::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
+                .with_geo_index(Arc::clone(&geo_index))
+                .with_state_observer(state_observer)
+                .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
         if let Some(budget) = pinned_budget {
-            ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
+            core = core.with_pinned_budget(budget);
         }
 
         if self.night_enabled {
             if let Some(source) =
                 self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
             {
-                ortho_union_fs = ortho_union_fs.with_lit_source(source);
+                core = core.with_lit_source(source);
             }
         }
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = metrics_client {
-            ortho_union_fs = ortho_union_fs.with_metrics(metrics);
+            core = core.with_metrics(metrics);
         }
-        let mountpoint_str = mountpoint.to_string_lossy();
 
-        let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));
+        // Mount through the neutral seam. The backend picks this OS's platform
+        // policy and applies the FUSE background-request limits from the
+        // request; it returns a live session we hold without naming a backend.
+        let request = MountRequest::new(mountpoint.clone())
+            .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
+        let backend = select_backend();
+
+        let mount_result = runtime_handle.block_on(backend.mount(core, request));
 
         match mount_result {
             Ok(session) => {
