@@ -800,6 +800,8 @@ mod tests {
     use crate::executor::{DdsClientError, Priority};
     use crate::ortho_union::OrthoUnionIndexBuilder;
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
+    use crate::vfs::support::requestor::DdsRequestor;
+    use bytes::Bytes;
     use semver::Version;
     use std::sync::Arc;
     use tempfile::TempDir;
@@ -1046,7 +1048,7 @@ mod tests {
         let client = create_test_client();
         let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_timeout(Duration::from_secs(60));
 
-        assert_eq!(fs.generation_timeout, Duration::from_secs(60));
+        assert_eq!(fs.core.generation_timeout(), Duration::from_secs(60));
     }
 
     /// Test that readdirplus returns correct file sizes for passthrough files.
@@ -1290,7 +1292,7 @@ mod tests {
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "lit files hold no memoising handle");
-        assert!(fs.dds_handles.is_empty());
+        assert!(fs.core.dds_handles().is_empty());
 
         let data = fs
             .read(test_request(), ino, opened.fh, 0, 1 << 20)
@@ -1316,7 +1318,7 @@ mod tests {
             kind: crate::vfs::TextureKind::Lit,
         };
 
-        let data = fs.request_dds_impl(&coords).await;
+        let data = fs.core.request_dds_impl(&coords).await;
 
         assert_eq!(data, crate::night::minimal_black_dds());
         assert_eq!(data.len(), 152);
@@ -1433,7 +1435,7 @@ mod tests {
         let ino = virtual_inode(&fs);
 
         // One tile short of the ceiling: pinned + expected must exceed it.
-        fs.pinned.pin(fs.pinned.ceiling_bytes());
+        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
@@ -1442,7 +1444,7 @@ mod tests {
             "the file must still bypass the page cache"
         );
         assert!(
-            fs.dds_handles.is_empty(),
+            fs.core.dds_handles().is_empty(),
             "a refused open must not leave a handle behind"
         );
     }
@@ -1455,7 +1457,7 @@ mod tests {
 
         let (fs, mut rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned.pin(fs.pinned.ceiling_bytes());
+        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
 
         for _ in 0..3 {
             let opened = fs.open(test_request(), ino, 0).await.unwrap();
@@ -1475,20 +1477,20 @@ mod tests {
 
         let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.pinned.pin(fs.pinned.ceiling_bytes());
+        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
 
         // Assert the claim, not the flag. A flag assertion passes even if the
         // warn is emitted unconditionally, so long as something sets it.
         fs.open(test_request(), ino, 0).await.unwrap();
         assert!(
-            !fs.claim_budget_warning(),
+            !fs.core.claim_budget_warning(),
             "the first refusal must have consumed the one-shot claim"
         );
 
         for _ in 0..3 {
             fs.open(test_request(), ino, 0).await.unwrap();
             assert!(
-                !fs.claim_budget_warning(),
+                !fs.core.claim_budget_warning(),
                 "later refusals must not re-arm the warning"
             );
         }
@@ -1499,9 +1501,9 @@ mod tests {
     fn test_claim_budget_warning_is_one_shot() {
         let (fs, _requests, _temp) = virtual_dds_fixture();
 
-        assert!(fs.claim_budget_warning(), "first claim must succeed");
+        assert!(fs.core.claim_budget_warning(), "first claim must succeed");
         for _ in 0..5 {
-            assert!(!fs.claim_budget_warning(), "every later claim must fail");
+            assert!(!fs.core.claim_budget_warning(), "every later claim must fail");
         }
     }
 
@@ -1729,7 +1731,7 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = fs.dds_handles.get(&opened.fh).expect("handle is live");
+        let handle = fs.core.dds_handles().get(&opened.fh).expect("handle is live");
         let tile = handle.tile.get().expect("first read produced the tile");
 
         // The reply's buffer must sit inside the tile's allocation, at the
@@ -2679,7 +2681,7 @@ mod tests {
             map_type: "BI".to_string(),
             kind: crate::vfs::TextureKind::Ortho,
         };
-        let _ = fs.request_dds_impl(&coords).await;
+        let _ = fs.core.request_dds_impl(&coords).await;
         responder.await.unwrap();
 
         geo_index.get::<PrefetchedRegion>(&region).is_some()
