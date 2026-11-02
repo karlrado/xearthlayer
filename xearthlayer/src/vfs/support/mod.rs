@@ -6,6 +6,8 @@
 
 // Shared types used by fuse3
 pub mod attrs;
+#[cfg(test)]
+pub(crate) mod conformance;
 pub mod core;
 pub mod error;
 pub mod inode;
