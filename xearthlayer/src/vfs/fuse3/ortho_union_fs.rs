@@ -171,12 +171,17 @@ impl Fuse3OrthoUnionFS {
         index: OrthoUnionIndex,
         dds_client: Arc<dyn DdsClient>,
         expected_dds_size: usize,
-        disk_io_limiter: Arc<StorageConcurrencyLimiter>
+        disk_io_limiter: Arc<StorageConcurrencyLimiter>,
     ) -> Self {
         let virtual_root = PathBuf::from("/");
 
         Self {
-            core: OrthoUnionCore::with_disk_io_limiter(index, dds_client, expected_dds_size, disk_io_limiter),
+            core: OrthoUnionCore::with_disk_io_limiter(
+                index,
+                dds_client,
+                expected_dds_size,
+                disk_io_limiter,
+            ),
             inode_manager: InodeManager::new(virtual_root),
             fuse_max_background: None,
             fuse_congestion_threshold: None,
@@ -1503,7 +1508,10 @@ mod tests {
 
         assert!(fs.core.claim_budget_warning(), "first claim must succeed");
         for _ in 0..5 {
-            assert!(!fs.core.claim_budget_warning(), "every later claim must fail");
+            assert!(
+                !fs.core.claim_budget_warning(),
+                "every later claim must fail"
+            );
         }
     }
 
@@ -1731,7 +1739,11 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = fs.core.dds_handles().get(&opened.fh).expect("handle is live");
+        let handle = fs
+            .core
+            .dds_handles()
+            .get(&opened.fh)
+            .expect("handle is live");
         let tile = handle.tile.get().expect("first read produced the tile");
 
         // The reply's buffer must sit inside the tile's allocation, at the
