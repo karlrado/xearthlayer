@@ -814,6 +814,20 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use xearthlayer_package::{InstalledPackage, Package, PackageType};
 
+    /// The neutral conformance suite, invoked from this adapter's test module.
+    ///
+    /// Every backend runs the same suite (see `vfs/support/conformance`): it
+    /// drives the `UnionFilesystem` contract against the shared core, so the
+    /// behaviour is defined once and each adapter only adds its own
+    /// translation tests. This is the FUSE adapter's copy of the invocation.
+    #[tokio::test]
+    async fn conformance() {
+        use crate::vfs::support::conformance::{conformance_core, run_conformance_suite};
+
+        let (core, _temp) = conformance_core();
+        run_conformance_suite(&core).await;
+    }
+
     /// #305: Finder shows a mounted volume's name in place of its mount-point
     /// folder, and macFUSE's default is `macFUSE Volume 0 (<process>)`.
     #[test]
