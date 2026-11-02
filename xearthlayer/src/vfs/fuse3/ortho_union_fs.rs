@@ -788,6 +788,10 @@ mod tests {
     /// drives the `UnionFilesystem` contract against the shared core, so the
     /// behaviour is defined once and each adapter only adds its own
     /// translation tests. This is the FUSE adapter's copy of the invocation.
+    ///
+    /// The adapter's FUSE op-level tests intentionally overlap the suite: they
+    /// exercise the FUSE translation path the core-level suite cannot see.
+    /// Pruning that overlap is deferred.
     #[tokio::test]
     async fn conformance() {
         use crate::vfs::support::conformance::{conformance_core, run_conformance_suite};
