@@ -24,11 +24,13 @@
 //! - **Concurrency**: DDS requests processed in parallel
 //! - **Self reference**: `&self` (immutable), enabling shared concurrent access
 
+mod fuse_platform;
 mod inode;
 mod ortho_union_fs;
 mod shared;
 mod types;
 
+pub use fuse_platform::{current_platform, FusePlatform, Linux, Mac};
 pub use ortho_union_fs::Fuse3OrthoUnionFS;
 pub use shared::{chunk_to_tile_coords, DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
 pub use types::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};

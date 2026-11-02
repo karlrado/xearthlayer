@@ -36,6 +36,7 @@
 //! This ensures sources can include pre-built textures, but XEL generates
 //! missing textures dynamically using its configured imagery provider.
 
+use super::fuse_platform::FusePlatform;
 use super::inode::InodeManager;
 use super::shared::{to_file_attr, FileAttrBuilder, VirtualDdsConfig, TTL};
 use super::types::{Fuse3Error, Fuse3Result};
@@ -65,37 +66,6 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, trace};
 
-/// FUSE open flag: bypass kernel page cache for this file.
-///
-/// From `linux/fuse.h`: `#define FOPEN_DIRECT_IO (1 << 0)`
-///
-/// When set in `ReplyOpen::flags`, the kernel sends every `read()` through
-/// the FUSE handler instead of serving from its page cache. Used for virtual
-/// DDS files so that every X-Plane read is counted (`MetricEvent::FuseRead`)
-/// and none is answered from a cache this filesystem cannot invalidate.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-const FOPEN_DIRECT_IO: u32 = 1;
-
-/// Open flags reported for virtual DDS files.
-///
-/// Linux uses [`FOPEN_DIRECT_IO`]: every `read()` reaches this handler, so the
-/// FUSE read counters are exact and the page cache never holds a second copy
-/// of a tile the memory cache already has.
-///
-/// **macOS must not.** X-Plane memory-maps texture files, and macFUSE faults
-/// with `EXC_BAD_ACCESS` when a `direct_io` file is `mmap`ed, because `mmap`
-/// needs the page cache that `direct_io` bypasses. macOS therefore serves
-/// virtual DDS through the page cache, trading per-read visibility for not
-/// crashing the sim's texture loader. The one consequence is that the FUSE
-/// read counters under-report there: a tile's cold first read reaches this
-/// handler and repeat reads are answered by the kernel. Nothing functional
-/// depends on seeing every read (#204): prefetch is driven by telemetry, and
-/// the cold reads that trigger generation still arrive.
-#[cfg(not(target_os = "macos"))]
-const VIRTUAL_DDS_OPEN_FLAGS: u32 = FOPEN_DIRECT_IO;
-#[cfg(target_os = "macos")]
-const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
-
 /// Consolidated ortho union FUSE filesystem.
 ///
 /// This filesystem merges all ortho sources (patches + regional packages) into
@@ -118,11 +88,13 @@ const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
 ///     .add_packages(installed_packages)
 ///     .build()?;
 ///
-/// let fs = Fuse3OrthoUnionFS::new(index, dds_handler, expected_dds_size);
+/// let fs = Fuse3OrthoUnionFS::new(index, dds_client, expected_dds_size, platform);
 /// fs.mount_spawned("/path/to/mountpoint").await?;
 /// ```
 pub struct Fuse3OrthoUnionFS {
     core: OrthoUnionCore,
+    /// Platform-specific FUSE behavior (virtual-DDS open flags, volume name).
+    platform: Arc<dyn FusePlatform>,
     /// Inode manager for path mappings
     inode_manager: InodeManager,
     /// Maximum pending background FUSE requests (kernel limit).
@@ -145,22 +117,18 @@ impl Fuse3OrthoUnionFS {
     /// # Example
     ///
     /// ```ignore
-    /// let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016);
+    /// let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016, platform);
     /// ```
     pub fn new(
         index: OrthoUnionIndex,
         dds_client: Arc<dyn DdsClient>,
         expected_dds_size: usize,
+        platform: Arc<dyn FusePlatform>,
     ) -> Self {
-        // Use a virtual root path for the inode manager
-        let virtual_root = PathBuf::from("/");
-
-        Self {
-            core: OrthoUnionCore::new(index, dds_client, expected_dds_size),
-            inode_manager: InodeManager::new(virtual_root),
-            fuse_max_background: None,
-            fuse_congestion_threshold: None,
-        }
+        Self::with_core(
+            OrthoUnionCore::new(index, dds_client, expected_dds_size),
+            platform,
+        )
     }
 
     /// Create with custom disk I/O limiter.
@@ -172,16 +140,31 @@ impl Fuse3OrthoUnionFS {
         dds_client: Arc<dyn DdsClient>,
         expected_dds_size: usize,
         disk_io_limiter: Arc<StorageConcurrencyLimiter>,
+        platform: Arc<dyn FusePlatform>,
     ) -> Self {
-        let virtual_root = PathBuf::from("/");
-
-        Self {
-            core: OrthoUnionCore::with_disk_io_limiter(
+        Self::with_core(
+            OrthoUnionCore::with_disk_io_limiter(
                 index,
                 dds_client,
                 expected_dds_size,
                 disk_io_limiter,
             ),
+            platform,
+        )
+    }
+
+    /// Create from an already-built core.
+    ///
+    /// The core carries the generation behavior (timeout, budget, sources,
+    /// metrics, ...); the platform carries the FUSE-protocol differences
+    /// (virtual-DDS open flags, volume name).
+    pub fn with_core(core: OrthoUnionCore, platform: Arc<dyn FusePlatform>) -> Self {
+        // Use a virtual root path for the inode manager
+        let virtual_root = PathBuf::from("/");
+
+        Self {
+            core,
+            platform,
             inode_manager: InodeManager::new(virtual_root),
             fuse_max_background: None,
             fuse_congestion_threshold: None,
@@ -299,7 +282,7 @@ impl Fuse3OrthoUnionFS {
     /// For non-blocking usage, see [`mount_spawned`](Self::mount_spawned).
     pub async fn mount(self, mountpoint: &str) -> Fuse3Result<super::types::MountHandle> {
         let mount_path = PathBuf::from(mountpoint);
-        let mount_options = mount_options(&mount_path);
+        let mount_options = self.mount_options(&mount_path);
 
         // State the ceiling once, so a flight log is self-describing: a reader
         // comparing dds_pinned_peak_mb against it does not have to know the
@@ -343,7 +326,7 @@ impl Fuse3OrthoUnionFS {
         mountpoint: &str,
     ) -> Fuse3Result<super::types::SpawnedMountHandle> {
         let mount_path = PathBuf::from(mountpoint);
-        let mount_options = mount_options(&mount_path);
+        let mount_options = self.mount_options(&mount_path);
 
         #[cfg(target_os = "linux")]
         let handle = fuse3::raw::Session::new(mount_options)
@@ -374,36 +357,20 @@ impl Fuse3OrthoUnionFS {
             }
         }
     }
-}
 
-/// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
-/// [`Fuse3OrthoUnionFS::mount_spawned`].
-fn mount_options(mount_path: &Path) -> MountOptions {
-    let mut mount_options = MountOptions::default();
-    mount_options.read_only(true);
-    mount_options.force_readdir_plus(false);
-    // Tell kernel we don't implement opendir - it should call readdir directly
-    mount_options.no_open_dir_support(true);
-    if let Some(volname) = volume_name_option(mount_path, cfg!(target_os = "macos")) {
-        mount_options.custom_options(volname);
+    /// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
+    /// [`Fuse3OrthoUnionFS::mount_spawned`].
+    fn mount_options(&self, mount_path: &Path) -> MountOptions {
+        let mut mount_options = MountOptions::default();
+        mount_options.read_only(true);
+        mount_options.force_readdir_plus(false);
+        // Tell kernel we don't implement opendir - it should call readdir directly
+        mount_options.no_open_dir_support(true);
+        if let Some(volname) = self.platform.volume_name_option(mount_path) {
+            mount_options.custom_options(volname);
+        }
+        mount_options
     }
-    mount_options
-}
-
-/// The macFUSE `volname` option naming the volume after its mount-point
-/// folder (#305).
-///
-/// Finder shows a mounted volume's name in place of the folder it is mounted
-/// on, and macFUSE's default is `macFUSE Volume 0 (<process>)`, so without
-/// this `zzXEL_ortho` appears in Custom Scenery under that name. `None` off
-/// macOS, which has no volume names, and for a folder name containing a
-/// comma, which macFUSE would split into a second option.
-fn volume_name_option(mount_path: &Path, macos: bool) -> Option<String> {
-    if !macos {
-        return None;
-    }
-    let name = mount_path.file_name()?.to_str()?;
-    (!name.contains(',')).then(|| format!("volname={name}"))
 }
 
 // =============================================================================
@@ -674,14 +641,14 @@ impl Filesystem for Fuse3OrthoUnionFS {
             return Ok(ReplyOpen { fh: 0, flags: 0 });
         }
 
-        // Virtual DDS files: bypass the kernel page cache so every read()
-        // reaches this handler (see VIRTUAL_DDS_OPEN_FLAGS).
+        // Virtual DDS files: the open flags come from the platform policy
+        // (page-cache bypass on Linux, page cache on macOS).
         let Some(coords) = self.inode_manager.get_virtual_dds(inode) else {
             // An inode we cannot map to a tile gets no handle rather than an
             // error: read() is where a genuinely unknown one becomes ENOENT.
             return Ok(ReplyOpen {
                 fh: 0,
-                flags: VIRTUAL_DDS_OPEN_FLAGS,
+                flags: self.platform.virtual_dds_open_flags(),
             });
         };
 
@@ -694,7 +661,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         Ok(ReplyOpen {
             fh,
-            flags: VIRTUAL_DDS_OPEN_FLAGS,
+            flags: self.platform.virtual_dds_open_flags(),
         })
     }
 
@@ -799,6 +766,7 @@ fn file_attr(ino: u64, real_file: bool, attrs: &FileAttributes) -> FileAttr {
 
 #[cfg(test)]
 mod tests {
+    use super::super::fuse_platform::Linux;
     use super::super::shared::chunk_to_tile_coords;
     use super::*;
     use crate::coord::TileCoord;
@@ -826,34 +794,6 @@ mod tests {
 
         let (core, _temp) = conformance_core();
         run_conformance_suite(&core).await;
-    }
-
-    /// #305: Finder shows a mounted volume's name in place of its mount-point
-    /// folder, and macFUSE's default is `macFUSE Volume 0 (<process>)`.
-    #[test]
-    fn on_macos_the_volume_is_named_after_the_mount_point_folder() {
-        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
-
-        assert_eq!(
-            volume_name_option(mount, true).as_deref(),
-            Some("volname=zzXEL_ortho")
-        );
-    }
-
-    #[test]
-    fn off_macos_there_is_no_volume_name() {
-        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
-
-        assert_eq!(volume_name_option(mount, false), None);
-    }
-
-    /// macFUSE splits its option list on commas, so a name containing one
-    /// would leak its tail in as a separate option.
-    #[test]
-    fn a_folder_name_with_a_comma_is_not_passed_as_a_volume_name() {
-        let mount = Path::new("/Custom Scenery/zzXEL_ortho,allow_other");
-
-        assert_eq!(volume_name_option(mount, true), None);
     }
 
     /// Mock DdsClient for testing
@@ -963,7 +903,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         assert_eq!(fs.index().source_count(), 1);
         assert!(fs.index().file_count() > 0);
@@ -980,7 +920,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         assert_eq!(fs.index().source_count(), 1);
         assert!(fs.index().file_count() > 0);
@@ -1005,7 +945,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         // At least 1 source (package is guaranteed)
         assert!(fs.index().source_count() >= 1);
@@ -1049,7 +989,13 @@ mod tests {
         let client = create_test_client();
         let limiter = Arc::new(StorageConcurrencyLimiter::with_defaults("test"));
 
-        let fs = Fuse3OrthoUnionFS::with_disk_io_limiter(index, client, 1024, limiter.clone());
+        let fs = Fuse3OrthoUnionFS::with_disk_io_limiter(
+            index,
+            client,
+            1024,
+            limiter.clone(),
+            Arc::new(Linux),
+        );
 
         assert!(Arc::ptr_eq(fs.disk_io_limiter(), &limiter));
     }
@@ -1065,7 +1011,8 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_timeout(Duration::from_secs(60));
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux))
+            .with_timeout(Duration::from_secs(60));
 
         assert_eq!(fs.core.generation_timeout(), Duration::from_secs(60));
     }
@@ -1103,7 +1050,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         // Get the inode for the directory containing the DSF
         let dsf_dir_virtual = std::path::Path::new("Earth nav data/+40-080");
@@ -1234,7 +1181,12 @@ mod tests {
             .unwrap();
 
         let (client, requests) = CountingDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE);
+        let fs = Fuse3OrthoUnionFS::new(
+            index,
+            client,
+            crate::vfs::EXPECTED_DDS_SIZE,
+            Arc::new(Linux),
+        );
         (fs, requests, temp)
     }
 
@@ -1365,7 +1317,12 @@ mod tests {
             .build()
             .unwrap();
         let (client, _requests) = CountingDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE);
+        let fs = Fuse3OrthoUnionFS::new(
+            index,
+            client,
+            crate::vfs::EXPECTED_DDS_SIZE,
+            Arc::new(Linux),
+        );
 
         let entry = fs
             .lookup(test_request(), textures_inode(&fs), lit_name())
@@ -1459,7 +1416,8 @@ mod tests {
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
         assert_eq!(
-            opened.flags, VIRTUAL_DDS_OPEN_FLAGS,
+            opened.flags,
+            Linux.virtual_dds_open_flags(),
             "the file must still bypass the page cache"
         );
         assert!(
@@ -1615,7 +1573,7 @@ mod tests {
         let reply = fs.open(test_request(), ino, 0).await.unwrap();
 
         assert_ne!(reply.fh, 0, "a known tile must get a memoising handle");
-        assert_eq!(reply.flags, VIRTUAL_DDS_OPEN_FLAGS);
+        assert_eq!(reply.flags, Linux.virtual_dds_open_flags());
         assert_eq!(fs.open_dds_handles(), 1);
         // open() must not produce the tile: generation can take up to the
         // configured timeout, and X-Plane may open a file it never reads.
@@ -1694,8 +1652,13 @@ mod tests {
             .unwrap();
         let (client, _requests) = CountingDdsClient::new();
         let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE)
-            .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
+        let fs = Fuse3OrthoUnionFS::new(
+            index,
+            client,
+            crate::vfs::EXPECTED_DDS_SIZE,
+            Arc::new(Linux),
+        )
+        .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
         let ino = virtual_inode(&fs);
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
 
@@ -1857,7 +1820,7 @@ mod tests {
             .unwrap();
 
         let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fs = Fuse3OrthoUnionFS::new(index, create_test_client(), 1024)
+        let fs = Fuse3OrthoUnionFS::new(index, create_test_client(), 1024, Arc::new(Linux))
             .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
         let inode = fs
             .inode_manager
@@ -2119,7 +2082,8 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux))
+            .with_geo_index(Arc::clone(&geo_index));
 
         // Get inode for "textures" directory
         let textures_inode = fs
@@ -2207,7 +2171,8 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux))
+            .with_geo_index(Arc::clone(&geo_index));
 
         let terrain_inode = fs
             .inode_manager
@@ -2276,7 +2241,8 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux))
+            .with_geo_index(Arc::clone(&geo_index));
 
         // Get inode for "textures" directory
         let textures_inode = fs
@@ -2352,7 +2318,8 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux))
+            .with_geo_index(Arc::clone(&geo_index));
 
         let textures_inode = fs
             .inode_manager
@@ -2431,7 +2398,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         let textures_inode = fs
             .inode_manager
@@ -2489,7 +2456,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         let textures_inode = fs
             .inode_manager
@@ -2534,7 +2501,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         let textures_inode = fs
             .inode_manager
@@ -2567,8 +2534,7 @@ mod tests {
     // ========================================================================
 
     #[tokio::test]
-    async fn test_open_virtual_dds_returns_direct_io() {
-        use super::VIRTUAL_DDS_OPEN_FLAGS;
+    async fn test_open_virtual_dds_returns_the_platform_open_flags() {
         use fuse3::raw::Filesystem;
 
         let temp = TempDir::new().unwrap();
@@ -2580,7 +2546,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         let req = fuse3::raw::Request {
             unique: 1,
@@ -2597,8 +2563,9 @@ mod tests {
 
         let reply = result.expect("open on virtual DDS inode should succeed");
         assert_eq!(
-            reply.flags, VIRTUAL_DDS_OPEN_FLAGS,
-            "virtual DDS files should use the platform's virtual-DDS open flags \
+            reply.flags,
+            Linux.virtual_dds_open_flags(),
+            "virtual DDS files carry the platform's open flags \
              (direct I/O on Linux, page cache on macOS for mmap compatibility)"
         );
         // This inode was synthesised, not registered by lookup, so there is no
@@ -2622,7 +2589,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let fs = Fuse3OrthoUnionFS::new(index, client, 1024, Arc::new(Linux));
 
         let req = fuse3::raw::Request {
             unique: 1,
@@ -2682,7 +2649,7 @@ mod tests {
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
 
         let (client, mut rx) = MockDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client as Arc<dyn DdsClient>, 1024)
+        let fs = Fuse3OrthoUnionFS::new(index, client as Arc<dyn DdsClient>, 1024, Arc::new(Linux))
             .with_state_observer(Arc::new(PrefetchStateObserver::new(Arc::clone(&geo_index))));
 
         // Stand in for the executor daemon: answer the one request FUSE makes.

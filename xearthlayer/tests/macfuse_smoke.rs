@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use xearthlayer::executor::ChannelDdsClient;
 use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
 use xearthlayer::runtime::JobRequest;
-use xearthlayer::vfs::fuse3::Fuse3OrthoUnionFS;
+use xearthlayer::vfs::fuse3::{Fuse3OrthoUnionFS, Mac};
 
 /// Mount the *production* consolidated ortho union FS over macFUSE and read a
 /// real passthrough scenery file back through it. This is the FS X-Plane
@@ -56,7 +56,7 @@ async fn ortho_union_fs_mounts_and_serves_a_file_through_macfuse() {
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
     let dds_client = Arc::new(ChannelDdsClient::new(tx));
 
-    let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016);
+    let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016, Arc::new(Mac));
     let handle = fs
         .mount_spawned(&mount_str)
         .await
@@ -104,7 +104,12 @@ async fn ortho_union_fs_volume_is_named_after_its_mount_point_folder() {
     std::fs::create_dir(&mountpoint).unwrap();
 
     let (tx, _rx) = mpsc::channel::<JobRequest>(8);
-    let fs = Fuse3OrthoUnionFS::new(index, Arc::new(ChannelDdsClient::new(tx)), 11_174_016);
+    let fs = Fuse3OrthoUnionFS::new(
+        index,
+        Arc::new(ChannelDdsClient::new(tx)),
+        11_174_016,
+        Arc::new(Mac),
+    );
     let handle = fs
         .mount_spawned(mountpoint.to_str().unwrap())
         .await

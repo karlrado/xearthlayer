@@ -21,7 +21,7 @@ use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
-use crate::vfs::fuse3::Fuse3OrthoUnionFS;
+use crate::vfs::fuse3::{current_platform, Fuse3OrthoUnionFS};
 use crate::vfs::SpawnedMountHandle;
 use xearthlayer_package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
@@ -569,12 +569,20 @@ impl MountManager {
         // so the filesystem accounts against the same one prefetch reads (#246).
         let pinned_budget = dds_client.pinned_budget();
 
-        let mut ortho_union_fs =
-            Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
-                .with_geo_index(Arc::clone(&geo_index))
-                .with_state_observer(state_observer)
-                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
-                .with_timeout(Duration::from_secs(self.generation_timeout_secs));
+        // Transitional: the manager picks this platform's FUSE policy until
+        // it mounts through a MountBackend.
+        let fuse_platform = current_platform();
+
+        let mut ortho_union_fs = Fuse3OrthoUnionFS::new(
+            (*index_for_prefetch).clone(),
+            dds_client,
+            expected_dds_size,
+            fuse_platform,
+        )
+        .with_geo_index(Arc::clone(&geo_index))
+        .with_state_observer(state_observer)
+        .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
+        .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
         if let Some(budget) = pinned_budget {
             ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
