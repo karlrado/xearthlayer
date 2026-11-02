@@ -9,6 +9,7 @@
 //! merges all ortho sources into one mount while generating DDS textures on-demand.
 
 // Internal support modules: shared types + inode management (used by fuse3)
+pub(crate) mod backend;
 pub(crate) mod support;
 
 mod coalesce;
@@ -17,6 +18,7 @@ pub mod fuse3;
 mod placeholder;
 
 // Re-export types for public API
+pub use backend::{MountBackend, MountError, MountFuture, MountSession};
 pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};
 pub use fuse3::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
