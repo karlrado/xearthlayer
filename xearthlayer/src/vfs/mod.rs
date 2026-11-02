@@ -18,7 +18,9 @@ pub mod fuse3;
 mod placeholder;
 
 // Re-export types for public API
-pub use backend::{MountBackend, MountError, MountFuture, MountSession};
+pub use backend::{
+    select_backend, MountBackend, MountError, MountFuture, MountRequest, MountSession,
+};
 pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};
 pub use fuse3::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};

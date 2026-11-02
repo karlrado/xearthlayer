@@ -99,6 +99,11 @@ impl SpawnedMountHandle {
         }
     }
 
+    /// The directory this filesystem is mounted at.
+    pub fn mountpoint(&self) -> &Path {
+        &self.mountpoint
+    }
+
     /// Create a `SpawnedMountHandle` from a fuse3 `MountHandle`.
     ///
     /// Spawns a tokio task that runs the FUSE event loop and handles
