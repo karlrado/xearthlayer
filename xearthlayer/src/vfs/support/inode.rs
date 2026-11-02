@@ -122,6 +122,7 @@ impl InodeManager {
     ///
     /// Unlike `get_or_create_inode`, this does not allocate a new inode.
     /// This operation is lock-free.
+    #[allow(dead_code)]
     pub fn get_inode(&self, path: &Path) -> Option<u64> {
         self.path_to_inode.get(path).map(|r| *r.value())
     }

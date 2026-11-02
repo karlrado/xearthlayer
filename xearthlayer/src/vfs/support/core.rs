@@ -280,6 +280,7 @@ impl OrthoUnionCore {
     /// The ops drive the map directly; this accessor is the white-box surface
     /// the backend's tests use to inspect a live tile (e.g. the zero-copy read
     /// test).
+    #[allow(dead_code)]
     pub fn dds_handles(&self) -> &DashMap<u64, Arc<DdsHandle>> {
         &self.dds_handles
     }
