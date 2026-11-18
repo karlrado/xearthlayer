@@ -8,6 +8,10 @@
 //! Uses [`fuse3::Fuse3OrthoUnionFS`] - an async multi-threaded union filesystem that
 //! merges all ortho sources into one mount while generating DDS textures on-demand.
 
+// Backend-neutral types and contract; the core lands here as the split
+// proceeds (docs/dev/filesystem-backend-split.md).
+pub mod common;
+
 // Internal support modules: shared types + inode management (used by fuse3)
 pub(crate) mod support;
 
