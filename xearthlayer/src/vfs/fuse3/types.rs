@@ -1,6 +1,8 @@
 //! Types for the fuse3 filesystem implementation.
 
+use crate::vfs::common::FsError;
 use fuse3::raw::MountHandle as Fuse3MountHandle;
+use fuse3::Errno;
 use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,23 @@ pub enum Fuse3Error {
     /// Invalid path
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+}
+
+/// Map the core's neutral error onto FUSE's error space.
+///
+/// The whole core -> kernel failure translation in one place (the inline
+/// `Errno::from(libc::…)` sites each op used to carry). I/O failures keep
+/// their real OS error (`raw_os_error`) instead of flattening to `EIO`, so
+/// a vanished source reads as `ENOENT` and a permission failure as
+/// `EACCES`; only an error with no OS code behind it falls back to `EIO`.
+/// errno_from lives in the fuse3 adapter because common code cannot
+/// reference `Errno` (see `docs/dev/filesystem-backend-split.md`).
+pub fn errno_from(err: FsError) -> Errno {
+    match err {
+        FsError::NotFound => Errno::from(libc::ENOENT),
+        FsError::NotADirectory => Errno::from(libc::ENOTDIR),
+        FsError::Io(e) => Errno::from(e.raw_os_error().unwrap_or(libc::EIO)),
+    }
 }
 
 /// Handle to a mounted fuse3 filesystem.
@@ -432,5 +451,26 @@ mod tests {
         // Unmount with no task should succeed
         let result = handle.unmount().await;
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn errno_from_maps_the_neutral_variants() {
+        assert_eq!(errno_from(FsError::NotFound), Errno::from(libc::ENOENT));
+        assert_eq!(
+            errno_from(FsError::NotADirectory),
+            Errno::from(libc::ENOTDIR)
+        );
+    }
+
+    #[test]
+    fn errno_from_propagates_the_raw_os_error() {
+        // The deliberate behaviour change over the pre-split flattening:
+        // a real OS error keeps its identity instead of becoming EIO.
+        let io = std::io::Error::from_raw_os_error(libc::EACCES);
+        assert_eq!(errno_from(FsError::Io(io)), Errno::from(libc::EACCES));
+
+        // No OS code behind it: EIO is the fallback.
+        let io = std::io::Error::other("no os code");
+        assert_eq!(errno_from(FsError::Io(io)), Errno::from(libc::EIO));
     }
 }

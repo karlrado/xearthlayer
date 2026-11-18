@@ -42,6 +42,7 @@ use super::attrs::{
 use super::error::FsError;
 use super::node::FsNode;
 use super::requestor::DdsRequestor;
+use super::union::{BoxFuture, UnionFilesystem};
 
 /// Per-open state for one virtual DDS file.
 ///
@@ -854,6 +855,57 @@ impl OrthoUnionCore {
     }
 }
 
+// ===========================================================================
+// The neutral contract: every backend drives the core through this impl.
+//
+// Thin delegations to the inherent operations of the same names — the trait
+// exists to hand a backend an `Arc<dyn UnionFilesystem>`, boxing the async
+// futures for object-safety. Behaviour is defined once, in the inherents.
+// ===========================================================================
+
+impl UnionFilesystem for OrthoUnionCore {
+    fn lookup<'a>(
+        &'a self,
+        node: &'a FsNode,
+        name: &'a str,
+    ) -> BoxFuture<'a, Result<Entry, FsError>> {
+        Box::pin(async move { OrthoUnionCore::lookup(self, node, name).await })
+    }
+
+    fn attrs<'a>(&'a self, node: &'a FsNode) -> BoxFuture<'a, Result<FileAttributes, FsError>> {
+        Box::pin(async move { OrthoUnionCore::attrs(self, node).await })
+    }
+
+    fn read<'a>(
+        &'a self,
+        node: &'a FsNode,
+        fh: u64,
+        offset: u64,
+        size: usize,
+    ) -> BoxFuture<'a, Result<Bytes, FsError>> {
+        Box::pin(async move { OrthoUnionCore::read(self, node, fh, offset, size).await })
+    }
+
+    fn list_directory<'a>(
+        &'a self,
+        node: &'a FsNode,
+    ) -> BoxFuture<'a, Result<Vec<DirEntry>, FsError>> {
+        Box::pin(async move { OrthoUnionCore::list_directory(self, node).await })
+    }
+
+    fn open(&self, node: &FsNode) -> Result<u64, FsError> {
+        OrthoUnionCore::open(self, node)
+    }
+
+    fn release(&self, fh: u64) -> Result<(), FsError> {
+        OrthoUnionCore::release(self, fh)
+    }
+
+    fn statfs(&self) -> StatFsInfo {
+        OrthoUnionCore::statfs(self)
+    }
+}
+
 impl DdsRequestor for OrthoUnionCore {
     fn dds_client(&self) -> &Arc<dyn DdsClient> {
         &self.dds_client
@@ -883,5 +935,124 @@ impl DdsRequestor for OrthoUnionCore {
         if let Some(ref observer) = self.state_observer {
             observer.observe(tile, cache_hit);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::DdsClientError;
+    use crate::runtime::{DdsResponse, JobRequest};
+    use std::sync::Arc;
+    use tokio::sync::oneshot;
+    use tokio_util::sync::CancellationToken;
+
+    /// A client whose responses are dropped: any tile resolution answers
+    /// through the placeholder path, which the core contract tests below
+    /// never depend on.
+    struct NullDdsClient;
+
+    impl DdsClient for NullDdsClient {
+        fn submit(&self, _request: JobRequest) -> Result<(), DdsClientError> {
+            Ok(())
+        }
+
+        fn request_dds(
+            &self,
+            _tile: crate::coord::TileCoord,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            oneshot::channel().1
+        }
+
+        fn request_dds_with_options(
+            &self,
+            _tile: crate::coord::TileCoord,
+            _priority: crate::executor::Priority,
+            _origin: crate::runtime::RequestOrigin,
+            _cancellation: CancellationToken,
+        ) -> oneshot::Receiver<DdsResponse> {
+            oneshot::channel().1
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
+    /// A core over an empty union index: enough for the seam to be driven
+    /// end to end. The full behavioural contract is pinned by the
+    /// conformance suite (`docs/dev/filesystem-backend-split.md`).
+    fn core() -> OrthoUnionCore {
+        OrthoUnionCore::new(OrthoUnionIndex::default(), Arc::new(NullDdsClient), 1024)
+    }
+
+    fn dds_node() -> FsNode {
+        FsNode::VirtualDds(DdsFilename {
+            row: 16,
+            col: 32,
+            zoom: 12,
+            map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
+        })
+    }
+
+    #[tokio::test]
+    async fn the_core_mounts_as_a_trait_object() {
+        let fs: Arc<dyn UnionFilesystem> = Arc::new(core());
+
+        let attrs = fs.attrs(&FsNode::root()).await.unwrap();
+        assert_eq!(attrs.kind, super::super::attrs::NodeKind::Directory);
+        assert_eq!(attrs.perm, 0o555);
+
+        assert_eq!(fs.statfs().files, 0);
+
+        let missing = FsNode::root();
+        assert!(matches!(
+            fs.lookup(&missing, "nope.txt").await,
+            Err(FsError::NotFound)
+        ));
+
+        let listing = fs.list_directory(&FsNode::root()).await.unwrap();
+        assert!(listing.is_empty(), "empty index lists nothing");
+    }
+
+    #[tokio::test]
+    async fn handle_lifecycle_runs_through_the_trait_object() {
+        let concrete = core();
+        let fs: Arc<dyn UnionFilesystem> = Arc::new(concrete);
+        let dds = dds_node();
+
+        // Ortho virtual DDS gets a memoising handle; contract case beyond 0.
+        let fh = fs.open(&dds).unwrap();
+        assert_ne!(fh, 0);
+        fs.release(fh).unwrap();
+
+        // release(0) is the contract's no-op, not an error.
+        fs.release(0).unwrap();
+
+        // Real files get no handle state (contract case 1).
+        let real = FsNode::RealFile(PathBuf::from("terrain/tile.dsf"));
+        assert_eq!(fs.open(&real).unwrap(), 0);
+
+        // Lit textures pin nothing (contract case 2).
+        let lit = FsNode::VirtualDds(DdsFilename {
+            row: 16,
+            col: 32,
+            zoom: 12,
+            map_type: "BI".to_string(),
+            kind: TextureKind::Lit,
+        });
+        assert_eq!(fs.open(&lit).unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn virtual_dds_attrs_come_through_the_trait_object() {
+        let fs: Arc<dyn UnionFilesystem> = Arc::new(core());
+        let attrs = fs.attrs(&dds_node()).await.unwrap();
+        // The configured expected size, read-only, single link.
+        assert_eq!(attrs.size, 1024);
+        assert_eq!(attrs.perm, 0o444);
+        assert_eq!(attrs.nlink, 1);
     }
 }

@@ -44,7 +44,7 @@
 
 use super::inode::InodeManager;
 use super::shared::TTL;
-use super::types::{Fuse3Error, Fuse3Result};
+use super::types::{errno_from, Fuse3Error, Fuse3Result};
 use crate::executor::{DdsClient, StorageConcurrencyLimiter};
 use crate::geo_index::GeoIndex;
 use crate::night::LitTextureSource;
@@ -52,7 +52,7 @@ use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::vfs::common::attrs::{attrs_from_metadata, FileAttributes};
-use crate::vfs::common::{FsError, FsNode, NodeKind, OrthoUnionCore};
+use crate::vfs::common::{FsNode, NodeKind, OrthoUnionCore};
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyData, ReplyDirectory,
@@ -496,21 +496,6 @@ fn to_file_attr(attrs: &FileAttributes, ino: u64) -> FileAttr {
     }
 }
 
-/// Map a core [`FsError`] onto the kernel's error space.
-///
-/// Exactly the inline translations these ops performed before the core
-/// existed: missing → ENOENT, not-a-directory → ENOTDIR, and real-file I/O
-/// failures flattened to EIO. Step 3b of the split replaces this with the
-/// design doc's `errno_from`, which propagates the raw OS error instead of
-/// flattening (a deliberate behaviour change, not part of this move).
-fn fs_error_to_errno(err: FsError) -> Errno {
-    match err {
-        FsError::NotFound => Errno::from(libc::ENOENT),
-        FsError::NotADirectory => Errno::from(libc::ENOTDIR),
-        FsError::Io(_) => Errno::from(libc::EIO),
-    }
-}
-
 impl Filesystem for Fuse3OrthoUnionFS {
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!(
@@ -557,7 +542,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .core
             .lookup(&parent_node, &name_str)
             .await
-            .map_err(fs_error_to_errno)?;
+            .map_err(errno_from)?;
 
         // Register the child's kernel identity the way each resolution kind
         // always has: real paths by path, virtual DDS files by coordinates.
@@ -587,7 +572,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         trace!(ino = ino, "fuse3 ortho union: getattr");
 
         let node = self.node_for_inode(ino).ok_or(Errno::from(libc::ENOENT))?;
-        let attrs = self.core.attrs(&node).await.map_err(fs_error_to_errno)?;
+        let attrs = self.core.attrs(&node).await.map_err(errno_from)?;
         Ok(ReplyAttr {
             ttl: TTL,
             attr: to_file_attr(&attrs, ino),
@@ -614,7 +599,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .core
             .read(&node, fh, offset, size as usize)
             .await
-            .map_err(fs_error_to_errno)?;
+            .map_err(errno_from)?;
         Ok(ReplyData { data })
     }
 
@@ -644,7 +629,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .core
             .list_directory(&FsNode::Directory(virtual_path.clone()))
             .await
-            .map_err(fs_error_to_errno)?;
+            .map_err(errno_from)?;
 
         let mut entries: Vec<DirectoryEntry> = Vec::new();
 
@@ -733,7 +718,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .core
             .list_directory(&FsNode::Directory(virtual_path.clone()))
             .await
-            .map_err(fs_error_to_errno)?;
+            .map_err(errno_from)?;
 
         let mut entries: Vec<DirectoryEntryPlus> = Vec::new();
 
@@ -866,7 +851,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         let fh = self
             .core
             .open(&FsNode::VirtualDds(coords))
-            .map_err(fs_error_to_errno)?;
+            .map_err(errno_from)?;
 
         Ok(ReplyOpen {
             fh,
@@ -885,7 +870,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
     ) -> Fuse3InternalResult<()> {
         // Drop the memoised tile. Without this every open file would pin
         // 11.17 MB for the life of the mount.
-        self.core.release(fh).map_err(fs_error_to_errno)?;
+        self.core.release(fh).map_err(errno_from)?;
         Ok(())
     }
 
