@@ -1487,7 +1487,7 @@ mod tests {
 
         assert_eq!(entry.attr.size, 10, "the real file, not the 152-byte black");
         assert!(
-            entry.attr.ino < crate::vfs::support::inode::VIRTUAL_INODE_BASE,
+            entry.attr.ino < super::super::inode::VIRTUAL_INODE_BASE,
             "a real file has a real inode"
         );
     }
@@ -2703,7 +2703,7 @@ mod tests {
         };
 
         // Virtual DDS inode (above VIRTUAL_INODE_BASE)
-        use crate::vfs::support::inode::VIRTUAL_INODE_BASE;
+        use super::super::inode::VIRTUAL_INODE_BASE;
         let virtual_inode = VIRTUAL_INODE_BASE + 42;
         let result: Fuse3InternalResult<ReplyOpen> =
             fs.open(req, virtual_inode, libc::O_RDONLY as u32).await;

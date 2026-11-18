@@ -13,6 +13,7 @@ pub mod core;
 pub mod error;
 pub mod node;
 pub mod requestor;
+pub mod types;
 pub mod union;
 
 pub use attrs::{
@@ -23,4 +24,5 @@ pub use core::{DdsHandle, OrthoUnionCore};
 pub use error::FsError;
 pub use node::FsNode;
 pub use requestor::DdsRequestor;
+pub use types::{DdsHandler, DdsRequest, DdsResponse};
 pub use union::{BoxFuture, UnionFilesystem};
