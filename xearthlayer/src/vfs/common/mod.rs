@@ -9,11 +9,18 @@
 //! `docs/dev/filesystem-backend-split.md` §Acceptance).
 
 pub mod attrs;
+pub mod core;
 pub mod error;
 pub mod node;
+pub mod requestor;
 pub mod union;
 
-pub use attrs::{DirEntry, Entry, FileAttributes, NodeKind, StatFsInfo};
+pub use attrs::{
+    attrs_from_metadata, chunk_to_tile_coords, root_dir_attrs, virtual_dds_attrs,
+    virtual_dir_attrs, DirEntry, Entry, FileAttributes, NodeKind, StatFsInfo, VirtualDdsConfig,
+};
+pub use core::{DdsHandle, OrthoUnionCore};
 pub use error::FsError;
 pub use node::FsNode;
+pub use requestor::DdsRequestor;
 pub use union::{BoxFuture, UnionFilesystem};

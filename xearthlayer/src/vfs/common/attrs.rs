@@ -7,7 +7,10 @@
 //! would fill a `FILE_ATTRIBUTE_DATA`).
 
 use std::ffi::OsString;
-use std::time::SystemTime;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::coord::TileCoord;
+use crate::vfs::DdsFilename;
 
 use super::node::FsNode;
 
@@ -107,6 +110,227 @@ pub struct StatFsInfo {
     pub namelen: u32,
     /// Fundamental block size.
     pub frsize: u32,
+}
+
+// =============================================================================
+// Attribute mappers — the neutral answers the core gives
+// =============================================================================
+
+/// Map `std::fs::Metadata` onto neutral attributes.
+///
+/// Uses the portable `Metadata` surface; on Unix it additionally carries
+/// the extended fields (`blocks`, `perm`, `nlink`, `uid`, `gid`, `rdev`)
+/// that the FUSE backend reports today. Other platforms get the neutral
+/// defaults for those fields. `ctime`/`crtime` follow the adapter values
+/// this replaced: FUSE's `ctime` is `UNIX_EPOCH` for real files, and so is
+/// macFUSE's `crtime` (there is no portable creation time to read).
+pub fn attrs_from_metadata(metadata: &std::fs::Metadata) -> FileAttributes {
+    let kind = if metadata.is_dir() {
+        NodeKind::Directory
+    } else if metadata.is_symlink() {
+        NodeKind::Symlink
+    } else {
+        NodeKind::RegularFile
+    };
+
+    let base = FileAttributes {
+        size: metadata.len(),
+        blocks: 0,
+        atime: metadata.accessed().unwrap_or(UNIX_EPOCH),
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        ctime: UNIX_EPOCH,
+        crtime: UNIX_EPOCH,
+        kind,
+        perm: 0o444,
+        nlink: 1,
+        uid: 0,
+        gid: 0,
+        rdev: 0,
+        blksize: 4096,
+    };
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileAttributes {
+            blocks: metadata.blocks(),
+            perm: (metadata.mode() & 0o7777) as u16,
+            nlink: metadata.nlink() as u32,
+            uid: metadata.uid(),
+            gid: metadata.gid(),
+            rdev: metadata.rdev() as u32,
+            ..base
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        base
+    }
+}
+
+/// Attributes for a generated (virtual) DDS file: read-only, single link.
+///
+/// The file is owned by the process serving the mount, as the fuse3
+/// attribute builders this replaced reported it. `libc` is a portable OS
+/// call, not a backend symbol, so the fill is neutral; the WinFSP backend
+/// will override with the launching user.
+pub fn virtual_dds_attrs(config: &VirtualDdsConfig) -> FileAttributes {
+    let now = SystemTime::now();
+    FileAttributes {
+        size: config.size(),
+        blocks: config.blocks(),
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
+        kind: NodeKind::RegularFile,
+        perm: 0o444, // Read-only
+        nlink: 1,
+        uid: process_uid(),
+        gid: process_gid(),
+        rdev: 0,
+        blksize: config.blksize(),
+    }
+}
+
+/// Attributes for a virtual directory in the union view.
+///
+/// Owned by the serving process, as in [`virtual_dds_attrs`].
+pub fn virtual_dir_attrs() -> FileAttributes {
+    let now = SystemTime::now();
+    FileAttributes {
+        size: 4096,
+        blocks: 1,
+        atime: now,
+        mtime: now,
+        ctime: now,
+        crtime: now,
+        kind: NodeKind::Directory,
+        perm: 0o555,
+        nlink: 2,
+        uid: process_uid(),
+        gid: process_gid(),
+        rdev: 0,
+        blksize: 4096,
+    }
+}
+
+/// Owner uid of the process serving the mount (0 where there is none).
+fn process_uid() -> u32 {
+    #[cfg(unix)]
+    unsafe {
+        libc::getuid()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Owner gid of the process serving the mount (0 where there is none).
+fn process_gid() -> u32 {
+    #[cfg(unix)]
+    unsafe {
+        libc::getgid()
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Attributes for the root directory.
+///
+/// Identical to a virtual directory; the inode number is an adapter-side
+/// concept and is not part of [`FileAttributes`].
+pub fn root_dir_attrs() -> FileAttributes {
+    virtual_dir_attrs()
+}
+
+// =============================================================================
+// VirtualDdsConfig - Shared DDS file configuration
+// =============================================================================
+
+/// Configuration for virtual DDS file attributes.
+///
+/// Virtual DDS files are generated on-demand by XEarthLayer. This struct
+/// holds the configuration for reporting their attributes to the kernel.
+#[derive(Debug, Clone)]
+pub struct VirtualDdsConfig {
+    /// Expected size of generated DDS files (bytes).
+    size: u64,
+    /// Block size for filesystem reporting.
+    blksize: u32,
+}
+
+impl VirtualDdsConfig {
+    /// Create a new virtual DDS configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `size` - Expected size of generated DDS files in bytes
+    pub fn new(size: u64) -> Self {
+        Self {
+            size,
+            blksize: 4096,
+        }
+    }
+
+    /// Get the expected file size.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// Get the block size.
+    pub fn blksize(&self) -> u32 {
+        self.blksize
+    }
+
+    /// Calculate the number of blocks for this file size.
+    pub fn blocks(&self) -> u64 {
+        self.size.div_ceil(self.blksize as u64)
+    }
+}
+
+impl Default for VirtualDdsConfig {
+    fn default() -> Self {
+        // Default DDS size: 4096x4096 BC1 with mipmaps ≈ 11MB
+        Self::new(11_184_952)
+    }
+}
+
+// =============================================================================
+// Tile Coordinate Conversion
+// =============================================================================
+
+/// Convert chunk-level DDS coordinates to tile-level coordinates.
+///
+/// DDS filenames use chunk coordinates (16x smaller grid than tiles).
+/// This function converts chunk coordinates to tile coordinates for
+/// the DDS generation pipeline.
+///
+/// # Coordinate Relationship
+///
+/// ```text
+/// Chunk zoom = Tile zoom + 4
+/// Chunk row  = Tile row * 16 + offset
+/// Chunk col  = Tile col * 16 + offset
+/// ```
+///
+/// # Arguments
+///
+/// * `coords` - Parsed DDS filename with chunk coordinates
+///
+/// # Returns
+///
+/// Tile coordinates suitable for the DDS handler
+pub fn chunk_to_tile_coords(coords: &DdsFilename) -> TileCoord {
+    let tile_zoom = coords.zoom.saturating_sub(4);
+    TileCoord {
+        row: coords.row / 16,
+        col: coords.col / 16,
+        zoom: tile_zoom,
+    }
 }
 
 #[cfg(test)]
@@ -232,5 +456,176 @@ mod tests {
             FsNode::VirtualDds(c) => assert_eq!(c, coords),
             _ => panic!("expected VirtualDds node"),
         }
+    }
+
+    // --- VirtualDdsConfig (moved from fuse3/shared.rs) ---
+
+    #[test]
+    fn test_virtual_dds_config_new() {
+        let config = VirtualDdsConfig::new(1024);
+        assert_eq!(config.size(), 1024);
+        assert_eq!(config.blksize(), 4096);
+    }
+
+    #[test]
+    fn test_virtual_dds_config_blocks() {
+        // Exact block boundary
+        let config = VirtualDdsConfig::new(4096);
+        assert_eq!(config.blocks(), 1);
+
+        // One byte over
+        let config = VirtualDdsConfig::new(4097);
+        assert_eq!(config.blocks(), 2);
+
+        // Large file
+        let config = VirtualDdsConfig::new(11_184_952);
+        assert_eq!(config.blocks(), 2731);
+    }
+
+    #[test]
+    fn test_virtual_dds_config_default() {
+        let config = VirtualDdsConfig::default();
+        assert_eq!(config.size(), 11_184_952);
+    }
+
+    // --- chunk_to_tile_coords (moved from fuse3/shared.rs) ---
+
+    #[test]
+    fn test_chunk_to_tile_coords() {
+        // Standard zoom 18 chunk
+        let coords = DdsFilename {
+            row: 100000,
+            col: 125184,
+            zoom: 18,
+            map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
+        };
+        let tile = chunk_to_tile_coords(&coords);
+        assert_eq!(tile.row, 100000 / 16);
+        assert_eq!(tile.col, 125184 / 16);
+        assert_eq!(tile.zoom, 14);
+    }
+
+    #[test]
+    fn test_chunk_to_tile_coords_zoom_16() {
+        let coords = DdsFilename {
+            row: 25264,
+            col: 10368,
+            zoom: 16,
+            map_type: "GO2".to_string(),
+            kind: TextureKind::Ortho,
+        };
+        let tile = chunk_to_tile_coords(&coords);
+        assert_eq!(tile.row, 25264 / 16);
+        assert_eq!(tile.col, 10368 / 16);
+        assert_eq!(tile.zoom, 12);
+    }
+
+    #[test]
+    fn test_chunk_to_tile_coords_low_zoom() {
+        // Edge case: zoom less than 4
+        let coords = DdsFilename {
+            row: 100,
+            col: 200,
+            zoom: 2,
+            map_type: "BI".to_string(),
+            kind: TextureKind::Ortho,
+        };
+        let tile = chunk_to_tile_coords(&coords);
+        assert_eq!(tile.zoom, 0); // saturating_sub prevents underflow
+    }
+
+    // --- neutral attribute mappers ---
+
+    #[test]
+    fn attrs_from_metadata_maps_kind_and_times() {
+        // ctime/crtime follow the fuse3 values this replaces: UNIX_EPOCH
+        // for real files on every platform.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tile.dsf");
+        std::fs::write(&file, b"1234").unwrap();
+
+        let attrs = attrs_from_metadata(&file.metadata().unwrap());
+        assert_eq!(attrs.kind, NodeKind::RegularFile);
+        assert_eq!(attrs.size, 4);
+        assert_eq!(attrs.blksize, 4096);
+        assert_eq!(attrs.ctime, UNIX_EPOCH);
+        assert_eq!(attrs.crtime, UNIX_EPOCH);
+        assert_eq!(attrs.atime, file.metadata().unwrap().accessed().unwrap());
+
+        let dir_attrs = attrs_from_metadata(&dir.path().metadata().unwrap());
+        assert_eq!(dir_attrs.kind, NodeKind::Directory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn attrs_from_metadata_carries_the_unix_ext_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("tile.dsf");
+        std::fs::write(&file, b"1234").unwrap();
+
+        let meta = file.metadata().unwrap();
+        let attrs = attrs_from_metadata(&meta);
+
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(attrs.blocks, meta.blocks());
+        assert_eq!(attrs.perm, (meta.mode() & 0o7777) as u16);
+        assert_eq!(attrs.nlink, meta.nlink() as u32);
+        assert_eq!(attrs.uid, meta.uid());
+        assert_eq!(attrs.gid, meta.gid());
+        assert_eq!(attrs.rdev, meta.rdev() as u32);
+    }
+
+    #[test]
+    fn virtual_dds_attrs_match_the_config() {
+        let config = VirtualDdsConfig::new(11_184_952);
+        let attrs = virtual_dds_attrs(&config);
+
+        assert_eq!(attrs.size, 11_184_952);
+        assert_eq!(attrs.blocks, config.blocks());
+        assert_eq!(attrs.blksize, 4096);
+        assert_eq!(attrs.kind, NodeKind::RegularFile);
+        assert_eq!(attrs.perm, 0o444);
+        assert_eq!(attrs.nlink, 1);
+        assert_eq!(attrs.rdev, 0);
+        // uid/gid are the serving process, as the fuse3 builders this
+        // replaced reported them.
+        #[cfg(unix)]
+        unsafe {
+            assert_eq!(attrs.uid, libc::getuid());
+            assert_eq!(attrs.gid, libc::getgid());
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(attrs.uid, 0);
+            assert_eq!(attrs.gid, 0);
+        }
+    }
+
+    #[test]
+    fn virtual_and_root_dir_attrs_are_read_only_directories() {
+        let dir = virtual_dir_attrs();
+
+        assert_eq!(dir.size, 4096);
+        assert_eq!(dir.blocks, 1);
+        assert_eq!(dir.kind, NodeKind::Directory);
+        assert_eq!(dir.perm, 0o555);
+        assert_eq!(dir.nlink, 2);
+        assert_eq!(dir.rdev, 0);
+        assert_eq!(dir.blksize, 4096);
+
+        // The root dir's attributes are identical; only the inode
+        // (adapter-side) differs. (atime/mtime/ctime/crtime come from the
+        // clock per call, so compare the stable fields.)
+        let root = root_dir_attrs();
+        assert_eq!(root.size, dir.size);
+        assert_eq!(root.blocks, dir.blocks);
+        assert_eq!(root.kind, dir.kind);
+        assert_eq!(root.perm, dir.perm);
+        assert_eq!(root.nlink, dir.nlink);
+        assert_eq!(root.uid, dir.uid);
+        assert_eq!(root.gid, dir.gid);
+        assert_eq!(root.rdev, dir.rdev);
+        assert_eq!(root.blksize, dir.blksize);
     }
 }

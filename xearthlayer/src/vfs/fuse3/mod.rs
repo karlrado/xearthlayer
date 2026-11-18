@@ -30,5 +30,5 @@ mod shared;
 mod types;
 
 pub use ortho_union_fs::Fuse3OrthoUnionFS;
-pub use shared::{chunk_to_tile_coords, DdsRequestor, FileAttrBuilder, VirtualDdsConfig, TTL};
+pub use shared::{chunk_to_tile_coords, DdsRequestor, VirtualDdsConfig, TTL};
 pub use types::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
