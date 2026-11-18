@@ -11,7 +11,9 @@
 pub mod attrs;
 pub mod error;
 pub mod node;
+pub mod union;
 
 pub use attrs::{DirEntry, Entry, FileAttributes, NodeKind, StatFsInfo};
 pub use error::FsError;
 pub use node::FsNode;
+pub use union::{BoxFuture, UnionFilesystem};
