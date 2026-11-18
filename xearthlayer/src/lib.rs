@@ -28,7 +28,6 @@ pub mod dds;
 pub mod debug_map;
 pub mod diagnostics;
 pub mod executor;
-pub mod fuse;
 pub mod geo_index;
 pub mod jobs;
 pub mod logging;
@@ -50,6 +49,7 @@ pub mod tasks;
 pub mod texture;
 pub mod time;
 pub mod update;
+pub mod vfs;
 pub mod xplane;
 pub mod xworld_pro;
 

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use super::generator::{LedRegion, LIT_GENERATOR_VERSION};
 use super::store::FileIdentity;
 use crate::cache::integrity::LIT_ENTRY_MAGIC;
-use crate::fuse::DdsFilename;
+use crate::vfs::DdsFilename;
 
 /// Magic (4), fingerprint (32), payload length u64 LE (8).
 const ENTRY_HEADER_LEN: usize = 44;
@@ -88,7 +88,7 @@ pub fn decode_entry(entry: Bytes, fp: &LitFingerprint, expected_len: u64) -> Opt
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::TextureKind;
+    use crate::vfs::TextureKind;
 
     fn fp(b: u8) -> LitFingerprint {
         LitFingerprint([b; 32])

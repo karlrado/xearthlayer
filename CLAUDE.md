@@ -24,7 +24,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Implemented Components
 
-1. **FUSE Layer** (`xearthlayer/src/fuse/fuse3/`)
+1. **FUSE Layer** (`xearthlayer/src/vfs/fuse3/`)
    - `Fuse3OrthoUnionFS` - The single FUSE mount: all ortho sources (patches + packages)
      merged into one union filesystem. The earlier `Fuse3PassthroughFS` and
      `Fuse3UnionFS` implementations were deleted in #233 once they became unreachable.
@@ -269,7 +269,7 @@ xearthlayer-cli
             │               └─→ jobs (DdsGenerateJob)                   │
             │                       └─→ tasks (DownloadChunks, BuildAndCacheDds) │
             │                                                            │
-            ├─→ fuse/fuse3 (async multi-threaded FUSE) ─────────────────┤
+            ├─→ vfs/fuse3 (async multi-threaded FUSE) ─────────────────┤
             │       ├─→ uses DdsClient (demand lane) for tile requests  │
             │       └─→ uses GeoIndex for patch region filtering        │
             │                                                            │
@@ -454,9 +454,9 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
 | `xearthlayer/src/tasks/` | Task implementations (DownloadChunks, BuildAndCacheDds; legacy: assemble, encode, cache) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
-| `xearthlayer/src/fuse/fuse3/` | Fuse3 async multi-threaded filesystem |
-| `xearthlayer/src/fuse/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
-| `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |
+| `xearthlayer/src/vfs/fuse3/` | Fuse3 async multi-threaded filesystem |
+| `xearthlayer/src/vfs/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
+| `xearthlayer/src/vfs/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |
 | `xearthlayer/src/paths/` | Path resolution: BaseDirectories, platform layouts, role accessors |
 | `xearthlayer-cli/src/preflight/migrate.rs` | Layout migration check |
 | `xearthlayer-cli/src/preflight/proposal.rs` | Migration decision table and guidance (pure) |
@@ -611,7 +611,7 @@ matrix jobs are renamed.
 - Configuration reference: `docs/configuration.md`
 - Developer documentation: `docs/dev/`
 - **Job Executor Framework**: `docs/dev/job-executor-design.md` (daemon architecture, job/task traits)
-- **Fuse3 implementation**: `xearthlayer/src/fuse/fuse3/mod.rs` (async multi-threaded FUSE)
+- **Fuse3 implementation**: `xearthlayer/src/vfs/fuse3/mod.rs` (async multi-threaded FUSE)
 - **GPU Encoding**: `docs/dev/gpu-encoding-design.md` (wgpu compute shaders, channel worker, memory optimization)
 - Package publisher design: `docs/dev/package-publisher-design.md`
 - **World rebuild runbook**: `docs/dev/world-rebuild-runbook.md` (the campaign to rebuild every regional package: naming, staging channel, promotion, retirement)

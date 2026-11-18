@@ -23,9 +23,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use xearthlayer::executor::ChannelDdsClient;
-use xearthlayer::fuse::fuse3::Fuse3OrthoUnionFS;
 use xearthlayer::ortho_union::OrthoUnionIndexBuilder;
 use xearthlayer::runtime::JobRequest;
+use xearthlayer::vfs::fuse3::Fuse3OrthoUnionFS;
 
 /// Mount the *production* consolidated ortho union FS over macFUSE and read a
 /// real passthrough scenery file back through it. This is the FS X-Plane

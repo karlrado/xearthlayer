@@ -322,7 +322,7 @@ xearthlayer/src/
 │   ├── mod.rs               # Module exports
 │   ├── discovery.rs         # Patch folder discovery and validation
 │   └── union_index.rs       # Merged file index with priority handling
-├── fuse/fuse3/
+├── vfs/fuse3/
 │   └── union_fs.rs          # Union FUSE filesystem implementation (new)
 └── ...
 
@@ -340,7 +340,7 @@ docs/
 | `xearthlayer/src/lib.rs` | Add `pub mod patches;` |
 | `xearthlayer/src/config/keys.rs` | Add `PatchesEnabled`, `PatchesDirectory` |
 | `xearthlayer/src/config/file.rs` | Add `PatchesConfig` struct |
-| `xearthlayer/src/fuse/fuse3/mod.rs` | Export `union_fs` module |
+| `xearthlayer/src/vfs/fuse3/mod.rs` | Export `union_fs` module |
 | `xearthlayer/src/manager/mounts.rs` | Mount patches before regional packages |
 | `xearthlayer-cli/src/commands/run.rs` | Wire patches into mount flow |
 | `xearthlayer-cli/src/commands/mod.rs` | Add patches subcommand |
@@ -382,8 +382,8 @@ docs/
 5. Reuse existing `DdsHandler` for texture generation
 
 **Files:**
-- `xearthlayer/src/fuse/fuse3/union_fs.rs` (new)
-- `xearthlayer/src/fuse/fuse3/mod.rs`
+- `xearthlayer/src/vfs/fuse3/union_fs.rs` (new)
+- `xearthlayer/src/vfs/fuse3/mod.rs`
 
 ### Phase 4: Mount Integration
 

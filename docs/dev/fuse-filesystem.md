@@ -258,7 +258,7 @@ Names ending `_LIT.dds` are lit textures for night lighting. They get their own 
 ### Open Flags for Virtual DDS Files
 
 The ortho union filesystem sets `VIRTUAL_DDS_OPEN_FLAGS` (single source of truth in
-`fuse/fuse3/ortho_union_fs.rs`) on virtual DDS inodes in `open()`. The value is
+`vfs/fuse3/ortho_union_fs.rs`) on virtual DDS inodes in `open()`. The value is
 platform-dependent:
 
 **Linux: `FOPEN_DIRECT_IO`** -- bypasses the kernel page cache for generated textures:
@@ -474,7 +474,7 @@ xearthlayer/src/
 
 | Type | Module | Purpose |
 |------|--------|---------|
-| `Fuse3OrthoUnionFS` | `fuse/fuse3/ortho_union_fs.rs` | Consolidated FUSE filesystem |
+| `Fuse3OrthoUnionFS` | `vfs/fuse3/ortho_union_fs.rs` | Consolidated FUSE filesystem |
 | `OrthoUnionIndex` | `ortho_union/index.rs` | Maps files to sources with priority |
 | `MountManager` | `manager/mounts.rs` | Orchestrates consolidated mounting |
 | `DdsHandler` | `service/dds_handler.rs` | Async DDS generation pipeline |

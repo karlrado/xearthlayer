@@ -5,7 +5,7 @@
 
 use std::f64::consts::PI;
 
-use crate::fuse::DdsFilename;
+use crate::vfs::DdsFilename;
 
 /// Web Mercator tiles along each side of one Ortho4XP texture.
 pub const TILES_PER_TEXTURE: u32 = 16;
@@ -60,7 +60,7 @@ impl Footprint {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::parse_dds_filename;
+    use crate::vfs::parse_dds_filename;
 
     #[test]
     fn expanded_grows_every_edge() {

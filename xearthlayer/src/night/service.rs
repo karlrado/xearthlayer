@@ -28,7 +28,7 @@ use super::{
     TextureSettingSource,
 };
 use crate::cache::Cache;
-use crate::fuse::DdsFilename;
+use crate::vfs::DdsFilename;
 
 /// The source of lit DDS bytes for FUSE.
 ///
@@ -560,7 +560,7 @@ impl LitTextureSource for NightLitSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::{DdsFilename, TextureKind};
+    use crate::vfs::{DdsFilename, TextureKind};
 
     fn lit() -> DdsFilename {
         DdsFilename {
@@ -625,8 +625,8 @@ mod tests {
 
     mod night_source {
         use super::super::*;
-        use crate::fuse::{DdsFilename, TextureKind};
         use crate::night::{FixedTextureSetting, LaminarArt, RecipeStore};
+        use crate::vfs::{DdsFilename, TextureKind};
         use std::sync::Arc;
         use tempfile::TempDir;
 

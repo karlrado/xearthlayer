@@ -1278,7 +1278,7 @@ xearthlayer/src/
 │   ├── cache_write.rs          # CacheWriteTask
 │   └── cached_tile_probe.rs    # CachedTileProbeTask (prefetch lane admission re-check)
 │
-├── fuse/fuse3/
+├── vfs/fuse3/
 │   └── shared.rs               # DdsRequestor trait (supports DdsClient)
 │
 └── prefetch/

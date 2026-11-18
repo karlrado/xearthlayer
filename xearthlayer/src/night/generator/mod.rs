@@ -16,7 +16,7 @@ use image::RgbaImage;
 
 use super::laminar::LitPattern;
 use super::recipe::Recipe;
-use crate::fuse::DdsFilename;
+use crate::vfs::DdsFilename;
 
 pub use cpu::CpuLitGenerator;
 pub use gain::{gain, GAIN_CEILING_NW, GAIN_FLOOR_NW, GAIN_GAMMA};
@@ -97,8 +97,8 @@ const DDS_HEADER_LEN: usize = 128;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fuse::TextureKind;
     use crate::night::parse_recipe;
+    use crate::vfs::TextureKind;
 
     const URBAN: &[u8] = include_bytes!("../../../tests/fixtures/night/urban.oxn");
 

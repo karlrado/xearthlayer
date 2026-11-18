@@ -45,8 +45,8 @@ which is **25% of the entire CLI crate**.
 module itself are in a `#[cfg(test)]` block:
 
 ```
-xearthlayer/src/fuse/fuse3/ortho_union_fs.rs:2149   crate::publisher::DsfCompressor::laminar()
-xearthlayer/src/fuse/fuse3/ortho_union_fs.rs:2153   crate::publisher::SEVENZ_MAGIC
+xearthlayer/src/vfs/fuse3/ortho_union_fs.rs:2149   crate::publisher::DsfCompressor::laminar()
+xearthlayer/src/vfs/fuse3/ortho_union_fs.rs:2153   crate::publisher::SEVENZ_MAGIC
 ```
 
 That test builds a realistic 7z DSF container and asserts FUSE passes it

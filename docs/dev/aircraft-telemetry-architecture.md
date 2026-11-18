@@ -745,8 +745,8 @@ xearthlayer/src/
 
 | File | Changes |
 |------|---------|
-| `fuse/fuse3/ortho_union_fs.rs` | Send `DdsTileCoord` events to Scene Tracker |
-| `fuse/fuse3/shared.rs` | Parse DDS filename to `DdsTileCoord` |
+| `vfs/fuse3/ortho_union_fs.rs` | Send `DdsTileCoord` events to Scene Tracker |
+| `vfs/fuse3/shared.rs` | Parse DDS filename to `DdsTileCoord` |
 | `prefetch/tile_based/prefetcher.rs` | Remove aircraft state, observe APT, query Scene Tracker |
 | `prefetch/state.rs` | Remove aircraft state, keep prefetch stats only |
 | `prefetch/prewarm.rs` | Send prewarm position to APT via channel |

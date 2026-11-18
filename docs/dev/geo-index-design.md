@@ -388,7 +388,7 @@ Bulk population via `populate()` provides atomicity: readers never see a partial
 | `xearthlayer/src/geo_index/layers.rs` | `GeoLayer` trait, `PatchCoverage`, `RetainedRegion`, `PrefetchedRegion` |
 | `xearthlayer/src/prefetch/state_observer.rs` | `PrefetchStateObserver` — FUSE-side `PrefetchedRegion` writer (demotion) |
 | `xearthlayer/src/ortho_union/index.rs` | `resolve_lazy_filtered()` |
-| `xearthlayer/src/fuse/fuse3/ortho_union_fs.rs` | FUSE composition (`is_geo_filtered`, `resolve_lazy_geo`) |
+| `xearthlayer/src/vfs/fuse3/ortho_union_fs.rs` | FUSE composition (`is_geo_filtered`, `resolve_lazy_geo`) |
 | `xearthlayer/src/manager/mounts.rs` | GeoIndex creation and population |
 | `xearthlayer/src/prefetch/prewarm/context.rs` | Prewarm patched region filtering |
 | `xearthlayer/src/prefetch/adaptive/coordinator/core.rs` | Prefetch patched region filtering |

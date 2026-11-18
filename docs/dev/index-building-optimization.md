@@ -496,7 +496,7 @@ impl MountManager {
 | `ortho_union/builder.rs` | Add `build_with_progress()`, parallel scanning |
 | `ortho_union/mod.rs` | Export new types |
 | `manager/mounts.rs` | Use new builder API with progress |
-| `fuse/fuse3/ortho_union_fs.rs` | Handle lazy directories in readdir |
+| `vfs/fuse3/ortho_union_fs.rs` | Handle lazy directories in readdir |
 | `xearthlayer/Cargo.toml` | Add rayon, bincode dependencies |
 | `xearthlayer-cli/src/ui/dashboard/state.rs` | Add BuildingIndex state |
 | `xearthlayer-cli/src/ui/dashboard/render.rs` | Render index building progress |
