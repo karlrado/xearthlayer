@@ -8,8 +8,7 @@ The following features are **implemented and working**:
 
 | Feature | Status | Description |
 |---------|--------|-------------|
-| PassthroughFS | ✅ Complete | FUSE filesystem that overlays existing scenery packs |
-| UnionFS | ✅ Complete | Union filesystem for consolidated multi-source mounting |
+| Consolidated ortho mount | ✅ Complete | The single union FUSE mount (sole path since #233, which deleted PassthroughFS and UnionFS) |
 | X-Plane Path Detection | ✅ Complete | Auto-detects X-Plane 12 install from reference file |
 | On-demand DDS Generation | ✅ Complete | Downloads satellite imagery and encodes to BC1/BC3 DDS |
 | Multi-provider Support | ✅ Complete | Bing Maps, Google GO2, Google Maps API |
@@ -257,8 +256,10 @@ Names ending `_LIT.dds` are lit textures for night lighting. They get their own 
 
 ### Open Flags for Virtual DDS Files
 
-The ortho union filesystem sets `VIRTUAL_DDS_OPEN_FLAGS` (single source of truth in
-`vfs/fuse3/ortho_union_fs.rs`) on virtual DDS inodes in `open()`. The value is
+The fuse3 adapter opens virtual DDS inodes with the flags decided by
+`vfs/fuse3/fuse_platform.rs` — the fuse3 backend's platform-policy module
+(`virtual_dds_open_flags()`, and the one `#[cfg(target_os)]` policy site in
+`vfs/`; see `docs/dev/filesystem-backend-split.md`). The value is
 platform-dependent:
 
 **Linux: `FOPEN_DIRECT_IO`** -- bypasses the kernel page cache for generated textures:
@@ -371,6 +372,24 @@ X-Plane 12/Custom Scenery/
 
 ## Mount Lifecycle
 
+### The Mount Seam
+
+All mounting goes through `vfs/backend.rs`. The manager builds an
+`OrthoUnionCore` (`vfs/common/core.rs`), fully wired — geo index, state
+observer, lit source, pinned budget, metrics, timeout — wraps it as
+`Arc<dyn UnionFilesystem>`, and calls `select_backend().mount(fs,
+MountRequest)`. The returned `MountSession` answers `mountpoint()` and
+`is_mounted()`, unmounts on `unmount()` (resolving only once the mount is
+gone from the kernel's table), and **guarantees unmount on drop** — the
+manager's teardown and the panic hook's `force_unmount` both rely on that.
+`LinuxFuse` and `MacFuse` (`vfs/fuse3/adapters.rs`) are the two fuse3
+backends; `select_backend()` is the crate's one platform choice, and
+`fuse_platform.rs` carries the mount-call/open-flag/volname policy inside
+the backend. The fuse3 adapter itself has no mount path of its own.
+Per-backend drop-unmount tests are `#[ignore]`d unit tests plus
+`tests/live_mount.rs`, run by `make live-fuse`. The design lives in
+`docs/dev/filesystem-backend-split.md`.
+
 ### Startup Sequence
 
 ```
@@ -379,7 +398,7 @@ X-Plane 12/Custom Scenery/
 3. Discover patches from patches directory
 4. Build OrthoUnionIndex (patches + packages, sorted)
 5. Create shared XEarthLayerService (cache, pipeline, limiters)
-6. Mount Fuse3OrthoUnionFS at zzXEL_ortho
+6. Build OrthoUnionCore; mount it via the seam: select_backend().mount(...) at zzXEL_ortho
 7. Create consolidated overlay symlinks at yzXEL_overlay
 8. Start prefetch listener if telemetry enabled
 9. Display dashboard and wait for Ctrl+C
@@ -390,7 +409,7 @@ X-Plane 12/Custom Scenery/
 ```
 1. Signal shutdown (Ctrl+C received)
 2. Stop prefetch listener
-3. Unmount FUSE filesystem
+3. Drop the MountSession (drop-unmount is the seam's guarantee)
 4. Flush pending cache writes
 5. Clean up resources
 6. Remove overlay symlinks (optional)
@@ -416,69 +435,57 @@ xearthlayer start --source /path/to/scenery
 
 ```
 xearthlayer/src/
-├── fuse/
-│   ├── mod.rs              # Module exports
-│   ├── fuse3/              # Async multi-threaded FUSE (primary)
-│   │   ├── mod.rs          # Fuse3 module exports
-│   │   ├── passthrough_fs.rs   # Single-source passthrough
-│   │   ├── union_fs.rs         # Multi-source union (patches)
-│   │   └── ortho_union_fs.rs   # Consolidated ortho mount
+├── vfs/                    # Virtual filesystem domain (backend-neutral + backends)
+│   ├── mod.rs              # Exports: filename, placeholder, coalesce, EXPECTED_DDS_SIZE
+│   ├── backend.rs          # Mount seam: MountBackend/MountSession, select_backend()
+│   ├── common/
+│   │   ├── core.rs         # OrthoUnionCore — backend-neutral union filesystem
+│   │   ├── union.rs        # UnionFilesystem contract (object-safe, boxed futures)
+│   │   ├── node.rs         # FsNode — what a path node is
+│   │   ├── error.rs        # FsError — the neutral error space
+│   │   ├── attrs.rs        # Neutral FileAttributes/Entry/DirEntry/StatFsInfo
+│   │   ├── requestor.rs    # DDS request pipeline (chunk coords, requestor trait)
+│   │   └── conformance.rs  # check_union_filesystem — the contract suite
 │   ├── filename.rs         # DDS filename parsing
-│   └── placeholder.rs      # Magenta placeholder generation
+│   ├── placeholder.rs      # Magenta placeholder generation
+│   └── fuse3/
+│       ├── ortho_union_fs.rs   # Thin fuse3 adapter (inode identity + kernel translation)
+│       ├── adapters.rs         # LinuxFuse/MacFuse backends + Fuse3MountSession
+│       ├── fuse_platform.rs    # Platform policy: mount call, open flags, volname, FileAttr
+│       ├── inode.rs            # InodeManager (kernel identity)
+│       ├── unmount.rs          # Mount-table operations (fusermount3 / umount)
+│       └── types.rs            # Fuse3Error, errno_from
 ├── ortho_union/
-│   ├── mod.rs              # Module exports
-│   ├── index.rs            # OrthoUnionIndex (tile → source mapping)
-│   └── source.rs           # OrthoSource, SourceType
-├── patches/
-│   ├── mod.rs              # Module exports
-│   ├── discovery.rs        # Patch directory scanning
-│   └── index.rs            # PatchUnionIndex
+│   ├── index.rs            # OrthoUnionIndex (file → source mapping)
+│   └── builder.rs          # Parallel index build with terrain/textures lazy dirs
+├── geo_index/              # Region-indexed geospatial reference database
+├── patches/                # Patch discovery and union index
 ├── service/
-│   ├── mod.rs              # Module exports
-│   ├── facade.rs           # High-level service API
-│   ├── dds_handler.rs      # DDS request handling
-│   └── fuse_mount.rs       # FUSE mount management
+│   ├── facade.rs           # XEarthLayerService (runtime, caches, wiring)
+│   └── cache_layer.rs      # Cache lifecycle and budgets
 ├── manager/
-│   ├── mod.rs              # Module exports
-│   ├── mounts.rs           # MountManager for consolidated mounting
+│   ├── mounts.rs           # MountManager — mounts through the seam, holds sessions
 │   └── symlinks.rs         # Overlay symlink management
-├── executor/
-│   ├── mod.rs              # Module exports
-│   ├── daemon.rs           # JobExecutorDaemon (channel-based job processing)
-│   ├── client.rs           # DdsClient trait, job submission
-│   └── resource_pool.rs    # Concurrency limiting by resource type
-├── runtime/
-│   ├── mod.rs              # Module exports
-│   └── health.rs           # RuntimeHealth monitoring
-├── jobs/
-│   ├── mod.rs              # Module exports
-│   └── dds_generate.rs     # DdsGenerateJob
-├── tasks/
-│   ├── mod.rs              # Module exports
-│   ├── download_chunks.rs  # Parallel chunk downloads
-│   ├── assemble_image.rs   # JPEG decode, canvas assembly
-│   ├── encode_dds.rs       # BC1/BC3 compression
-│   └── cache_write.rs      # Memory cache write
-├── prefetch/
-│   ├── mod.rs              # Module exports
-│   ├── strategy.rs         # Prefetcher trait
-│   ├── radial.rs           # RadialPrefetcher (recommended)
-│   └── web_api/            # X-Plane Web API telemetry
-├── config/                 # Configuration system
-├── cache/                  # Three-tier caching
-├── provider/               # Imagery providers
-└── texture/                # DDS encoding
+├── executor/               # Two-lane job executor (demand + prefetch)
+├── runtime/                # Orchestrator, lanes, requests
+├── jobs/  tasks/           # Tile generation job/task units
+└── prefetch/
+    ├── adaptive/           # AdaptivePrefetchCoordinator (flight-phase aware)
+    └── state_observer.rs   # FUSE-side prefetch claim demotion
 ```
+
 
 ### Key Types
 
 | Type | Module | Purpose |
 |------|--------|---------|
-| `Fuse3OrthoUnionFS` | `vfs/fuse3/ortho_union_fs.rs` | Consolidated FUSE filesystem |
+| `OrthoUnionCore` | `vfs/common/core.rs` | Backend-neutral union filesystem (implements `UnionFilesystem`) |
+| `Fuse3OrthoUnionFS` | `vfs/fuse3/ortho_union_fs.rs` | Thin fuse3 adapter: inode identity + kernel translation only |
+| `LinuxFuse` / `MacFuse` | `vfs/fuse3/adapters.rs` | The fuse3 `MountBackend`s behind the seam |
+| `MountSession` | `vfs/backend.rs` | Live mount contract: `is_mounted`, `unmount`, drop-unmounts |
 | `OrthoUnionIndex` | `ortho_union/index.rs` | Maps files to sources with priority |
-| `MountManager` | `manager/mounts.rs` | Orchestrates consolidated mounting |
-| `DdsHandler` | `service/dds_handler.rs` | Async DDS generation pipeline |
-| `RadialPrefetcher` | `prefetch/radial.rs` | Predictive tile caching |
+| `MountManager` | `manager/mounts.rs` | Orchestrates consolidated mounting through the seam |
+| `AdaptivePrefetchCoordinator` | `prefetch/adaptive/` | Predictive tile caching |
 
 ## Error Handling
 

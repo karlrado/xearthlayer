@@ -501,9 +501,20 @@ impl OrthoUnionIndex {
 
 ## FUSE Integration
 
+> **Superseded shape (0.6 backend split).** The struct below is the
+> original v0.2.11 design. Today `Fuse3OrthoUnionFS` is a thin fuse3
+> adapter carrying only kernel identity (inodes) and translation over the
+> backend-neutral `OrthoUnionCore` (`vfs/common/core.rs`, implementing the
+> object-safe `UnionFilesystem` contract). Mounting no longer happens in
+> the adapter: `MountManager` hands a fully-wired
+> `Arc<dyn UnionFilesystem>` to `select_backend().mount(...)` (the mount
+> seam, `vfs/backend.rs`) and stores the returned `MountSession`, which
+> unmounts on drop. See `docs/dev/filesystem-backend-split.md` for the
+> design and `docs/dev/fuse-filesystem.md` for the current shape.
+
 ### Fuse3OrthoUnionFS
 
-New FUSE filesystem that wraps `OrthoUnionIndex` and `DdsHandler`.
+Originally a single filesystem wrapping `OrthoUnionIndex` and `DdsHandler`.
 
 ```rust
 pub struct Fuse3OrthoUnionFS {

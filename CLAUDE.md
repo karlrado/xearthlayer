@@ -24,14 +24,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ### Implemented Components
 
-1. **FUSE Layer** (`xearthlayer/src/vfs/fuse3/`)
-   - `Fuse3OrthoUnionFS` - The single FUSE mount: all ortho sources (patches + packages)
-     merged into one union filesystem. The earlier `Fuse3PassthroughFS` and
-     `Fuse3UnionFS` implementations were deleted in #233 once they became unreachable.
+1. **VFS Layer** (`xearthlayer/src/vfs/`)
+   - `OrthoUnionCore` (`vfs/common/core.rs`) - The backend-neutral union
+     filesystem: all ortho sources (patches + packages) merged into one
+     view, DDS handle memoisation, pinned budget, lit routing. Implements
+     the object-safe `UnionFilesystem` contract (`vfs/common/union.rs`,
+     hand-boxed futures; no async-trait/AFIT) and is held to it by the
+     conformance suite `check_union_filesystem` (`vfs/common/conformance.rs`).
+     The earlier `Fuse3PassthroughFS`/`Fuse3UnionFS` were deleted in #233.
+   - `Fuse3OrthoUnionFS` (`vfs/fuse3/ortho_union_fs.rs`) - Thin fuse3
+     adapter: kernel identity (`InodeManager`) plus kernel⇄neutral
+     translation (`errno_from`, `fuse_platform::file_attr` — the
+     `FileAttrBuilder` trait dissolved into it) and nothing else; built
+     inside the backend at mount time, never by the manager. Wiring
+     (geo index, observer, lit source, budget, metrics, timeout) happens
+     on the core BEFORE `Arc<dyn UnionFilesystem>` wrapping — past the
+     seam the backend cannot re-configure what it cannot name.
+   - Mount seam (`vfs/backend.rs`) - `MountBackend::mount(Arc<dyn
+     UnionFilesystem>, MountRequest) -> MountFuture<MountSession>` plus
+     `recover_stale`/`force_unmount` (sync, no-panic via `catch_unwind` —
+     the panic hook calls them); `select_backend()` is the crate's one
+     `cfg!` platform choice (`LinuxFuse`/`MacFuse` unit structs in
+     `vfs/fuse3/adapters.rs`). A `MountSession` unmounts on drop (the
+     guaranteed teardown path; per-backend live tests) and its `unmount()`
+     resolves only once the mount table is clean. `fuse_platform.rs` is
+     the fuse3 backend's platform policy (session mount call, virtual-DDS
+     open flags, volname rule, `FileAttr` platform fields); with the
+     backend's own `unmount.rs` mount-table arms it is the only
+     `#[cfg(target_os)]` in `vfs/`. Design: `docs/dev/filesystem-backend-split.md`
+   - Live-mount suite: `tests/live_mount.rs` + the per-backend drop-unmount
+     probes, `#[ignore]`-gated, run by `make live-fuse` (CI Linux runs it
+     as a non-blocking probe step)
    - All FUSE operations run asynchronously on the Tokio runtime
-   - Shared traits: `FileAttrBuilder`, `DdsRequestor` (SOLID: Interface Segregation)
-   - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`
-   - Virtual DDS files open with `FOPEN_DIRECT_IO` on Linux so every read reaches the handler. macOS serves them through the kernel page cache (direct I/O crashes X-Plane's `mmap` texture loader under macFUSE), so the FUSE read counters under-report there; nothing functional depends on per-read visibility (#204). See `docs/dev/fuse-filesystem.md`
+   - Pattern matching for DDS files: `{row}_{col}_ZL{zoom}.dds`; the
+     request pipeline lives in `vfs/common/requestor.rs`
+   - Virtual DDS files open with `FOPEN_DIRECT_IO` on Linux so every read reaches the handler. macOS serves them through the kernel page cache (direct I/O crashes X-Plane's `mmap` texture loader under macFUSE), so the FUSE read counters under-report there; nothing functional depends on per-read visibility (#204). The flags are chosen by `vfs/fuse3/fuse_platform::virtual_dds_open_flags()`. See `docs/dev/fuse-filesystem.md`
 
 2. **Tile Generation** (`xearthlayer/src/tile/`)
    - `TileGenerator` trait with dependency injection
@@ -269,7 +296,7 @@ xearthlayer-cli
             │               └─→ jobs (DdsGenerateJob)                   │
             │                       └─→ tasks (DownloadChunks, BuildAndCacheDds) │
             │                                                            │
-            ├─→ vfs/fuse3 (async multi-threaded FUSE) ─────────────────┤
+            ├─→ vfs (OrthoUnionCore; fuse3 backend behind the seam) ───┤
             │       ├─→ uses DdsClient (demand lane) for tile requests  │
             │       └─→ uses GeoIndex for patch region filtering        │
             │                                                            │
@@ -454,9 +481,11 @@ xearthlayer-publish --library <gen> <command>              # Any command in anot
 | `xearthlayer/src/jobs/factory.rs` | DdsJobFactory trait for job creation |
 | `xearthlayer/src/tasks/` | Task implementations (DownloadChunks, BuildAndCacheDds; legacy: assemble, encode, cache) |
 | `xearthlayer/src/provider/factory.rs` | Provider factories (sync + async) |
-| `xearthlayer/src/vfs/fuse3/` | Fuse3 async multi-threaded filesystem |
-| `xearthlayer/src/vfs/fuse3/shared.rs` | Shared FUSE traits (FileAttrBuilder, DdsRequestor) |
-| `xearthlayer/src/vfs/fuse3/ortho_union_fs.rs` | Consolidated ortho FUSE mount |
+| `xearthlayer/src/vfs/common/core.rs` | OrthoUnionCore — the backend-neutral union filesystem |
+| `xearthlayer/src/vfs/backend.rs` | Mount seam: MountBackend/MountSession, select_backend() |
+| `xearthlayer/src/vfs/fuse3/ortho_union_fs.rs` | Thin fuse3 adapter (inodes + kernel translation) |
+| `xearthlayer/src/vfs/fuse3/adapters.rs` | LinuxFuse/MacFuse backends, Fuse3MountSession |
+| `xearthlayer/src/vfs/fuse3/fuse_platform.rs` | fuse3 platform policy (mount call, open flags, volname, FileAttr) |
 | `xearthlayer/src/paths/` | Path resolution: BaseDirectories, platform layouts, role accessors |
 | `xearthlayer-cli/src/preflight/migrate.rs` | Layout migration check |
 | `xearthlayer-cli/src/preflight/proposal.rs` | Migration decision table and guidance (pure) |
@@ -611,7 +640,8 @@ matrix jobs are renamed.
 - Configuration reference: `docs/configuration.md`
 - Developer documentation: `docs/dev/`
 - **Job Executor Framework**: `docs/dev/job-executor-design.md` (daemon architecture, job/task traits)
-- **Fuse3 implementation**: `xearthlayer/src/vfs/fuse3/mod.rs` (async multi-threaded FUSE)
+- **Filesystem backend split**: `docs/dev/filesystem-backend-split.md` (vfs domain, `UnionFilesystem` contract, mount seam, rehearsal findings)
+- **FUSE filesystem**: `docs/dev/fuse-filesystem.md` (current architecture, open-flag policy, mount lifecycle through the seam)
 - **GPU Encoding**: `docs/dev/gpu-encoding-design.md` (wgpu compute shaders, channel worker, memory optimization)
 - Package publisher design: `docs/dev/package-publisher-design.md`
 - **World rebuild runbook**: `docs/dev/world-rebuild-runbook.md` (the campaign to rebuild every regional package: naming, staging channel, promotion, retirement)
