@@ -24,6 +24,7 @@
 //! - **Concurrency**: DDS requests processed in parallel
 //! - **Self reference**: `&self` (immutable), enabling shared concurrent access
 
+mod fuse_platform;
 mod inode;
 mod ortho_union_fs;
 mod shared;

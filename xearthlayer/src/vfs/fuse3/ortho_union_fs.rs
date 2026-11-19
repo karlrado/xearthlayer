@@ -42,6 +42,8 @@
 //! This ensures sources can include pre-built textures, but XEL generates
 //! missing textures dynamically using its configured imagery provider.
 
+use super::fuse_platform;
+use super::fuse_platform::file_attr;
 use super::inode::InodeManager;
 use super::shared::TTL;
 use super::types::{errno_from, Fuse3Error, Fuse3Result};
@@ -51,11 +53,11 @@ use crate::night::LitTextureSource;
 use crate::ortho_union::OrthoUnionIndex;
 use crate::pinned_budget::PinnedTileBudget;
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use crate::vfs::common::attrs::{attrs_from_metadata, FileAttributes};
-use crate::vfs::common::{FsNode, NodeKind, OrthoUnionCore};
+use crate::vfs::common::attrs::attrs_from_metadata;
+use crate::vfs::common::{FsNode, OrthoUnionCore};
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, FileAttr, ReplyAttr, ReplyData, ReplyDirectory,
+    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory,
     ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
@@ -68,38 +70,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::fs;
 use tracing::{debug, trace};
-
-/// FUSE open flag: bypass kernel page cache for this file.
-///
-/// From `linux/fuse.h`: `#define FOPEN_DIRECT_IO (1 << 0)`
-///
-/// When set in `ReplyOpen::flags`, the kernel sends every `read()` through
-/// the FUSE handler instead of serving from its page cache. Used for virtual
-/// DDS files so that every X-Plane read is counted (`MetricEvent::FuseRead`)
-/// and none is answered from a cache this filesystem cannot invalidate.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
-const FOPEN_DIRECT_IO: u32 = 1;
-
-/// Open flags reported for virtual DDS files.
-///
-/// Linux uses [`FOPEN_DIRECT_IO`]: every `read()` reaches this handler, so the
-/// FUSE read counters are exact and the page cache never holds a second copy
-/// of a tile the memory cache already has.
-///
-/// **macOS must not.** X-Plane memory-maps texture files, and macFUSE faults
-/// with `EXC_BAD_ACCESS` when a `direct_io` file is `mmap`ed, because `mmap`
-/// needs the page cache that `direct_io` bypasses. macOS therefore serves
-/// virtual DDS through the page cache, trading per-read visibility for not
-/// crashing the sim's texture loader. The one consequence is that the FUSE
-/// read counters under-report there: a tile's cold first read reaches this
-/// handler and repeat reads are answered by the kernel. Nothing functional
-/// depends on seeing every read (#204): prefetch is driven by telemetry, and
-/// the cold reads that trigger generation still arrive.
-#[cfg(not(target_os = "macos"))]
-const VIRTUAL_DDS_OPEN_FLAGS: u32 = FOPEN_DIRECT_IO;
-#[cfg(target_os = "macos")]
-const VIRTUAL_DDS_OPEN_FLAGS: u32 = 0;
-
 /// Consolidated ortho union FUSE filesystem.
 ///
 /// This filesystem merges all ortho sources (patches + regional packages) into
@@ -377,15 +347,7 @@ impl Fuse3OrthoUnionFS {
             "Virtual DDS handle memoisation budget"
         );
 
-        #[cfg(target_os = "linux")]
-        let handle = fuse3::raw::Session::new(mount_options)
-            .mount_with_unprivileged(self, mount_path)
-            .await
-            .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
-
-        #[cfg(not(target_os = "linux"))]
-        let handle = fuse3::raw::Session::new(mount_options)
-            .mount(self, mount_path)
+        let handle = fuse_platform::mount(mount_options, self, &mount_path)
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
 
@@ -411,15 +373,7 @@ impl Fuse3OrthoUnionFS {
         let mount_path = PathBuf::from(mountpoint);
         let mount_options = mount_options(&mount_path);
 
-        #[cfg(target_os = "linux")]
-        let handle = fuse3::raw::Session::new(mount_options)
-            .mount_with_unprivileged(self, mount_path.clone())
-            .await
-            .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
-
-        #[cfg(not(target_os = "linux"))]
-        let handle = fuse3::raw::Session::new(mount_options)
-            .mount(self, mount_path.clone())
+        let handle = fuse_platform::mount(mount_options, self, &mount_path)
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
 
@@ -437,65 +391,14 @@ fn mount_options(mount_path: &Path) -> MountOptions {
     mount_options.force_readdir_plus(false);
     // Tell kernel we don't implement opendir - it should call readdir directly
     mount_options.no_open_dir_support(true);
-    if let Some(volname) = volume_name_option(mount_path, cfg!(target_os = "macos")) {
+    if let Some(volname) = fuse_platform::volume_name_option(mount_path) {
         mount_options.custom_options(volname);
     }
     mount_options
 }
-
-/// The macFUSE `volname` option naming the volume after its mount-point
-/// folder (#305).
-///
-/// Finder shows a mounted volume's name in place of the folder it is mounted
-/// on, and macFUSE's default is `macFUSE Volume 0 (<process>)`, so without
-/// this `zzXEL_ortho` appears in Custom Scenery under that name. `None` off
-/// macOS, which has no volume names, and for a folder name containing a
-/// comma, which macFUSE would split into a second option.
-fn volume_name_option(mount_path: &Path, macos: bool) -> Option<String> {
-    if !macos {
-        return None;
-    }
-    let name = mount_path.file_name()?.to_str()?;
-    (!name.contains(',')).then(|| format!("volname={name}"))
-}
-
 // =============================================================================
 // Kernel-boundary translation
 // =============================================================================
-
-/// Neutral attributes plus the kernel inode → FUSE `FileAttr`.
-///
-/// The only place the fuse3 attribute shape is assembled: `ino` is the
-/// kernel identity the core does not know, and `flags` (macFUSE's BSD file
-/// flags) stays 0 as the `FileAttrBuilder` methods this replaced had it.
-/// Every other field is a copy — the core's constructors already fill
-/// `ctime`/`crtime` and the process owner exactly as the FUSE answers did.
-fn to_file_attr(attrs: &FileAttributes, ino: u64) -> FileAttr {
-    FileAttr {
-        ino,
-        size: attrs.size,
-        blocks: attrs.blocks,
-        atime: attrs.atime.into(),
-        mtime: attrs.mtime.into(),
-        ctime: attrs.ctime.into(),
-        kind: match attrs.kind {
-            NodeKind::Directory => FileType::Directory,
-            NodeKind::RegularFile => FileType::RegularFile,
-            NodeKind::Symlink => FileType::Symlink,
-        },
-        perm: attrs.perm,
-        nlink: attrs.nlink,
-        uid: attrs.uid,
-        gid: attrs.gid,
-        rdev: attrs.rdev,
-        blksize: attrs.blksize,
-        #[cfg(target_os = "macos")]
-        crtime: attrs.crtime.into(),
-        #[cfg(target_os = "macos")]
-        flags: 0,
-    }
-}
-
 impl Filesystem for Fuse3OrthoUnionFS {
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!(
@@ -557,7 +460,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         Ok(ReplyEntry {
             ttl: TTL,
-            attr: to_file_attr(&entry.attrs, inode),
+            attr: file_attr(&entry.attrs, inode),
             generation: 0,
         })
     }
@@ -575,7 +478,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         let attrs = self.core.attrs(&node).await.map_err(errno_from)?;
         Ok(ReplyAttr {
             ttl: TTL,
-            attr: to_file_attr(&attrs, ino),
+            attr: file_attr(&attrs, ino),
         })
     }
 
@@ -728,8 +631,8 @@ impl Filesystem for Fuse3OrthoUnionFS {
             .attrs(&FsNode::Directory(virtual_path.clone()))
             .await;
         let self_attr = match self_attrs {
-            Ok(attrs) => to_file_attr(&attrs, ino),
-            Err(_) => to_file_attr(&crate::vfs::common::virtual_dir_attrs(), ino),
+            Ok(attrs) => file_attr(&attrs, ino),
+            Err(_) => file_attr(&crate::vfs::common::virtual_dir_attrs(), ino),
         };
         entries.push(DirectoryEntryPlus {
             inode: ino,
@@ -761,7 +664,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             kind: FileType::Directory,
             name: OsString::from(".."),
             offset: 2,
-            attr: to_file_attr(&crate::vfs::common::virtual_dir_attrs(), parent_inode),
+            attr: file_attr(&crate::vfs::common::virtual_dir_attrs(), parent_inode),
             entry_ttl: TTL,
             attr_ttl: TTL,
         });
@@ -782,7 +685,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
             };
 
             let attr = if is_dir {
-                to_file_attr(&child.entry.attrs, entry_inode)
+                file_attr(&child.entry.attrs, entry_inode)
             } else {
                 // For real files, get actual metadata from the source path
                 // This is critical for DSF and other passthrough files that need
@@ -793,12 +696,12 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 };
                 match upgraded {
                     Some(source) => match fs::metadata(&source.real_path).await {
-                        Ok(metadata) => to_file_attr(&attrs_from_metadata(&metadata), entry_inode),
+                        Ok(metadata) => file_attr(&attrs_from_metadata(&metadata), entry_inode),
                         // Fallback if metadata read fails
-                        Err(_) => to_file_attr(&child.entry.attrs, entry_inode),
+                        Err(_) => file_attr(&child.entry.attrs, entry_inode),
                     },
                     // Entry not in index (shouldn't happen for list_directory entries)
-                    None => to_file_attr(&child.entry.attrs, entry_inode),
+                    None => file_attr(&child.entry.attrs, entry_inode),
                 }
             };
 
@@ -823,40 +726,37 @@ impl Filesystem for Fuse3OrthoUnionFS {
     }
 
     async fn open(&self, _req: Request, inode: u64, _flags: u32) -> Fuse3InternalResult<ReplyOpen> {
-        if !InodeManager::is_virtual_inode(inode) {
-            // Real passthrough files: use default kernel caching, no handle state.
-            return Ok(ReplyOpen { fh: 0, flags: 0 });
-        }
-
-        // Virtual DDS files: bypass the kernel page cache so every read()
-        // reaches this handler (see VIRTUAL_DDS_OPEN_FLAGS).
-        //
-        // Allocate a handle so the tile is produced once and every later read
-        // slices it. The tile itself is NOT produced here: generation can take
-        // up to the configured timeout, and X-Plane may open a file it never
-        // reads. First read pays, as it always did.
-        // An inode we cannot map to a tile gets no handle rather than an error:
-        // open() used to succeed for any virtual inode, and read() is where a
-        // genuinely unknown one becomes ENOENT. Failing here instead would turn
-        // any gap in the inode map into a failed open.
-        let Some(coords) = self.inode_manager.get_virtual_dds(inode) else {
-            return Ok(ReplyOpen {
+        // Open flags are platform policy keyed on the node variant (see
+        // `fuse_platform::virtual_dds_open_flags`): only virtual DDS opens
+        // carry them; real passthrough and directory opens get the kernel's
+        // default caching, which is what a source file wants.
+        match self.node_for_inode(inode) {
+            Some(node @ FsNode::VirtualDds(_)) => {
+                // Allocate a handle so the tile is produced once and every
+                // later read slices it. The tile itself is NOT produced
+                // here: generation can take up to the configured timeout,
+                // and X-Plane may open a file it never reads. First read
+                // pays, as it always did. Lit passthrough, the pinned-bytes
+                // budget and memoisation are the core's decision; every
+                // no-handle case answers fh 0.
+                let fh = self.core.open(&node).map_err(errno_from)?;
+                Ok(ReplyOpen {
+                    fh,
+                    flags: fuse_platform::virtual_dds_open_flags(),
+                })
+            }
+            Some(_) => Ok(ReplyOpen { fh: 0, flags: 0 }),
+            // An inode we cannot map: a virtual-range one keeps the virtual
+            // DDS flags and gets no handle rather than an error — open()
+            // used to succeed for any virtual inode, and read() is where a
+            // genuinely unknown one becomes ENOENT. Failing here instead
+            // would turn any gap in the inode map into a failed open.
+            None if InodeManager::is_virtual_inode(inode) => Ok(ReplyOpen {
                 fh: 0,
-                flags: VIRTUAL_DDS_OPEN_FLAGS,
-            });
-        };
-
-        // Lit passthrough, the pinned-bytes budget and memoisation are the
-        // core's decision; every no-handle case answers fh 0.
-        let fh = self
-            .core
-            .open(&FsNode::VirtualDds(coords))
-            .map_err(errno_from)?;
-
-        Ok(ReplyOpen {
-            fh,
-            flags: VIRTUAL_DDS_OPEN_FLAGS,
-        })
+                flags: fuse_platform::virtual_dds_open_flags(),
+            }),
+            None => Ok(ReplyOpen { fh: 0, flags: 0 }),
+        }
     }
 
     async fn release(
@@ -939,35 +839,6 @@ mod tests {
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
     use xearthlayer_package::{InstalledPackage, Package, PackageType};
-
-    /// #305: Finder shows a mounted volume's name in place of its mount-point
-    /// folder, and macFUSE's default is `macFUSE Volume 0 (<process>)`.
-    #[test]
-    fn on_macos_the_volume_is_named_after_the_mount_point_folder() {
-        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
-
-        assert_eq!(
-            volume_name_option(mount, true).as_deref(),
-            Some("volname=zzXEL_ortho")
-        );
-    }
-
-    #[test]
-    fn off_macos_there_is_no_volume_name() {
-        let mount = Path::new("/X-Plane 12/Custom Scenery/zzXEL_ortho");
-
-        assert_eq!(volume_name_option(mount, false), None);
-    }
-
-    /// macFUSE splits its option list on commas, so a name containing one
-    /// would leak its tail in as a separate option.
-    #[test]
-    fn a_folder_name_with_a_comma_is_not_passed_as_a_volume_name() {
-        let mount = Path::new("/Custom Scenery/zzXEL_ortho,allow_other");
-
-        assert_eq!(volume_name_option(mount, true), None);
-    }
-
     /// Mock DdsClient for testing
     struct MockDdsClient {
         tx: mpsc::Sender<JobRequest>,
@@ -1516,7 +1387,8 @@ mod tests {
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
         assert_eq!(
-            opened.flags, VIRTUAL_DDS_OPEN_FLAGS,
+            opened.flags,
+            super::super::fuse_platform::virtual_dds_open_flags(),
             "the file must still bypass the page cache"
         );
         assert!(
@@ -1596,7 +1468,10 @@ mod tests {
         let reply = fs.open(test_request(), ino, 0).await.unwrap();
 
         assert_ne!(reply.fh, 0, "a known tile must get a memoising handle");
-        assert_eq!(reply.flags, VIRTUAL_DDS_OPEN_FLAGS);
+        assert_eq!(
+            reply.flags,
+            super::super::fuse_platform::virtual_dds_open_flags(),
+        );
         assert_eq!(fs.open_dds_handles(), 1);
         // open() must not produce the tile: generation can take up to the
         // configured timeout, and X-Plane may open a file it never reads.
@@ -2528,7 +2403,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_open_virtual_dds_returns_direct_io() {
-        use super::VIRTUAL_DDS_OPEN_FLAGS;
         use fuse3::raw::Filesystem;
 
         let temp = TempDir::new().unwrap();
@@ -2557,7 +2431,8 @@ mod tests {
 
         let reply = result.expect("open on virtual DDS inode should succeed");
         assert_eq!(
-            reply.flags, VIRTUAL_DDS_OPEN_FLAGS,
+            reply.flags,
+            super::super::fuse_platform::virtual_dds_open_flags(),
             "virtual DDS files should use the platform's virtual-DDS open flags \
              (direct I/O on Linux, page cache on macOS for mmap compatibility)"
         );
