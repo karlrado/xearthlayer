@@ -40,12 +40,15 @@ jobs:
       - name: Run make verify
         run: make verify
 
-      # Live-mount probe through the mount seam (unprivileged fusermount3).
-      # Non-blocking until a first run confirms hosted runners allow
-      # unprivileged FUSE mounts; the suite is #[ignore]-gated so `make
-      # verify` never depends on /dev/fuse.
-      - name: Live FUSE mount probe (non-blocking)
-        continue-on-error: true
+      # Live mounts through the mount seam (unprivileged fusermount3).
+      # Blocking since the probe answered its question (2026-11-19): all
+      # three live_mount tests passed on a hosted ubuntu-latest runner.
+      # This is the only --ignored invocation in the workflow; the suite's
+      # #[ignore] gate is what keeps it away from the macOS job (macFUSE is
+      # a kext, unloadable on hosted runners) and away from `make verify`,
+      # so only CI pays for real mounts and only Linux hosts run them. The
+      # live macOS leg stays manual: `make verify-macos` on a real machine.
+      - name: Live FUSE mount suite
         run: cargo test -p xearthlayer --test live_mount -- --ignored --nocapture
 
   # macOS is a Tier 1 platform. Pinned to macos-15 (Apple Silicon) rather than
