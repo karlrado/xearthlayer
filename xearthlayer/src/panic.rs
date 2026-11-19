@@ -186,12 +186,16 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
                 for mount_point in &guard.mount_points {
                     let _ = write!(stderr, "  Unmounting {}... ", mount_point.display());
 
-                    // Graceful first, then escalate to the platform's forced
-                    // unmount if the mount is still busy. unmount_fuse picks
-                    // fusermount (Linux) or umount (macOS).
-                    if crate::vfs::fuse3::unmount_fuse(mount_point, false) {
+                    // Graceful first, then escalate to the backend's forced
+                    // unmount if the mount is still busy. The seam's
+                    // force_unmount must not panic — we are inside a panic
+                    // hook — and its bool is what lets us log which attempt
+                    // worked (the backend's catch_unwind is tested in
+                    // vfs/fuse3/adapters.rs).
+                    let backend = crate::vfs::backend::select_backend();
+                    if backend.force_unmount(mount_point, false) {
                         let _ = writeln!(stderr, "OK");
-                    } else if crate::vfs::fuse3::unmount_fuse(mount_point, true) {
+                    } else if backend.force_unmount(mount_point, true) {
                         let _ = writeln!(stderr, "OK (forced)");
                     } else {
                         let _ = writeln!(stderr, "FAILED");
