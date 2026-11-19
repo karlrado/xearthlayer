@@ -222,15 +222,19 @@ test-scripts: ## Run the release script tests (bash, against fake macOS tools)
 		shellcheck -x scripts/macos/*.sh scripts/macos/tests/*.sh scripts/macos/tests/fakes/fake-tool; \
 	else echo "$(YELLOW)shellcheck not installed; skipped$(NC)"; fi
 
+.PHONY: live-fuse
+live-fuse: ## Live FUSE mount suite through the mount seam (needs /dev/fuse + fusermount3, or macFUSE)
+	RUST_BACKTRACE=$(RUST_BACKTRACE) RUSTFLAGS="$(STRICT_RUSTFLAGS)" $(CARGO) test -p xearthlayer --test live_mount -- --ignored --nocapture
+
 .PHONY: verify-macos
-verify-macos: ## Full macOS verification: verify + live macFUSE smoke tests (macOS only)
+verify-macos: ## Full macOS verification: verify + live FUSE mount suite (macOS only)
 	@if [ "$$(uname -s)" != "Darwin" ]; then \
 		echo "$(RED)Error: verify-macos must be run on macOS$(NC)"; exit 1; fi
 	@if [ ! -d /Library/Filesystems/macfuse.fs ]; then \
 		echo "$(RED)Error: macFUSE not installed. See docs/macos.md$(NC)"; exit 1; fi
 	@$(MAKE) verify
-	@echo "$(BLUE)Running macFUSE smoke tests...$(NC)"
-	RUST_BACKTRACE=$(RUST_BACKTRACE) RUSTFLAGS="$(STRICT_RUSTFLAGS)" $(CARGO) test -p xearthlayer --test macfuse_smoke -- --ignored --nocapture
+	@echo "$(BLUE)Running live FUSE mount suite (macFUSE)...$(NC)"
+	RUST_BACKTRACE=$(RUST_BACKTRACE) RUSTFLAGS="$(STRICT_RUSTFLAGS)" $(CARGO) test -p xearthlayer --test live_mount -- --ignored --nocapture
 	@echo "$(GREEN)macOS verification complete!$(NC)"
 
 .PHONY: pre-commit

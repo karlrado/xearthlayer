@@ -12,15 +12,18 @@
 //! in production — it is wrapped, not rewritten.
 
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use super::fuse_platform;
 use super::ortho_union_fs::Fuse3OrthoUnionFS;
 use super::types::SpawnedMountHandle;
 use crate::vfs::backend::{MountBackend, MountError, MountFuture, MountRequest, MountSession};
 use crate::vfs::common::UnionFilesystem;
+use tracing::warn;
 
 /// The Linux fuse3 backend: `mount_with_unprivileged`, which goes through
 /// `fusermount3` (setuid) rather than the privileged `mount` syscall
@@ -53,14 +56,48 @@ impl MountSession for Fuse3MountSession {
 
     fn unmount(self: Box<Self>) -> Pin<Box<dyn Future<Output = Result<(), MountError>> + Send>> {
         Box::pin(async move {
-            let Fuse3MountSession { inner, .. } = *self;
-            inner.unmount().await.map_err(MountError::Unmount)
+            let Fuse3MountSession { inner, mountpoint } = *self;
+            inner.unmount().await.map_err(MountError::Unmount)?;
+            // The mount task finishing does NOT prove the kernel released
+            // the mount: fuse3's MountHandle::drop spawned the actual detach
+            // as its own task. Confirm it, escalating like the Drop path
+            // does — otherwise is_mounted() could honestly answer `true`
+            // after this future resolved Ok (live_mount found this race).
+            confirm_unmounted(&mountpoint).await
         })
     }
 
     fn is_mounted(&self) -> bool {
         super::unmount::is_path_mounted(&self.mountpoint)
     }
+}
+
+/// Wait for the kernel to drop the mount, escalating graceful-then-forced
+/// past a deadline — the same ladder `SpawnedMountHandle::unmount_sync`
+/// walks from a synchronous Drop.
+async fn confirm_unmounted(mountpoint: &Path) -> Result<(), MountError> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if !super::unmount::is_path_mounted(mountpoint) {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    warn!(mountpoint = %mountpoint.display(), "Mount still present 5s after unmount signal, forcing");
+    if super::unmount::unmount_fuse(mountpoint, false) {
+        return Ok(());
+    }
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    if !super::unmount::is_path_mounted(mountpoint) {
+        return Ok(());
+    }
+    if super::unmount::unmount_fuse(mountpoint, true) {
+        return Ok(());
+    }
+    Err(MountError::Unmount(io::Error::other(
+        "mount still present after forced unmount",
+    )))
 }
 
 /// Mount through the platform's session call and box the live mount.

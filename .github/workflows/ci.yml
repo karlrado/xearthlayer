@@ -29,13 +29,24 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The pinned fuse3 crate is pure Rust (no -sys in the lock): the old
+      # libfuse3-dev install was only a carrier for fusermount3. `fuse3`
+      # installs fusermount3 directly, which is what a live mount needs.
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libfuse3-dev
+          sudo apt-get install -y fuse3
 
       - name: Run make verify
         run: make verify
+
+      # Live-mount probe through the mount seam (unprivileged fusermount3).
+      # Non-blocking until a first run confirms hosted runners allow
+      # unprivileged FUSE mounts; the suite is #[ignore]-gated so `make
+      # verify` never depends on /dev/fuse.
+      - name: Live FUSE mount probe (non-blocking)
+        continue-on-error: true
+        run: cargo test -p xearthlayer --test live_mount -- --ignored --nocapture
 
   # macOS is a Tier 1 platform. Pinned to macos-15 (Apple Silicon) rather than
   # macos-latest: that label has moved across both OS versions and CPU
