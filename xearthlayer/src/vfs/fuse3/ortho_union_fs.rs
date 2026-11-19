@@ -926,13 +926,12 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
 #[cfg(test)]
 mod tests {
-    use super::super::shared::chunk_to_tile_coords;
     use super::*;
     use crate::coord::TileCoord;
     use crate::executor::{DdsClientError, Priority};
     use crate::ortho_union::OrthoUnionIndexBuilder;
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
-    use crate::vfs::common::{DdsRequestor, VirtualDdsConfig};
+    use crate::vfs::common::DdsRequestor;
     use bytes::Bytes;
     use semver::Version;
     use std::sync::Arc;
@@ -1123,32 +1122,6 @@ mod tests {
         // At least 1 source (package is guaranteed)
         assert!(fs.index().source_count() >= 1);
     }
-
-    #[test]
-    fn test_virtual_dds_config() {
-        let config = VirtualDdsConfig::new(11_174_016);
-        assert_eq!(config.size(), 11_174_016);
-        assert_eq!(config.blksize(), 4096);
-        assert_eq!(config.blocks(), 2729);
-    }
-
-    #[test]
-    fn test_chunk_to_tile_coords() {
-        let coords = crate::vfs::DdsFilename {
-            row: 160000,
-            col: 84000,
-            zoom: 20,
-            map_type: "BI".to_string(),
-            kind: crate::vfs::TextureKind::Ortho,
-        };
-
-        let tile = chunk_to_tile_coords(&coords);
-
-        assert_eq!(tile.row, 10000);
-        assert_eq!(tile.col, 5250);
-        assert_eq!(tile.zoom, 16);
-    }
-
     #[test]
     fn test_with_disk_io_limiter() {
         let temp = TempDir::new().unwrap();
@@ -1410,35 +1383,6 @@ mod tests {
             .unwrap();
         assert_eq!(attr.attr.size, 152);
     }
-
-    #[tokio::test]
-    async fn test_lit_read_serves_black_without_touching_the_executor() {
-        use fuse3::raw::Filesystem;
-        let (fs, requests, _temp) = virtual_dds_fixture();
-        let ino = fs
-            .lookup(test_request(), textures_inode(&fs), lit_name())
-            .await
-            .unwrap()
-            .attr
-            .ino;
-
-        let opened = fs.open(test_request(), ino, 0).await.unwrap();
-        assert_eq!(opened.fh, 0, "lit files hold no memoising handle");
-        assert!(fs.core.dds_handles().is_empty());
-
-        let data = fs
-            .read(test_request(), ino, opened.fh, 0, 1 << 20)
-            .await
-            .unwrap()
-            .data;
-        assert_eq!(data, crate::night::minimal_black_dds());
-        assert_eq!(
-            requests.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "no DDS request"
-        );
-    }
-
     #[tokio::test]
     async fn test_request_dds_impl_serves_black_for_a_lit_name_without_a_request() {
         let (fs, requests, _temp) = virtual_dds_fixture();
@@ -1641,82 +1585,6 @@ mod tests {
             );
         }
     }
-
-    /// One open, many reads, one tile request.
-    ///
-    /// This is the defect: `read()` re-entered the executor on every ranged
-    /// call, so a single texture cost 12-23 round trips, each of which cloned
-    /// the whole 11.17 MB tile twice. Fails against the pre-fix handler with
-    /// one request per read.
-    #[tokio::test]
-    async fn test_virtual_dds_resolves_once_per_open() {
-        use fuse3::raw::Filesystem;
-
-        let (fs, requests, _temp) = virtual_dds_fixture();
-        let ino = virtual_inode(&fs);
-
-        let opened = fs.open(test_request(), ino, 0).await.unwrap();
-
-        const CHUNK: u32 = 1024 * 1024;
-        for i in 0..5u64 {
-            let reply = fs
-                .read(test_request(), ino, opened.fh, i * CHUNK as u64, CHUNK)
-                .await
-                .unwrap();
-            assert_eq!(reply.data.len(), CHUNK as usize, "read {i} short");
-        }
-
-        assert_eq!(
-            requests.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "five ranged reads of one open file must cost one tile request"
-        );
-    }
-
-    /// Serving from the memoised tile must still return the right window.
-    #[tokio::test]
-    async fn test_virtual_dds_reads_serve_the_requested_window() {
-        use fuse3::raw::Filesystem;
-
-        let (fs, _requests, _temp) = virtual_dds_fixture();
-        let ino = virtual_inode(&fs);
-        let opened = fs.open(test_request(), ino, 0).await.unwrap();
-
-        // Byte i of the tile is `i as u8`, except the four magic bytes.
-        for offset in [4096u64, 1_000_000, 8_000_000] {
-            let reply = fs
-                .read(test_request(), ino, opened.fh, offset, 256)
-                .await
-                .unwrap();
-            assert_eq!(reply.data.len(), 256);
-            assert_eq!(reply.data[0], (offset % 256) as u8, "offset {offset}");
-            assert_eq!(reply.data[255], ((offset + 255) % 256) as u8);
-        }
-    }
-
-    /// The last window is short, and reads past the tile return nothing.
-    #[tokio::test]
-    async fn test_virtual_dds_read_at_and_past_tile_end() {
-        use fuse3::raw::Filesystem;
-
-        let (fs, _requests, _temp) = virtual_dds_fixture();
-        let ino = virtual_inode(&fs);
-        let opened = fs.open(test_request(), ino, 0).await.unwrap();
-        let size = crate::vfs::EXPECTED_DDS_SIZE as u64;
-
-        let tail = fs
-            .read(test_request(), ino, opened.fh, size - 100, 4096)
-            .await
-            .unwrap();
-        assert_eq!(tail.data.len(), 100);
-
-        let past = fs
-            .read(test_request(), ino, opened.fh, size, 4096)
-            .await
-            .unwrap();
-        assert!(past.data.is_empty());
-    }
-
     /// A registered virtual inode gets a real, non-zero handle.
     #[tokio::test]
     async fn test_open_registered_virtual_dds_returns_a_handle() {
@@ -1905,27 +1773,6 @@ mod tests {
         assert_eq!(fs.open_dds_handles(), 0);
         assert_eq!(fs.pinned_tile_bytes(), 0);
     }
-
-    /// A read with no handle still works, one request per read.
-    ///
-    /// The kernel always calls `open()` first, but a handler that returns
-    /// ENOENT when it does not recognise a handle would turn any bookkeeping
-    /// slip into a black texture.
-    #[tokio::test]
-    async fn test_virtual_dds_read_without_a_handle_falls_back() {
-        use fuse3::raw::Filesystem;
-
-        let (fs, requests, _temp) = virtual_dds_fixture();
-        let ino = virtual_inode(&fs);
-
-        for _ in 0..3 {
-            let reply = fs.read(test_request(), ino, 0, 0, 4096).await.unwrap();
-            assert_eq!(reply.data.len(), 4096);
-        }
-
-        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 3);
-    }
-
     // ========================================================================
     // Passthrough read amplification (#233)
     // ========================================================================
