@@ -10,6 +10,7 @@
 
 // Backend-neutral types and contract; the core lands here as the split
 // proceeds (docs/dev/filesystem-backend-split.md).
+pub mod backend;
 pub mod common;
 
 mod coalesce;
@@ -18,6 +19,7 @@ pub mod fuse3;
 mod placeholder;
 
 // Re-export types for public API
+pub use backend::{FuseLimits, MountBackend, MountError, MountFuture, MountRequest, MountSession};
 pub use coalesce::{CoalesceResult, CoalescedResult, CoalescerStats, RequestCoalescer};
 pub use common::{DdsHandler, DdsRequest, DdsResponse};
 pub use filename::{parse_dds_filename, DdsFilename, ParseError, TextureKind};

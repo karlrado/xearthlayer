@@ -57,8 +57,8 @@ use crate::vfs::common::attrs::attrs_from_metadata;
 use crate::vfs::common::{FsNode, OrthoUnionCore};
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
-    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
+    DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
+    ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
 use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
