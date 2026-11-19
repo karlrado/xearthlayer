@@ -486,7 +486,7 @@ impl MountManager {
         // (macFUSE: ENXIO "Device not configured"). A stale mount also makes
         // exists() report false, so recovery must happen before the directory
         // check below.
-        crate::system::recover_stale_fuse_mount(&mountpoint);
+        crate::vfs::fuse3::recover_stale_fuse_mount(&mountpoint);
 
         // Create mountpoint directory
         if !mountpoint.exists() {

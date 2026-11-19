@@ -278,17 +278,17 @@ impl SpawnedMountHandle {
     /// # Returns
     /// `true` if unmount command succeeded, `false` otherwise
     fn try_unmount(mountpoint: &str, lazy: bool) -> bool {
-        crate::system::unmount_fuse(std::path::Path::new(mountpoint), lazy)
+        super::unmount::unmount_fuse(std::path::Path::new(mountpoint), lazy)
     }
 
     /// Check if a path is currently mounted.
     ///
-    /// Delegates to the shared, platform-aware [`crate::system::is_path_mounted`]
+    /// Delegates to the shared, platform-aware [`super::unmount::is_path_mounted`]
     /// so mount detection lives in exactly one place. A wrong answer here is not
     /// cosmetic: `unmount_sync` only escalates to a real `umount` when this
     /// returns `true`.
     fn is_mounted(path: &Path) -> bool {
-        crate::system::is_path_mounted(path)
+        super::unmount::is_path_mounted(path)
     }
 }
 

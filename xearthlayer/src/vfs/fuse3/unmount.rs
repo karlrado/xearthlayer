@@ -1,11 +1,14 @@
-//! Platform-abstracted FUSE mount-table operations.
+//! The fuse3 backend's mount-table operations.
 //!
 //! Linux unmounts FUSE filesystems with `fusermount3`/`fusermount` and exposes
 //! the mount table as `/proc/mounts`, while macOS (macFUSE) uses the BSD
 //! `umount(8)` and `mount(8)`. Everything that needs to unmount a mount or ask
 //! "is this path mounted?" shares the same platform logic, so it lives here
-//! once: the panic handler, the spawned-mount Drop fallback, and the package
-//! manager's status display.
+//! once, beside the backend whose mounts it tears down (moved out of
+//! `crate::system` for the mount seam, docs/dev/filesystem-backend-split.md
+//! step 6): the seam's `force_unmount`/`recover_stale`, the panic handler
+//! until M7 reroutes it through the seam, and the spawned-mount Drop
+//! fallback.
 
 use std::path::Path;
 use std::process::Command;

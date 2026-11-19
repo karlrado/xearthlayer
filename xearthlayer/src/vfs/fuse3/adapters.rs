@@ -59,7 +59,7 @@ impl MountSession for Fuse3MountSession {
     }
 
     fn is_mounted(&self) -> bool {
-        crate::system::is_path_mounted(&self.mountpoint)
+        super::unmount::is_path_mounted(&self.mountpoint)
     }
 }
 
@@ -101,11 +101,11 @@ impl MountBackend for LinuxFuse {
     }
 
     fn recover_stale(&self, mountpoint: &Path) -> bool {
-        no_panic(|| crate::system::recover_stale_fuse_mount(mountpoint))
+        no_panic(|| super::unmount::recover_stale_fuse_mount(mountpoint))
     }
 
     fn force_unmount(&self, path: &Path, force: bool) -> bool {
-        no_panic(|| crate::system::unmount_fuse(path, force))
+        no_panic(|| super::unmount::unmount_fuse(path, force))
     }
 }
 
@@ -115,11 +115,11 @@ impl MountBackend for MacFuse {
     }
 
     fn recover_stale(&self, mountpoint: &Path) -> bool {
-        no_panic(|| crate::system::recover_stale_fuse_mount(mountpoint))
+        no_panic(|| super::unmount::recover_stale_fuse_mount(mountpoint))
     }
 
     fn force_unmount(&self, path: &Path, force: bool) -> bool {
-        no_panic(|| crate::system::unmount_fuse(path, force))
+        no_panic(|| super::unmount::unmount_fuse(path, force))
     }
 }
 
@@ -205,13 +205,13 @@ mod tests {
         // a beat, then check the mount table — the same verification
         // unmount_sync makes before it escalates.
         for _ in 0..100 {
-            if !crate::system::is_path_mounted(&mountpoint) {
+            if !crate::vfs::fuse3::is_path_mounted(&mountpoint) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         assert!(
-            !crate::system::is_path_mounted(&mountpoint),
+            !crate::vfs::fuse3::is_path_mounted(&mountpoint),
             "dropping the session must leave nothing mounted"
         );
     }

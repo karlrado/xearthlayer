@@ -189,9 +189,9 @@ fn handle_panic(info: &PanicHookInfo<'_>) {
                     // Graceful first, then escalate to the platform's forced
                     // unmount if the mount is still busy. unmount_fuse picks
                     // fusermount (Linux) or umount (macOS).
-                    if crate::system::unmount_fuse(mount_point, false) {
+                    if crate::vfs::fuse3::unmount_fuse(mount_point, false) {
                         let _ = writeln!(stderr, "OK");
-                    } else if crate::system::unmount_fuse(mount_point, true) {
+                    } else if crate::vfs::fuse3::unmount_fuse(mount_point, true) {
                         let _ = writeln!(stderr, "OK (forced)");
                     } else {
                         let _ = writeln!(stderr, "FAILED");
