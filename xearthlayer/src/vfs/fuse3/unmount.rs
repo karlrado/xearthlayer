@@ -31,7 +31,7 @@ pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
         // fallback from the panic handler and the Drop path, where the daemon
         // may be wedged and we just want the mount gone — so we always force
         // (`-f`) to detach immediately rather than risk blocking. The normal,
-        // clean teardown goes through the async `MountHandle::unmount`, not
+        // clean teardown goes through the async `MountSession::unmount`, not
         // this path; `force` is therefore advisory on macOS.
         let _ = force;
         run_unmount(Command::new("umount").arg("-f").arg(mountpoint), mountpoint)
@@ -57,7 +57,7 @@ pub fn unmount_fuse(mountpoint: &Path, force: bool) -> bool {
 /// Platform-specific because the mount table lives in different places: Linux
 /// exposes it as `/proc/mounts`; macOS has no such file and must be queried via
 /// `mount(8)`. A wrong answer here is not cosmetic — callers gate real `umount`
-/// escalation (`SpawnedMountHandle`) and the user-facing package mount status on
+/// escalation (the seam's `force_unmount`) and the user-facing package mount status on
 /// it, so a Linux-only implementation silently mis-reports every macOS mount.
 ///
 /// This answers "is the kernel mount-table entry present", which is also `true`

@@ -47,7 +47,7 @@ use super::fuse_platform;
 use super::fuse_platform::file_attr;
 use super::inode::InodeManager;
 use super::shared::TTL;
-use super::types::{errno_from, Fuse3Error, Fuse3Result};
+use super::types::errno_from;
 use crate::vfs::common::{FsNode, UnionFilesystem};
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
@@ -55,11 +55,11 @@ use fuse3::raw::reply::{
     ReplyEntry, ReplyInit, ReplyOpen, ReplyStatFs,
 };
 use fuse3::raw::Filesystem;
-use fuse3::{Errno, MountOptions, Result as Fuse3InternalResult};
+use fuse3::{Errno, Result as Fuse3InternalResult};
 use futures::stream::{self, Stream, StreamExt};
 use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, trace};
 /// Consolidated ortho union FUSE filesystem.
@@ -170,71 +170,8 @@ impl Fuse3OrthoUnionFS {
         }
         self.inode_manager.get_path(ino).map(FsNode::Directory)
     }
-
-    // =========================================================================
-    // Mounting
-    // =========================================================================
-
-    /// Mount the filesystem at the given path.
-    ///
-    /// This is a blocking operation that runs until the filesystem is unmounted.
-    /// For non-blocking usage, see [`mount_spawned`](Self::mount_spawned).
-    pub async fn mount(self, mountpoint: &str) -> Fuse3Result<super::types::MountHandle> {
-        let mount_path = PathBuf::from(mountpoint);
-        let mount_options = mount_options(&mount_path);
-
-        // The mount-time state statement (#236) now lives with the core's
-        // builder in the manager: behind Arc<dyn UnionFilesystem> the
-        // ceiling is not readable from here.
-        let handle = fuse_platform::mount(mount_options, self, &mount_path)
-            .await
-            .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
-
-        Ok(super::types::MountHandle::new(handle))
-    }
-
-    /// Mount the filesystem as a spawned background task.
-    ///
-    /// Returns a handle that can be used to unmount the filesystem later.
-    /// The filesystem runs in the background until unmounted.
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let handle = fs.mount_spawned("/path/to/mountpoint").await?;
-    /// // ... filesystem is running ...
-    /// handle.unmount().await?;
-    /// ```
-    pub async fn mount_spawned(
-        self,
-        mountpoint: &str,
-    ) -> Fuse3Result<super::types::SpawnedMountHandle> {
-        let mount_path = PathBuf::from(mountpoint);
-        let mount_options = mount_options(&mount_path);
-
-        let handle = fuse_platform::mount(mount_options, self, &mount_path)
-            .await
-            .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
-
-        Ok(super::types::SpawnedMountHandle::spawn_from_handle(
-            handle, mount_path,
-        ))
-    }
 }
 
-/// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
-/// [`Fuse3OrthoUnionFS::mount_spawned`].
-pub(crate) fn mount_options(mount_path: &Path) -> MountOptions {
-    let mut mount_options = MountOptions::default();
-    mount_options.read_only(true);
-    mount_options.force_readdir_plus(false);
-    // Tell kernel we don't implement opendir - it should call readdir directly
-    mount_options.no_open_dir_support(true);
-    if let Some(volname) = fuse_platform::volume_name_option(mount_path) {
-        mount_options.custom_options(volname);
-    }
-    mount_options
-}
 // =============================================================================
 // Kernel-boundary translation
 // =============================================================================

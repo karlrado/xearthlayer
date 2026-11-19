@@ -35,5 +35,5 @@ mod unmount;
 pub use adapters::{LinuxFuse, MacFuse};
 pub use ortho_union_fs::Fuse3OrthoUnionFS;
 pub use shared::{chunk_to_tile_coords, DdsRequestor, VirtualDdsConfig, TTL};
-pub use types::{Fuse3Error, Fuse3Result, MountHandle, SpawnedMountHandle};
+pub use types::{Fuse3Error, Fuse3Result};
 pub use unmount::{is_path_mounted, is_stale_fuse_mount, recover_stale_fuse_mount, unmount_fuse};
