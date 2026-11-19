@@ -21,6 +21,7 @@ use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
+use crate::vfs::common::OrthoUnionCore;
 use crate::vfs::fuse3::Fuse3OrthoUnionFS;
 use crate::vfs::SpawnedMountHandle;
 use xearthlayer_package::{
@@ -563,35 +564,51 @@ impl MountManager {
         }
         let state_observer = Arc::new(state_observer);
 
-        // Create and mount the consolidated ortho union filesystem with DDS access channel
-        // Wire FUSE kernel limits for concurrent background request control
+        // Build the backend-neutral core with everything the configuration
+        // selects, then hand it to the fuse3 adapter behind the mount seam's
+        // handle type (docs/dev/filesystem-backend-split.md step 6): past
+        // Arc<dyn UnionFilesystem> the wiring must be finished.
         // The client carries the pinned-tile budget it reports FUSE demand from,
         // so the filesystem accounts against the same one prefetch reads (#246).
         let pinned_budget = dds_client.pinned_budget();
 
-        let mut ortho_union_fs =
-            Fuse3OrthoUnionFS::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
+        let mut core =
+            OrthoUnionCore::new((*index_for_prefetch).clone(), dds_client, expected_dds_size)
                 .with_geo_index(Arc::clone(&geo_index))
                 .with_state_observer(state_observer)
-                .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold)
                 .with_timeout(Duration::from_secs(self.generation_timeout_secs));
 
         if let Some(budget) = pinned_budget {
-            ortho_union_fs = ortho_union_fs.with_pinned_budget(budget);
+            core = core.with_pinned_budget(budget);
         }
 
         if self.night_enabled {
             if let Some(source) =
                 self.resolve_night_lit_source(&index_for_prefetch, service.lit_disk_cache())
             {
-                ortho_union_fs = ortho_union_fs.with_lit_source(source);
+                core = core.with_lit_source(source);
             }
         }
 
         // Wire metrics client for coalesced request tracking
         if let Some(metrics) = metrics_client {
-            ortho_union_fs = ortho_union_fs.with_metrics(metrics);
+            core = core.with_metrics(metrics);
         }
+
+        // State the ceiling once, so a flight log is self-describing (#236): a
+        // reader comparing dds_pinned_peak_mb against it does not have to know
+        // the constant or which build it came from. The adapter can no longer
+        // say this — behind Arc<dyn UnionFilesystem> the ceiling is opaque.
+        tracing::info!(
+            dds_pinned_cap_mb = core.pinned().ceiling_bytes() / (1024 * 1024),
+            dds_pinned_cap_tiles =
+                core.pinned().ceiling_bytes() / core.virtual_dds_config().size().max(1),
+            "Virtual DDS handle memoisation budget"
+        );
+
+        // Wire FUSE kernel limits for concurrent background request control
+        let ortho_union_fs = Fuse3OrthoUnionFS::new(Arc::new(core))
+            .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
         let mountpoint_str = mountpoint.to_string_lossy();
 
         let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));

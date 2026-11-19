@@ -77,6 +77,19 @@ pub trait MountBackend: Send + Sync {
     fn force_unmount(&self, path: &Path, force: bool) -> bool;
 }
 
+/// The crate's one platform choice of mount backend.
+///
+/// `cfg!`, not `#[cfg]`: both unit structs are compiled and tested on every
+/// host, and CI on one platform type-checks the other's mount path. WinFSP
+/// and FSKit get branches here and nowhere else.
+pub fn select_backend() -> &'static dyn MountBackend {
+    if cfg!(target_os = "macos") {
+        &crate::vfs::fuse3::MacFuse
+    } else {
+        &crate::vfs::fuse3::LinuxFuse
+    }
+}
+
 /// What a [`MountBackend::mount`] call establishes: where, and with which
 /// kernel limits.
 pub struct MountRequest {

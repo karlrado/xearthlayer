@@ -1,12 +1,13 @@
 //! Consolidated ortho union FUSE filesystem — the fuse3 backend adapter.
 //!
 //! This filesystem presents all ortho sources (patches AND regional
-//! packages) as a single unified view. All state and logic live in the
-//! backend-neutral [`OrthoUnionCore`] (`crate::vfs::common::core`); this
-//! type is the thin adapter that owns the kernel identity — inode
+//! packages) as a single unified view. All state and logic live behind a
+//! [`UnionFilesystem`] — in production the backend-neutral
+//! [`OrthoUnionCore`](crate::vfs::common::OrthoUnionCore), wired before construction and never named again;
+//! this type is the thin adapter that owns the kernel identity — inode
 //! allocation and mapping — and translates between the kernel's
-//! [`Filesystem`] operations and the core's neutral node/attribute/error
-//! types (see `docs/dev/filesystem-backend-split.md`).
+//! [`Filesystem`] operations and the contract's neutral node/attribute/
+//! error types (see `docs/dev/filesystem-backend-split.md`).
 //!
 //! # Architecture
 //!
@@ -47,14 +48,7 @@ use super::fuse_platform::file_attr;
 use super::inode::InodeManager;
 use super::shared::TTL;
 use super::types::{errno_from, Fuse3Error, Fuse3Result};
-use crate::executor::{DdsClient, StorageConcurrencyLimiter};
-use crate::geo_index::GeoIndex;
-use crate::night::LitTextureSource;
-use crate::ortho_union::OrthoUnionIndex;
-use crate::pinned_budget::PinnedTileBudget;
-use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
-use crate::vfs::common::attrs::attrs_from_metadata;
-use crate::vfs::common::{FsNode, OrthoUnionCore};
+use crate::vfs::common::{FsNode, UnionFilesystem};
 use fuse3::raw::prelude::*;
 use fuse3::raw::reply::{
     DirectoryEntry, DirectoryEntryPlus, ReplyAttr, ReplyData, ReplyDirectory, ReplyDirectoryPlus,
@@ -67,8 +61,6 @@ use std::ffi::{OsStr, OsString};
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::fs;
 use tracing::{debug, trace};
 /// Consolidated ortho union FUSE filesystem.
 ///
@@ -100,13 +92,15 @@ use tracing::{debug, trace};
 /// fs.mount_spawned("/path/to/mountpoint").await?;
 /// ```
 pub struct Fuse3OrthoUnionFS {
-    /// The backend-neutral union filesystem: all state and logic.
+    /// The union filesystem this adapter translates for, behind the mount
+    /// seam's type (docs/dev/filesystem-backend-split.md §MountBackend).
     ///
-    /// Held by value: the builders consume and rebuild it, and its handle
-    /// state must not be cloned. The mount seam of the backend split
-    /// (docs/dev/filesystem-backend-split.md step 6) is what turns this into
-    /// an `Arc<dyn UnionFilesystem>` at mount time.
-    core: OrthoUnionCore,
+    /// Every operation below is one trait call plus kernel-shape assembly;
+    /// all state lives behind this handle. `Arc` because the mount seam
+    /// hands the same filesystem to whoever mounted it; `dyn` because the
+    /// seam's `MountBackend::mount` takes `Arc<dyn UnionFilesystem>`, so
+    /// the fuse3 backend never learns which core it carries.
+    fs: Arc<dyn UnionFilesystem>,
     /// Inode manager for path mappings
     inode_manager: InodeManager,
     /// Maximum pending background FUSE requests (kernel limit).
@@ -118,137 +112,23 @@ pub struct Fuse3OrthoUnionFS {
 }
 
 impl Fuse3OrthoUnionFS {
-    /// Create a new consolidated ortho union filesystem.
+    /// Wrap a union filesystem for the fuse3 kernel.
     ///
-    /// # Arguments
-    ///
-    /// * `index` - Pre-built union index of all ortho sources
-    /// * `dds_client` - Client for DDS generation requests (daemon architecture)
-    /// * `expected_dds_size` - Expected size of generated DDS files
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let fs = Fuse3OrthoUnionFS::new(index, dds_client, 11_174_016);
-    /// ```
-    pub fn new(
-        index: OrthoUnionIndex,
-        dds_client: Arc<dyn DdsClient>,
-        expected_dds_size: usize,
-    ) -> Self {
+    /// All core wiring (geo index, observer, lit source, budget, metrics,
+    /// timeout) happens on [`OrthoUnionCore`] before this call — the
+    /// builder-forwarding this adapter used to carry is gone with the seam:
+    /// past `Arc<dyn UnionFilesystem>` the backend cannot rebuild what it
+    /// does not concretely know.
+    pub fn new(fs: Arc<dyn UnionFilesystem>) -> Self {
         // Use a virtual root path for the inode manager
         let virtual_root = PathBuf::from("/");
 
         Self {
-            core: OrthoUnionCore::new(index, dds_client, expected_dds_size),
+            fs,
             inode_manager: InodeManager::new(virtual_root),
             fuse_max_background: None,
             fuse_congestion_threshold: None,
         }
-    }
-
-    /// Create with custom disk I/O limiter.
-    ///
-    /// Use this when you need to share a disk I/O limiter across multiple
-    /// filesystems or customize the concurrency limits.
-    pub fn with_disk_io_limiter(
-        index: OrthoUnionIndex,
-        dds_client: Arc<dyn DdsClient>,
-        expected_dds_size: usize,
-        disk_io_limiter: Arc<StorageConcurrencyLimiter>,
-    ) -> Self {
-        let virtual_root = PathBuf::from("/");
-
-        Self {
-            core: OrthoUnionCore::with_disk_io_limiter(
-                index,
-                dds_client,
-                expected_dds_size,
-                disk_io_limiter,
-            ),
-            inode_manager: InodeManager::new(virtual_root),
-            fuse_max_background: None,
-            fuse_congestion_threshold: None,
-        }
-    }
-
-    // =========================================================================
-    // Builder forwarding to the core
-    // =========================================================================
-
-    /// Rebuild the core with `build`, carrying the adapter's identity over.
-    ///
-    /// The core owns handle state that must not be cloned, so the builders
-    /// consume and return it; this swaps the result back into the adapter.
-    fn map_core(self, build: impl FnOnce(OrthoUnionCore) -> OrthoUnionCore) -> Self {
-        let Self {
-            core,
-            inode_manager,
-            fuse_max_background,
-            fuse_congestion_threshold,
-        } = self;
-        Self {
-            core: build(core),
-            inode_manager,
-            fuse_max_background,
-            fuse_congestion_threshold,
-        }
-    }
-
-    /// Share the pinned-tile budget with the prefetch backpressure signal.
-    ///
-    /// Without this the filesystem accounts against a budget only it can see,
-    /// which is correct for the memoisation cap but leaves prefetch blind to
-    /// demand on the mount (#246). Passing the runtime's budget makes the same
-    /// number answer both questions.
-    pub fn with_pinned_budget(self, budget: Arc<PinnedTileBudget>) -> Self {
-        self.map_core(|c| c.with_pinned_budget(budget))
-    }
-
-    /// Serve lit textures from `source` instead of the black default.
-    pub fn with_lit_source(self, source: Arc<dyn LitTextureSource>) -> Self {
-        self.map_core(|c| c.with_lit_source(source))
-    }
-
-    /// Set the timeout for DDS generation.
-    ///
-    /// After this timeout, a placeholder texture is returned to prevent
-    /// X-Plane from blocking indefinitely.
-    pub fn with_timeout(self, timeout: Duration) -> Self {
-        self.map_core(|c| c.with_timeout(timeout))
-    }
-
-    /// Set the callback for tile request tracking.
-    ///
-    /// This callback is invoked whenever a tile is requested, enabling
-    /// the prefetch system to infer aircraft position from FUSE requests.
-    pub fn with_tile_request_callback(self, callback: TileRequestCallback) -> Self {
-        self.map_core(|c| c.with_tile_request_callback(callback))
-    }
-
-    /// Set the metrics client for reporting FUSE-level metrics.
-    ///
-    /// When set, reports coalesced requests and other FUSE-specific metrics
-    /// to the metrics system.
-    pub fn with_metrics(self, metrics: crate::metrics::MetricsClient) -> Self {
-        self.map_core(|c| c.with_metrics(metrics))
-    }
-
-    /// Set the geospatial reference index for region-level ownership queries.
-    ///
-    /// When set, FUSE uses the GeoIndex to determine if a scenery file falls
-    /// within a patch-owned DSF region. Files in patched regions are resolved
-    /// only from patch sources, hiding package files that could conflict.
-    pub fn with_geo_index(self, geo_index: Arc<GeoIndex>) -> Self {
-        self.map_core(|c| c.with_geo_index(geo_index))
-    }
-
-    /// Set the prefetch state observer.
-    ///
-    /// When set, an on-demand generation in a region prefetch marked
-    /// `Prefetched` or `NoCoverage` demotes that region.
-    pub fn with_state_observer(self, observer: Arc<PrefetchStateObserver>) -> Self {
-        self.map_core(|c| c.with_state_observer(observer))
     }
 
     /// Set the FUSE kernel background request limits.
@@ -261,40 +141,6 @@ impl Fuse3OrthoUnionFS {
         self.fuse_max_background = Some(max_background);
         self.fuse_congestion_threshold = Some(congestion_threshold);
         self
-    }
-
-    // =========================================================================
-    // Accessors (forwarded to the core)
-    // =========================================================================
-
-    /// Get the ortho union index.
-    pub fn index(&self) -> &OrthoUnionIndex {
-        self.core.index()
-    }
-
-    /// Returns the disk I/O limiter for monitoring/metrics.
-    pub fn disk_io_limiter(&self) -> &Arc<StorageConcurrencyLimiter> {
-        self.core.disk_io_limiter()
-    }
-
-    /// Highest concurrent open handle count seen.
-    pub fn peak_dds_handles(&self) -> u64 {
-        self.core.peak_dds_handles()
-    }
-
-    /// Highest pinned tile byte total seen.
-    pub fn peak_pinned_tile_bytes(&self) -> u64 {
-        self.core.peak_pinned_tile_bytes()
-    }
-
-    /// Number of virtual DDS files currently open.
-    pub fn open_dds_handles(&self) -> usize {
-        self.core.open_dds_handles()
-    }
-
-    /// Bytes of DDS tiles currently pinned by open handles.
-    pub fn pinned_tile_bytes(&self) -> u64 {
-        self.core.pinned_tile_bytes()
     }
 
     // =========================================================================
@@ -337,16 +183,9 @@ impl Fuse3OrthoUnionFS {
         let mount_path = PathBuf::from(mountpoint);
         let mount_options = mount_options(&mount_path);
 
-        // State the ceiling once, so a flight log is self-describing: a reader
-        // comparing dds_pinned_peak_mb against it does not have to know the
-        // constant, and does not have to guess which build it came from (#236).
-        tracing::info!(
-            dds_pinned_cap_mb = self.core.pinned().ceiling_bytes() / (1024 * 1024),
-            dds_pinned_cap_tiles =
-                self.core.pinned().ceiling_bytes() / self.core.virtual_dds_config().size().max(1),
-            "Virtual DDS handle memoisation budget"
-        );
-
+        // The mount-time state statement (#236) now lives with the core's
+        // builder in the manager: behind Arc<dyn UnionFilesystem> the
+        // ceiling is not readable from here.
         let handle = fuse_platform::mount(mount_options, self, &mount_path)
             .await
             .map_err(|e| Fuse3Error::MountFailed(e.to_string()))?;
@@ -385,7 +224,7 @@ impl Fuse3OrthoUnionFS {
 
 /// Mount options shared by [`Fuse3OrthoUnionFS::mount`] and
 /// [`Fuse3OrthoUnionFS::mount_spawned`].
-fn mount_options(mount_path: &Path) -> MountOptions {
+pub(crate) fn mount_options(mount_path: &Path) -> MountOptions {
     let mut mount_options = MountOptions::default();
     mount_options.read_only(true);
     mount_options.force_readdir_plus(false);
@@ -402,8 +241,6 @@ fn mount_options(mount_path: &Path) -> MountOptions {
 impl Filesystem for Fuse3OrthoUnionFS {
     async fn init(&self, _req: Request) -> Fuse3InternalResult<ReplyInit> {
         debug!(
-            sources = self.core.index().source_count(),
-            files = self.core.index().file_count(),
             fuse_max_background = ?self.fuse_max_background,
             fuse_congestion_threshold = ?self.fuse_congestion_threshold,
             "fuse3 ortho union: init"
@@ -442,7 +279,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // in the core and answers child node + attributes in one pass.
         let name_str = name.to_string_lossy();
         let entry = self
-            .core
+            .fs
             .lookup(&parent_node, &name_str)
             .await
             .map_err(errno_from)?;
@@ -475,7 +312,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         trace!(ino = ino, "fuse3 ortho union: getattr");
 
         let node = self.node_for_inode(ino).ok_or(Errno::from(libc::ENOENT))?;
-        let attrs = self.core.attrs(&node).await.map_err(errno_from)?;
+        let attrs = self.fs.attrs(&node).await.map_err(errno_from)?;
         Ok(ReplyAttr {
             ttl: TTL,
             attr: file_attr(&attrs, ino),
@@ -499,7 +336,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         let node = self.node_for_inode(ino).ok_or(Errno::from(libc::ENOENT))?;
         let data = self
-            .core
+            .fs
             .read(&node, fh, offset, size as usize)
             .await
             .map_err(errno_from)?;
@@ -529,7 +366,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         // The core lists the real children and answers ENOTDIR for a
         // non-directory path (the guard this op used to write inline).
         let children = self
-            .core
+            .fs
             .list_directory(&FsNode::Directory(virtual_path.clone()))
             .await
             .map_err(errno_from)?;
@@ -618,7 +455,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
         };
 
         let children = self
-            .core
+            .fs
             .list_directory(&FsNode::Directory(virtual_path.clone()))
             .await
             .map_err(errno_from)?;
@@ -627,7 +464,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
 
         // Add . entry
         let self_attrs = self
-            .core
+            .fs
             .attrs(&FsNode::Directory(virtual_path.clone()))
             .await;
         let self_attr = match self_attrs {
@@ -687,20 +524,19 @@ impl Filesystem for Fuse3OrthoUnionFS {
             let attr = if is_dir {
                 file_attr(&child.entry.attrs, entry_inode)
             } else {
-                // For real files, get actual metadata from the source path
-                // This is critical for DSF and other passthrough files that need
-                // accurate file sizes reported to X-Plane
+                // For real files, re-stat through the contract: a listed
+                // child carries placeholder attrs (the listing stays I/O free)
+                // and the upgrade to real size is critical for DSF and other
+                // passthrough files X-Plane sizes off the entry. The core's
+                // attrs() is exactly the resolve-and-metadata this block did
+                // by hand, so the upgrade stays one await.
                 let upgraded = match child.entry.node {
-                    FsNode::RealFile(ref path) => self.core.index().resolve(path),
+                    FsNode::RealFile(_) => self.fs.attrs(&child.entry.node).await.ok(),
                     _ => None,
                 };
                 match upgraded {
-                    Some(source) => match fs::metadata(&source.real_path).await {
-                        Ok(metadata) => file_attr(&attrs_from_metadata(&metadata), entry_inode),
-                        // Fallback if metadata read fails
-                        Err(_) => file_attr(&child.entry.attrs, entry_inode),
-                    },
-                    // Entry not in index (shouldn't happen for list_directory entries)
+                    // Fallback if the stat fails: the listing's placeholder.
+                    Some(attrs) => file_attr(&attrs, entry_inode),
                     None => file_attr(&child.entry.attrs, entry_inode),
                 }
             };
@@ -739,7 +575,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
                 // pays, as it always did. Lit passthrough, the pinned-bytes
                 // budget and memoisation are the core's decision; every
                 // no-handle case answers fh 0.
-                let fh = self.core.open(&node).map_err(errno_from)?;
+                let fh = self.fs.open(&node).map_err(errno_from)?;
                 Ok(ReplyOpen {
                     fh,
                     flags: fuse_platform::virtual_dds_open_flags(),
@@ -770,7 +606,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
     ) -> Fuse3InternalResult<()> {
         // Drop the memoised tile. Without this every open file would pin
         // 11.17 MB for the life of the mount.
-        self.core.release(fh).map_err(errno_from)?;
+        self.fs.release(fh).map_err(errno_from)?;
         Ok(())
     }
 
@@ -810,7 +646,7 @@ impl Filesystem for Fuse3OrthoUnionFS {
     }
 
     async fn statfs(&self, _req: Request, _ino: u64) -> Fuse3InternalResult<ReplyStatFs> {
-        let stat = self.core.statfs();
+        let stat = self.fs.statfs();
         Ok(ReplyStatFs {
             blocks: stat.blocks,
             bfree: stat.bfree,
@@ -828,13 +664,18 @@ impl Filesystem for Fuse3OrthoUnionFS {
 mod tests {
     use super::*;
     use crate::coord::TileCoord;
-    use crate::executor::{DdsClientError, Priority};
+    use crate::executor::{DdsClient, DdsClientError, Priority, StorageConcurrencyLimiter};
+    use crate::geo_index::GeoIndex;
     use crate::ortho_union::OrthoUnionIndexBuilder;
+    use crate::pinned_budget::PinnedTileBudget;
+    use crate::prefetch::PrefetchStateObserver;
     use crate::runtime::{DdsResponse, JobRequest, RequestOrigin};
     use crate::vfs::common::DdsRequestor;
+    use crate::vfs::common::OrthoUnionCore;
     use bytes::Bytes;
     use semver::Version;
     use std::sync::Arc;
+    use std::time::Duration;
     use tempfile::TempDir;
     use tokio::sync::{mpsc, oneshot};
     use tokio_util::sync::CancellationToken;
@@ -946,10 +787,10 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (_fs, core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
-        assert_eq!(fs.index().source_count(), 1);
-        assert!(fs.index().file_count() > 0);
+        assert_eq!(core.index().source_count(), 1);
+        assert!(core.index().file_count() > 0);
     }
 
     #[test]
@@ -963,10 +804,10 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (_fs, core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
-        assert_eq!(fs.index().source_count(), 1);
-        assert!(fs.index().file_count() > 0);
+        assert_eq!(core.index().source_count(), 1);
+        assert!(core.index().file_count() > 0);
     }
 
     #[test]
@@ -988,10 +829,10 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (_fs, core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         // At least 1 source (package is guaranteed)
-        assert!(fs.index().source_count() >= 1);
+        assert!(core.index().source_count() >= 1);
     }
     #[test]
     fn test_with_disk_io_limiter() {
@@ -1006,9 +847,14 @@ mod tests {
         let client = create_test_client();
         let limiter = Arc::new(StorageConcurrencyLimiter::with_defaults("test"));
 
-        let fs = Fuse3OrthoUnionFS::with_disk_io_limiter(index, client, 1024, limiter.clone());
+        let (_fs, core) = mount_of(OrthoUnionCore::with_disk_io_limiter(
+            index,
+            client,
+            1024,
+            limiter.clone(),
+        ));
 
-        assert!(Arc::ptr_eq(fs.disk_io_limiter(), &limiter));
+        assert!(Arc::ptr_eq(core.disk_io_limiter(), &limiter));
     }
 
     #[test]
@@ -1022,9 +868,11 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_timeout(Duration::from_secs(60));
+        let (_fs, core) = mount_of(
+            OrthoUnionCore::new(index, client, 1024).with_timeout(Duration::from_secs(60)),
+        );
 
-        assert_eq!(fs.core.generation_timeout(), Duration::from_secs(60));
+        assert_eq!(core.generation_timeout(), Duration::from_secs(60));
     }
 
     /// Test that readdirplus returns correct file sizes for passthrough files.
@@ -1060,7 +908,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         // Get the inode for the directory containing the DSF
         let dsf_dir_virtual = std::path::Path::new("Earth nav data/+40-080");
@@ -1173,8 +1021,34 @@ mod tests {
         }
     }
 
+    /// Wrap a fully-wired core for the adapter and hand back the typed handle
+    /// too. White-box tests assert the internals (`pinned()`,
+    /// `dds_handles()`, the gauges) through `core` — which is precisely why
+    /// the adapter forwards nothing: past `Arc<dyn UnionFilesystem>` the
+    /// internals are not nameable.
+    fn mount_of(core: OrthoUnionCore) -> (Fuse3OrthoUnionFS, Arc<OrthoUnionCore>) {
+        let core = Arc::new(core);
+        let fs = Fuse3OrthoUnionFS::new(core.clone());
+        (fs, core)
+    }
+
     fn virtual_dds_fixture() -> (
         Fuse3OrthoUnionFS,
+        Arc<OrthoUnionCore>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        TempDir,
+    ) {
+        virtual_dds_fixture_with(|core| core)
+    }
+
+    /// The fixture's core wired through `build` before the adapter wraps it:
+    /// past the mount seam, metrics/lit/budget wiring must be decided at
+    /// construction, so fixtures take a builder instead of mutating.
+    fn virtual_dds_fixture_with(
+        build: impl FnOnce(OrthoUnionCore) -> OrthoUnionCore,
+    ) -> (
+        Fuse3OrthoUnionFS,
+        Arc<OrthoUnionCore>,
         Arc<std::sync::atomic::AtomicUsize>,
         TempDir,
     ) {
@@ -1191,8 +1065,12 @@ mod tests {
             .unwrap();
 
         let (client, requests) = CountingDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE);
-        (fs, requests, temp)
+        let (fs, core) = mount_of(build(OrthoUnionCore::new(
+            index,
+            client,
+            crate::vfs::EXPECTED_DDS_SIZE,
+        )));
+        (fs, core, requests, temp)
     }
 
     fn virtual_inode(fs: &Fuse3OrthoUnionFS) -> u64 {
@@ -1218,7 +1096,7 @@ mod tests {
     #[tokio::test]
     async fn test_lit_lookup_reports_the_minimal_black_size_and_its_own_inode() {
         use fuse3::raw::Filesystem;
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (fs, _core, _requests, _temp) = virtual_dds_fixture();
         let parent = textures_inode(&fs);
 
         let lit = fs.lookup(test_request(), parent, lit_name()).await.unwrap();
@@ -1243,7 +1121,7 @@ mod tests {
     #[tokio::test]
     async fn test_lit_getattr_matches_lookup() {
         use fuse3::raw::Filesystem;
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (fs, _core, _requests, _temp) = virtual_dds_fixture();
         let entry = fs
             .lookup(test_request(), textures_inode(&fs), lit_name())
             .await
@@ -1256,7 +1134,7 @@ mod tests {
     }
     #[tokio::test]
     async fn test_request_dds_impl_serves_black_for_a_lit_name_without_a_request() {
-        let (fs, requests, _temp) = virtual_dds_fixture();
+        let (_fs, core, requests, _temp) = virtual_dds_fixture();
         let coords = crate::vfs::DdsFilename {
             row: 25712,
             col: 12960,
@@ -1265,7 +1143,7 @@ mod tests {
             kind: crate::vfs::TextureKind::Lit,
         };
 
-        let data = fs.core.request_dds_impl(&coords).await;
+        let data = core.request_dds_impl(&coords).await;
 
         assert_eq!(data, crate::night::minimal_black_dds());
         assert_eq!(data.len(), 152);
@@ -1293,7 +1171,11 @@ mod tests {
             .build()
             .unwrap();
         let (client, _requests) = CountingDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(
+            index,
+            client,
+            crate::vfs::EXPECTED_DDS_SIZE,
+        ));
 
         let entry = fs
             .lookup(test_request(), textures_inode(&fs), lit_name())
@@ -1327,8 +1209,8 @@ mod tests {
                 Box::pin(async { Bytes::from_static(b"lit") })
             }
         }
-        let (fs, _requests, _temp) = virtual_dds_fixture();
-        let fs = fs.with_lit_source(Arc::new(Fixed));
+        let (fs, _core, _requests, _temp) =
+            virtual_dds_fixture_with(|core| core.with_lit_source(Arc::new(Fixed)));
         let entry = fs
             .lookup(test_request(), textures_inode(&fs), lit_name())
             .await
@@ -1345,16 +1227,15 @@ mod tests {
     /// Fixture wired to an observable metrics channel.
     fn virtual_dds_fixture_with_metrics() -> (
         Fuse3OrthoUnionFS,
+        Arc<OrthoUnionCore>,
         mpsc::UnboundedReceiver<crate::metrics::MetricEvent>,
         TempDir,
     ) {
-        let (fs, _requests, temp) = virtual_dds_fixture();
         let (tx, rx) = mpsc::unbounded_channel();
-        (
-            fs.with_metrics(crate::metrics::MetricsClient::new(tx)),
-            rx,
-            temp,
-        )
+        let (fs, core, _requests, temp) = virtual_dds_fixture_with(|core| {
+            core.with_metrics(crate::metrics::MetricsClient::new(tx))
+        });
+        (fs, core, rx, temp)
     }
 
     fn budget_exhausted_events(
@@ -1378,11 +1259,11 @@ mod tests {
     async fn test_open_past_budget_refuses_memoisation() {
         use fuse3::raw::Filesystem;
 
-        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let (fs, core, _rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
 
         // One tile short of the ceiling: pinned + expected must exceed it.
-        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
+        core.pinned().pin(core.pinned().ceiling_bytes());
 
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         assert_eq!(opened.fh, 0, "refused opens get no memoising handle");
@@ -1392,7 +1273,7 @@ mod tests {
             "the file must still bypass the page cache"
         );
         assert!(
-            fs.core.dds_handles().is_empty(),
+            core.dds_handles().is_empty(),
             "a refused open must not leave a handle behind"
         );
     }
@@ -1403,9 +1284,9 @@ mod tests {
     async fn test_open_past_budget_counts_every_refusal() {
         use fuse3::raw::Filesystem;
 
-        let (fs, mut rx, _temp) = virtual_dds_fixture_with_metrics();
+        let (fs, core, mut rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
+        core.pinned().pin(core.pinned().ceiling_bytes());
 
         for _ in 0..3 {
             let opened = fs.open(test_request(), ino, 0).await.unwrap();
@@ -1423,22 +1304,22 @@ mod tests {
     async fn test_budget_warning_is_latched() {
         use fuse3::raw::Filesystem;
 
-        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
+        let (fs, core, _rx, _temp) = virtual_dds_fixture_with_metrics();
         let ino = virtual_inode(&fs);
-        fs.core.pinned().pin(fs.core.pinned().ceiling_bytes());
+        core.pinned().pin(core.pinned().ceiling_bytes());
 
         // Assert the claim, not the flag. A flag assertion passes even if the
         // warn is emitted unconditionally, so long as something sets it.
         fs.open(test_request(), ino, 0).await.unwrap();
         assert!(
-            !fs.core.claim_budget_warning(),
+            !core.claim_budget_warning(),
             "the first refusal must have consumed the one-shot claim"
         );
 
         for _ in 0..3 {
             fs.open(test_request(), ino, 0).await.unwrap();
             assert!(
-                !fs.core.claim_budget_warning(),
+                !core.claim_budget_warning(),
                 "later refusals must not re-arm the warning"
             );
         }
@@ -1447,14 +1328,11 @@ mod tests {
     /// The latch in isolation: true exactly once, whatever the caller does.
     #[test]
     fn test_claim_budget_warning_is_one_shot() {
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (_fs, core, _requests, _temp) = virtual_dds_fixture();
 
-        assert!(fs.core.claim_budget_warning(), "first claim must succeed");
+        assert!(core.claim_budget_warning(), "first claim must succeed");
         for _ in 0..5 {
-            assert!(
-                !fs.core.claim_budget_warning(),
-                "every later claim must fail"
-            );
+            assert!(!core.claim_budget_warning(), "every later claim must fail");
         }
     }
     /// A registered virtual inode gets a real, non-zero handle.
@@ -1462,7 +1340,7 @@ mod tests {
     async fn test_open_registered_virtual_dds_returns_a_handle() {
         use fuse3::raw::Filesystem;
 
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (fs, core, _requests, _temp) = virtual_dds_fixture();
         let ino = virtual_inode(&fs);
 
         let reply = fs.open(test_request(), ino, 0).await.unwrap();
@@ -1472,10 +1350,10 @@ mod tests {
             reply.flags,
             super::super::fuse_platform::virtual_dds_open_flags(),
         );
-        assert_eq!(fs.open_dds_handles(), 1);
+        assert_eq!(core.open_dds_handles(), 1);
         // open() must not produce the tile: generation can take up to the
         // configured timeout, and X-Plane may open a file it never reads.
-        assert_eq!(fs.pinned_tile_bytes(), 0);
+        assert_eq!(core.pinned_tile_bytes(), 0);
     }
 
     /// Peaks must survive the drain that hides the current gauges.
@@ -1489,7 +1367,7 @@ mod tests {
     async fn test_virtual_dds_handle_peaks_outlive_the_current_gauges() {
         use fuse3::raw::Filesystem;
 
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (fs, core, _requests, _temp) = virtual_dds_fixture();
 
         let mut opened = Vec::new();
         for col in 0..3u32 {
@@ -1509,8 +1387,8 @@ mod tests {
             opened.push((ino, reply.fh));
         }
 
-        assert_eq!(fs.open_dds_handles(), 3);
-        let pinned_at_peak = fs.pinned_tile_bytes();
+        assert_eq!(core.open_dds_handles(), 3);
+        let pinned_at_peak = core.pinned_tile_bytes();
         assert_eq!(pinned_at_peak, 3 * crate::vfs::EXPECTED_DDS_SIZE as u64);
 
         for (ino, fh) in opened {
@@ -1520,11 +1398,11 @@ mod tests {
         }
 
         // Current gauges drain...
-        assert_eq!(fs.open_dds_handles(), 0);
-        assert_eq!(fs.pinned_tile_bytes(), 0);
+        assert_eq!(core.open_dds_handles(), 0);
+        assert_eq!(core.pinned_tile_bytes(), 0);
         // ...peaks do not.
-        assert_eq!(fs.peak_dds_handles(), 3);
-        assert_eq!(fs.peak_pinned_tile_bytes(), pinned_at_peak);
+        assert_eq!(core.peak_dds_handles(), 3);
+        assert_eq!(core.peak_pinned_tile_bytes(), pinned_at_peak);
     }
 
     /// The amplification metric must reflect the fix, not the old shape.
@@ -1550,8 +1428,10 @@ mod tests {
             .unwrap();
         let (client, _requests) = CountingDdsClient::new();
         let (metrics_tx, mut metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fs = Fuse3OrthoUnionFS::new(index, client, crate::vfs::EXPECTED_DDS_SIZE)
-            .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
+        let (fs, _core) = mount_of(
+            OrthoUnionCore::new(index, client, crate::vfs::EXPECTED_DDS_SIZE)
+                .with_metrics(crate::metrics::MetricsClient::new(metrics_tx)),
+        );
         let ino = virtual_inode(&fs);
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
 
@@ -1599,7 +1479,7 @@ mod tests {
     async fn test_virtual_dds_read_aliases_the_memoised_tile() {
         use fuse3::raw::Filesystem;
 
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (fs, core, _requests, _temp) = virtual_dds_fixture();
         let ino = virtual_inode(&fs);
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
 
@@ -1609,11 +1489,7 @@ mod tests {
             .await
             .unwrap();
 
-        let handle = fs
-            .core
-            .dds_handles()
-            .get(&opened.fh)
-            .expect("handle is live");
+        let handle = core.dds_handles().get(&opened.fh).expect("handle is live");
         let tile = handle.tile.get().expect("first read produced the tile");
 
         // The reply's buffer must sit inside the tile's allocation, at the
@@ -1631,22 +1507,22 @@ mod tests {
     async fn test_virtual_dds_release_frees_the_handle() {
         use fuse3::raw::Filesystem;
 
-        let (fs, _requests, _temp) = virtual_dds_fixture();
+        let (fs, core, _requests, _temp) = virtual_dds_fixture();
         let ino = virtual_inode(&fs);
         let opened = fs.open(test_request(), ino, 0).await.unwrap();
         fs.read(test_request(), ino, opened.fh, 0, 4096)
             .await
             .unwrap();
 
-        assert_eq!(fs.open_dds_handles(), 1);
-        assert!(fs.pinned_tile_bytes() > 0);
+        assert_eq!(core.open_dds_handles(), 1);
+        assert!(core.pinned_tile_bytes() > 0);
 
         fs.release(test_request(), ino, opened.fh, 0, 0, false)
             .await
             .unwrap();
 
-        assert_eq!(fs.open_dds_handles(), 0);
-        assert_eq!(fs.pinned_tile_bytes(), 0);
+        assert_eq!(core.open_dds_handles(), 0);
+        assert_eq!(core.pinned_tile_bytes(), 0);
     }
     // ========================================================================
     // Passthrough read amplification (#233)
@@ -1692,8 +1568,10 @@ mod tests {
             .unwrap();
 
         let (metrics_tx, metrics_rx) = tokio::sync::mpsc::unbounded_channel();
-        let fs = Fuse3OrthoUnionFS::new(index, create_test_client(), 1024)
-            .with_metrics(crate::metrics::MetricsClient::new(metrics_tx));
+        let (fs, _core) = mount_of(
+            OrthoUnionCore::new(index, create_test_client(), 1024)
+                .with_metrics(crate::metrics::MetricsClient::new(metrics_tx)),
+        );
         let inode = fs
             .inode_manager
             .get_or_create_inode(std::path::Path::new("Earth nav data/+40-080/+40-074.dsf"));
@@ -1756,13 +1634,13 @@ mod tests {
     #[test]
     fn with_pinned_budget_accounts_against_the_injected_budget() {
         let budget = Arc::new(PinnedTileBudget::with_ceiling(1000));
-        let (fs, _rx, _temp) = virtual_dds_fixture_with_metrics();
-        let fs = fs.with_pinned_budget(Arc::clone(&budget));
+        let (_fs, core, _requests, _temp) =
+            virtual_dds_fixture_with(|core| core.with_pinned_budget(Arc::clone(&budget)));
 
         budget.pin(400);
 
         assert_eq!(
-            fs.pinned_tile_bytes(),
+            core.pinned_tile_bytes(),
             400,
             "the filesystem must read the injected budget"
         );
@@ -1954,7 +1832,9 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let (fs, _core) = mount_of(
+            OrthoUnionCore::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index)),
+        );
 
         // Get inode for "textures" directory
         let textures_inode = fs
@@ -2042,7 +1922,9 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let (fs, _core) = mount_of(
+            OrthoUnionCore::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index)),
+        );
 
         let terrain_inode = fs
             .inode_manager
@@ -2111,7 +1993,9 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let (fs, _core) = mount_of(
+            OrthoUnionCore::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index)),
+        );
 
         // Get inode for "textures" directory
         let textures_inode = fs
@@ -2187,7 +2071,9 @@ mod tests {
         )]);
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index));
+        let (fs, _core) = mount_of(
+            OrthoUnionCore::new(index, client, 1024).with_geo_index(Arc::clone(&geo_index)),
+        );
 
         let textures_inode = fs
             .inode_manager
@@ -2266,7 +2152,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         let textures_inode = fs
             .inode_manager
@@ -2324,7 +2210,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         let textures_inode = fs
             .inode_manager
@@ -2369,7 +2255,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         let textures_inode = fs
             .inode_manager
@@ -2414,7 +2300,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         let req = fuse3::raw::Request {
             unique: 1,
@@ -2457,7 +2343,7 @@ mod tests {
             .unwrap();
 
         let client = create_test_client();
-        let fs = Fuse3OrthoUnionFS::new(index, client, 1024);
+        let (fs, _core) = mount_of(OrthoUnionCore::new(index, client, 1024));
 
         let req = fuse3::raw::Request {
             unique: 1,
@@ -2517,8 +2403,10 @@ mod tests {
         geo_index.insert::<PrefetchedRegion>(region, PrefetchedRegion::prefetched());
 
         let (client, mut rx) = MockDdsClient::new();
-        let fs = Fuse3OrthoUnionFS::new(index, client as Arc<dyn DdsClient>, 1024)
-            .with_state_observer(Arc::new(PrefetchStateObserver::new(Arc::clone(&geo_index))));
+        let (_fs, core) = mount_of(
+            OrthoUnionCore::new(index, client as Arc<dyn DdsClient>, 1024)
+                .with_state_observer(Arc::new(PrefetchStateObserver::new(Arc::clone(&geo_index)))),
+        );
 
         // Stand in for the executor daemon: answer the one request FUSE makes.
         let responder = tokio::spawn(async move {
@@ -2542,7 +2430,7 @@ mod tests {
             map_type: "BI".to_string(),
             kind: crate::vfs::TextureKind::Ortho,
         };
-        let _ = fs.core.request_dds_impl(&coords).await;
+        let _ = core.request_dds_impl(&coords).await;
         responder.await.unwrap();
 
         geo_index.get::<PrefetchedRegion>(&region).is_some()
