@@ -21,9 +21,8 @@ use crate::panic as panic_handler;
 use crate::patches::{extract_dsf_regions, PatchDiscovery};
 use crate::prefetch::{PrefetchStateObserver, TileRequestCallback};
 use crate::service::{ServiceConfig, ServiceError, XEarthLayerService};
+use crate::vfs::backend::{select_backend, FuseLimits, MountRequest, MountSession};
 use crate::vfs::common::OrthoUnionCore;
-use crate::vfs::fuse3::Fuse3OrthoUnionFS;
-use crate::vfs::SpawnedMountHandle;
 use xearthlayer_package::{
     InstalledPackage as PackageInstalledPackage, Package as PackageCore, PackageType,
 };
@@ -118,8 +117,9 @@ impl ConsolidatedOrthoMountResult {
 /// static DSF files that don't need on-demand generation.
 pub struct MountManager {
     /// Active mount sessions, keyed by region.
-    /// Uses SpawnedMountHandle which can be safely dropped from any context.
-    sessions: HashMap<String, SpawnedMountHandle>,
+    /// A `MountSession` unmounts when dropped (the seam's guaranteed
+    /// teardown path), so these are releasable from any context.
+    sessions: HashMap<String, Box<dyn MountSession>>,
     /// Services that own the Tokio runtimes - MUST be kept alive while sessions are active.
     /// The service contains the runtime that processes DDS generation requests.
     services: HashMap<String, XEarthLayerService>,
@@ -129,13 +129,13 @@ pub struct MountManager {
     /// If None, packages are mounted in-place.
     scenery_path: Option<PathBuf>,
     /// Active patches union filesystem mount (if any).
-    patches_session: Option<SpawnedMountHandle>,
+    patches_session: Option<Box<dyn MountSession>>,
     /// Patches mount info for display.
     patches_mount: Option<ActiveMount>,
     /// Service for patches (owns the runtime for DDS generation).
     patches_service: Option<XEarthLayerService>,
     /// Consolidated ortho union filesystem mount (if any).
-    consolidated_session: Option<SpawnedMountHandle>,
+    consolidated_session: Option<Box<dyn MountSession>>,
     /// Consolidated ortho mount info for display.
     consolidated_mount: Option<ActiveMount>,
     /// Service for consolidated ortho (owns the runtime for DDS generation).
@@ -486,7 +486,7 @@ impl MountManager {
         // (macFUSE: ENXIO "Device not configured"). A stale mount also makes
         // exists() report false, so recovery must happen before the directory
         // check below.
-        crate::vfs::fuse3::recover_stale_fuse_mount(&mountpoint);
+        select_backend().recover_stale(&mountpoint);
 
         // Create mountpoint directory
         if !mountpoint.exists() {
@@ -565,7 +565,7 @@ impl MountManager {
         let state_observer = Arc::new(state_observer);
 
         // Build the backend-neutral core with everything the configuration
-        // selects, then hand it to the fuse3 adapter behind the mount seam's
+        // selects, then hand it to the mount seam's backend for the kernel
         // handle type (docs/dev/filesystem-backend-split.md step 6): past
         // Arc<dyn UnionFilesystem> the wiring must be finished.
         // The client carries the pinned-tile budget it reports FUSE demand from,
@@ -606,12 +606,18 @@ impl MountManager {
             "Virtual DDS handle memoisation budget"
         );
 
-        // Wire FUSE kernel limits for concurrent background request control
-        let ortho_union_fs = Fuse3OrthoUnionFS::new(Arc::new(core))
-            .with_fuse_limits(self.fuse_max_background, self.fuse_congestion_threshold);
-        let mountpoint_str = mountpoint.to_string_lossy();
+        // The seam mounts it: the backend builds the kernel-side filesystem
+        // and carries the FUSE kernel limits for concurrent background
+        // request control. No backend name crosses back into this file.
+        let request = MountRequest {
+            mountpoint: mountpoint.clone(),
+            fuse_limits: FuseLimits {
+                max_background: self.fuse_max_background,
+                congestion_threshold: self.fuse_congestion_threshold,
+            },
+        };
 
-        let mount_result = runtime_handle.block_on(ortho_union_fs.mount_spawned(&mountpoint_str));
+        let mount_result = runtime_handle.block_on(select_backend().mount(Arc::new(core), request));
 
         match mount_result {
             Ok(session) => {
